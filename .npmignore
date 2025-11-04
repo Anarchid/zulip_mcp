@@ -1,0 +1,13 @@
+src/
+tsconfig.json
+*.log
+.DS_Store
+node_modules/
+examples/
+test/
+.github/
+zuliprc
+zuliprc.example
+.gitignore
+
+

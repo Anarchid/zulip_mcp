@@ -1,0 +1,32 @@
+{
+  "name": "zulip-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for Zulip API integration",
+  "type": "module",
+  "main": "build/index.js",
+  "bin": {
+    "zulip-mcp-server": "build/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "zulip",
+    "model-context-protocol"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zulip-js": "^2.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "typescript": "^5.7.2"
+  }
+}
+
+

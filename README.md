@@ -1,0 +1,411 @@
+# Zulip MCP Server
+
+A Model Context Protocol (MCP) server that provides **stateful, ergonomic** integration with the Zulip API. This server allows AI assistants and other MCP clients to monitor channels, track read/unread messages, and retrieve history with natural date-based queries.
+
+## 🎯 Design Philosophy
+
+**Fewer, Better Tools** - Instead of exposing 20+ low-level API endpoints, this server provides a small set of high-level, stateful tools that are intuitive and powerful.
+
+**Stateful Monitoring** - The server maintains state about which channels you're monitoring and tracks read/unread messages automatically.
+
+**Ambient Awareness via Resources** - MCP Resources expose unread message counts that the agent can see when activated for any reason, creating passive awareness without explicit queries.
+
+**Ergonomic Date Handling** - Use natural keywords like "today" and "yesterday" instead of timestamps and anchors.
+
+## 🚀 Core Features
+
+### 🔔 **Ambient Awareness (MCP Resources)**
+The agent can passively see unread message notifications when activated for any reason:
+- `zulip://unread/summary` - Total unread count across all monitored channels
+- `zulip://monitoring/status` - Current monitoring state
+- `zulip://channel/{name}/unread` - Unread count per channel
+
+### 📺 **Channel Monitoring (Tools)**
+- `start_monitoring` - Begin tracking one or more channels
+- `get_monitored_channels` - View all monitored channels and their state
+- `stop_monitoring` - Stop tracking channels
+
+### 📜 **Message Retrieval (Tools)**
+- `get_channel_history` - Retrieve messages with easy date/time filtering
+- `get_unread_messages` - Get unread messages from monitored channels (tracks state!)
+
+### 💬 **Communication (Tools)**
+- `send_message` - Send to streams or DMs
+- `add_reaction` - Add emoji reactions
+
+### 📋 **Discovery (Tools)**
+- `list_streams` - Browse available channels
+- `get_stream_topics` - See topics in a channel
+- `list_users` - View organization users
+- `get_user_profile` - Get your bot/user info
+
+## Installation
+
+```bash
+npm install
+npm run build
+```
+
+## Configuration
+
+The server supports three authentication methods:
+
+### Option 1: Environment Variables with API Key (Recommended)
+
+```bash
+export ZULIP_REALM="https://your-org.zulipchat.com"
+export ZULIP_EMAIL="your-bot@example.com"
+export ZULIP_API_KEY="your-api-key"
+export ZULIP_SESSION_ID="agent_name"  # Optional: for persistent state across restarts
+```
+
+**Note:** `ZULIP_SESSION_ID` is optional but recommended. It allows:
+- Multiple agents to have separate monitoring state
+- State to persist across server restarts
+- Each agent to have their own read/unread tracking
+
+If not set, defaults to your email/username.
+
+### Option 2: Environment Variables with Password
+
+```bash
+export ZULIP_REALM="https://your-org.zulipchat.com"
+export ZULIP_USERNAME="your-bot@example.com"
+export ZULIP_PASSWORD="your-password"
+```
+
+### Option 3: Using zuliprc File
+
+Create a `zuliprc` file (see `zuliprc.example`):
+
+```ini
+[api]
+email=your-bot@example.com
+key=your-api-key
+site=https://your-org.zulipchat.com
+```
+
+Then set the path:
+
+```bash
+export ZULIP_RC_PATH="/path/to/zuliprc"
+```
+
+**Important:** Add `zuliprc` to your `.gitignore` to avoid committing credentials!
+
+## Getting Your Zulip API Key
+
+1. Log in to your Zulip organization
+2. Go to Settings (gear icon) → Account & Privacy
+3. Under "API key", click "Show/change your API key"
+4. Copy the key or create a bot for API access
+
+For bots:
+1. Go to Settings → Your bots
+2. Add a new bot
+3. Copy the bot's email and API key
+
+## Usage with Cursor
+
+Add this to your Cursor MCP configuration (`~/.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "zulip": {
+      "command": "node",
+      "args": ["/absolute/path/to/zulip_mcp/build/index.js"],
+      "env": {
+        "ZULIP_REALM": "https://your-org.zulipchat.com",
+        "ZULIP_EMAIL": "your-bot@example.com",
+        "ZULIP_API_KEY": "your-api-key",
+        "ZULIP_SESSION_ID": "my_agent"
+      }
+    }
+  }
+}
+```
+
+**Multiple Agents:** To run multiple agents with separate state, use different session IDs:
+
+```json
+{
+  "mcpServers": {
+    "zulip-agent1": {
+      "command": "node",
+      "args": ["/path/to/zulip_mcp/build/index.js"],
+      "env": {
+        "ZULIP_REALM": "https://your-org.zulipchat.com",
+        "ZULIP_EMAIL": "bot1@example.com",
+        "ZULIP_API_KEY": "key1",
+        "ZULIP_SESSION_ID": "agent1"
+      }
+    },
+    "zulip-agent2": {
+      "command": "node",
+      "args": ["/path/to/zulip_mcp/build/index.js"],
+      "env": {
+        "ZULIP_REALM": "https://your-org.zulipchat.com",
+        "ZULIP_EMAIL": "bot2@example.com",
+        "ZULIP_API_KEY": "key2",
+        "ZULIP_SESSION_ID": "agent2"
+      }
+    }
+  }
+}
+```
+
+After updating the configuration, **restart Cursor**.
+
+## 📖 Usage Examples
+
+### Stateful Workflow
+
+```typescript
+// Simple! Just ask for history - monitoring starts automatically
+get_channel_history({ 
+  channel: "analysts", 
+  start_date: "today",
+  format: "detailed"
+  // auto_monitor: true by default - starts monitoring automatically!
+})
+
+// Check for unread messages (only new ones since last check!)
+get_unread_messages({ 
+  format: "summary",
+  mark_as_read: true 
+})
+
+// Get messages from a specific date range and topic
+get_channel_history({
+  channel: "engineering",
+  topic: "Sprint Planning",
+  start_date: "2025-11-01",
+  end_date: "2025-11-03T17:00:00",
+  format: "detailed"
+  // This also updates monitoring state!
+})
+
+// Optional: Explicitly manage monitoring
+start_monitoring({ channels: ["qa", "support"] })
+stop_monitoring({ channels: ["analysts"] })
+get_monitored_channels()
+```
+
+### Natural Language Examples
+
+Once configured in Cursor, you can simply ask:
+
+- **"Start monitoring the analysts and engineering channels"**
+- **"Get today's messages from #analysts"**
+- **"Show me unread messages from my monitored channels"**
+- **"Get yesterday's history from #general"**
+- **"What topics are being discussed in #engineering?"**
+- **"Send a message to #team-updates about the deployment"**
+
+### Date/Time Formats
+
+The `get_channel_history` tool supports flexible date inputs:
+
+**Keywords:**
+- `"today"` - Start of today (00:00)
+- `"yesterday"` - Start of yesterday (00:00)
+- `"now"` - Current time
+
+**ISO Dates:**
+- `"2025-11-03"` - Specific date (00:00)
+- `"2025-11-03T14:30:00"` - Specific date and time
+
+**Defaults:**
+- `start_date` defaults to start of today
+- `end_date` defaults to current time
+
+### Output Formats
+
+**Detailed** (default) - Full formatted messages:
+```
+[11/3/2025 08:43:21 AM] 📝 Topic: Kraków
+👤 Lena C
+💬 Насколько она использует для этого ллмки?
+```
+
+**Summary** - Quick overview:
+```
+[08:43] [Kraków] Lena C: Насколько она использует для этого ллмки?...
+```
+
+**Raw** - Complete JSON for programmatic processing
+
+## API Reference
+
+### start_monitoring
+
+Start monitoring channels to track read/unread state.
+
+```json
+{
+  "channels": ["analysts", "engineering"]
+}
+```
+
+Returns: Status of each channel and last message IDs
+
+### get_channel_history
+
+Retrieve channel messages with date filtering.
+
+```json
+{
+  "channel": "analysts",           // Required
+  "topic": "Sprint Planning",      // Optional
+  "start_date": "today",          // Optional (default: today 00:00)
+  "end_date": "now",              // Optional (default: now)
+  "max_messages": 500,            // Optional (default: 500)
+  "format": "detailed"            // Optional: detailed|summary|raw
+}
+```
+
+Returns:
+- `message_count` - Number of messages in date range
+- `formatted_history` - Beautifully formatted messages
+- Date range info and metadata
+
+### get_unread_messages
+
+Get unread messages from monitored channels.
+
+```json
+{
+  "channels": ["analysts"],       // Optional: specific channels, or all monitored
+  "format": "detailed",          // Optional: detailed|summary|raw
+  "mark_as_read": true          // Optional: update read state (default: true)
+}
+```
+
+Returns:
+- `total_unread` - Count of unread messages
+- `channels_checked` - Status per channel
+- `formatted_messages` - Formatted unread messages
+
+### send_message
+
+Send messages to streams or DMs.
+
+```json
+{
+  "type": "stream",              // stream|private
+  "to": "general",              // stream name or email(s)
+  "topic": "Announcements",     // Required for streams
+  "content": "Hello team!"      // Markdown supported
+}
+```
+
+### Other Tools
+
+- **get_monitored_channels** - List monitoring state
+- **stop_monitoring** - Stop tracking channels
+- **list_streams** - Browse all channels
+- **get_stream_topics** - See topics in a channel
+- **list_users** - View organization users
+- **get_user_profile** - Get bot/user info
+- **add_reaction** - Add emoji reactions to messages
+
+## Development
+
+```bash
+# Install dependencies
+npm install
+
+# Build the project
+npm run build
+
+# Watch mode for development
+npm run watch
+```
+
+## Workflow Example
+
+Here's a typical workflow with the stateful server:
+
+1. **Morning - Just Ask for History**
+   ```
+   "Get today's messages from #analysts"
+   ```
+   → Auto-starts monitoring and marks as read!
+
+2. **Throughout the Day - Check Unreads**
+   ```
+   "What are the unread messages?"
+   ```
+   → Returns only NEW messages since last check
+
+3. **Deep Dive - Specific Topics**
+   ```
+   "Show me messages from #engineering about API design from yesterday"
+   ```
+   → Automatically starts monitoring #engineering too
+
+4. **Participate**
+   ```
+   "Send a message to #engineering topic 'API Review': Great points!"
+   "Add a rocket reaction to message 14573574"
+   ```
+
+5. **State Persists**
+   → Monitoring state saved to `~/.zulip_mcp_state/{session_id}.json`
+   → Survives server restarts!
+   → Each agent has separate state
+
+## Why This Design?
+
+### Traditional Approach (23 tools)
+❌ Complex low-level APIs  
+❌ Need to manage anchors and message IDs manually  
+❌ No state tracking  
+❌ State lost on restart  
+❌ Cognitive overhead  
+❌ Raw data output  
+
+### Our Approach (9 tools)
+✅ High-level, intuitive APIs  
+✅ Automatic state management  
+✅ **Persistent state** across restarts  
+✅ **Auto-monitoring** on history retrieval  
+✅ **Multi-agent support** via session IDs  
+✅ Natural date/time handling  
+✅ **Beautiful formatted output**  
+✅ "Just works" experience  
+
+## License
+
+MIT
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit issues or pull requests.
+
+## Troubleshooting
+
+### Authentication Errors
+
+- Verify your API key is correct
+- Ensure your realm URL is complete (including `https://`)
+- Check that your bot has the necessary permissions
+
+### Monitoring Issues
+
+- Make sure to call `start_monitoring` before using `get_unread_messages`
+- The server maintains state per session (state resets on server restart)
+- Use `get_monitored_channels` to check current monitoring state
+
+### Date Parsing
+
+- Dates are parsed in UTC by default
+- Use ISO 8601 format for precise timestamps
+- Keywords ("today", "yesterday") use local time
+
+## Links
+
+- [Zulip API Documentation](https://zulip.com/api/)
+- [zulip-js Library](https://github.com/zulip/zulip-js)
+- [Model Context Protocol](https://modelcontextprotocol.io/)

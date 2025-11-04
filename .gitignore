@@ -1,0 +1,13 @@
+node_modules/
+build/
+dist/
+*.log
+.DS_Store
+
+# Credentials - never commit these!
+zuliprc
+.env
+*.key
+*.pem
+
+
