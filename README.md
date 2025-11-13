@@ -1,6 +1,11 @@
 # Zulip MCP Server
 
+[![npm version](https://img.shields.io/npm/v/zulip-mcp-server.svg)](https://www.npmjs.com/package/zulip-mcp-server)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A Model Context Protocol (MCP) server that provides **stateful, ergonomic** integration with the Zulip API. This server allows AI assistants and other MCP clients to monitor channels, track read/unread messages, and retrieve history with natural date-based queries.
+
+**Install:** `npm install -g zulip-mcp-server`
 
 ## 🎯 Design Philosophy
 
@@ -41,9 +46,18 @@ The agent can passively see unread message notifications when activated for any 
 
 ## Installation
 
+**No installation needed!** Just use `npx` to run directly from npm:
+
 ```bash
-npm install
-npm run build
+npx zulip-mcp-server
+```
+
+The package is published on npm: https://www.npmjs.com/package/zulip-mcp-server
+
+**Optional:** Install globally if you prefer:
+
+```bash
+npm install -g zulip-mcp-server
 ```
 
 ## Configuration
@@ -113,8 +127,26 @@ Add this to your Cursor MCP configuration (`~/.cursor/mcp.json`):
 {
   "mcpServers": {
     "zulip": {
-      "command": "node",
-      "args": ["/absolute/path/to/zulip_mcp/build/index.js"],
+      "command": "npx",
+      "args": ["-y", "zulip-mcp-server"],
+      "env": {
+        "ZULIP_REALM": "https://your-org.zulipchat.com",
+        "ZULIP_EMAIL": "your-bot@example.com",
+        "ZULIP_API_KEY": "your-api-key",
+        "ZULIP_SESSION_ID": "my_agent"
+      }
+    }
+  }
+}
+```
+
+**Alternative (if installed globally):**
+
+```json
+{
+  "mcpServers": {
+    "zulip": {
+      "command": "zulip-mcp-server",
       "env": {
         "ZULIP_REALM": "https://your-org.zulipchat.com",
         "ZULIP_EMAIL": "your-bot@example.com",

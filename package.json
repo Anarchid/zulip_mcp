@@ -1,7 +1,7 @@
 {
   "name": "zulip-mcp-server",
-  "version": "1.0.0",
-  "description": "MCP server for Zulip API integration",
+  "version": "2.0.1",
+  "description": "Stateful, ergonomic MCP server for Zulip with ambient awareness, persistent monitoring, and natural date-based queries",
   "type": "module",
   "main": "build/index.js",
   "bin": {
@@ -15,10 +15,26 @@
   "keywords": [
     "mcp",
     "zulip",
-    "model-context-protocol"
+    "model-context-protocol",
+    "chat",
+    "messaging",
+    "stateful",
+    "ai",
+    "assistant",
+    "cursor",
+    "claude"
   ],
-  "author": "",
+  "author": "Antra Tessera",
   "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "build",
+    "README.md",
+    "LICENSE",
+    "zuliprc.example"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "zulip-js": "^2.1.0"
@@ -28,5 +44,7 @@
     "typescript": "^5.7.2"
   }
 }
+
+
 
 
