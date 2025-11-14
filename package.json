@@ -1,7 +1,7 @@
 {
   "name": "zulip-mcp-server",
-  "version": "2.0.1",
-  "description": "Stateful, ergonomic MCP server for Zulip with ambient awareness, persistent monitoring, and natural date-based queries",
+  "version": "2.2.0",
+  "description": "Stateful, ergonomic MCP server for Zulip and Discord with ambient awareness, persistent monitoring, and natural date-based queries",
   "type": "module",
   "main": "build/index.js",
   "bin": {
@@ -15,6 +15,7 @@
   "keywords": [
     "mcp",
     "zulip",
+    "discord",
     "model-context-protocol",
     "chat",
     "messaging",
@@ -37,6 +38,7 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
+    "discord.js": "^14.16.3",
     "zulip-js": "^2.1.0"
   },
   "devDependencies": {

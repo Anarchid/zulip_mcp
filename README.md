@@ -1,11 +1,13 @@
-# Zulip MCP Server
+# Zulip & Discord MCP Server
 
 [![npm version](https://img.shields.io/npm/v/zulip-mcp-server.svg)](https://www.npmjs.com/package/zulip-mcp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A Model Context Protocol (MCP) server that provides **stateful, ergonomic** integration with the Zulip API. This server allows AI assistants and other MCP clients to monitor channels, track read/unread messages, and retrieve history with natural date-based queries.
+A Model Context Protocol (MCP) server that provides **stateful, ergonomic** integration with **Zulip and Discord**. This server allows AI assistants and other MCP clients to monitor channels, track read/unread messages, and retrieve history with natural date-based queries.
 
 **Install:** `npm install -g zulip-mcp-server`
+
+**Features:** Zulip ✅ | Discord ✅ | Stateful ✅ | Persistent ✅ | Ambient Awareness ✅
 
 ## 🎯 Design Philosophy
 
@@ -21,28 +23,42 @@ A Model Context Protocol (MCP) server that provides **stateful, ergonomic** inte
 
 ### 🔔 **Ambient Awareness (MCP Resources)**
 The agent can passively see unread message notifications when activated for any reason:
-- `zulip://unread/summary` - Total unread count across all monitored channels
+
+**Zulip:**
+- `zulip://unread/summary` - Total unread count across monitored channels
 - `zulip://monitoring/status` - Current monitoring state
-- `zulip://channel/{name}/unread` - Unread count per channel
+- `zulip://channel/{name}/unread` - Per-channel unread count
 
-### 📺 **Channel Monitoring (Tools)**
-- `start_monitoring` - Begin tracking one or more channels
-- `get_monitored_channels` - View all monitored channels and their state
-- `stop_monitoring` - Stop tracking channels
+**Discord:**
+- `discord://unread/summary` - Total unread count across monitored channels  
+- `discord://monitoring/status` - Current monitoring state
+- `discord://channel/{id}/unread` - Per-channel unread count
 
-### 📜 **Message Retrieval (Tools)**
-- `get_channel_history` - Retrieve messages with easy date/time filtering
-- `get_unread_messages` - Get unread messages from monitored channels (tracks state!)
-
-### 💬 **Communication (Tools)**
-- `send_message` - Send to streams or DMs
+### 📺 **Zulip Tools**
+- `start_monitoring` - Monitor Zulip channels
+- `get_channel_history` - Get history with natural dates (mentions formatted as `@username (uid:123)`)
+- `get_unread_messages` - Get unread from monitored channels
+- `send_message` - Send to streams or DMs (use `@**username**` for mentions)
+- `delete_message` - Delete any message by ID (with permissions)
 - `add_reaction` - Add emoji reactions
+- `find_user` - Search users to get mention format
+- `list_streams` - Browse channels
+- `get_stream_topics` - See topics
+- `list_users` - View users
+- `get_user_profile` - Get your info
+- `get_monitored_channels` - View monitoring state
+- `stop_monitoring` - Stop tracking
 
-### 📋 **Discovery (Tools)**
-- `list_streams` - Browse available channels
-- `get_stream_topics` - See topics in a channel
-- `list_users` - View organization users
-- `get_user_profile` - Get your bot/user info
+### 💬 **Discord Tools**
+- `discord_start_monitoring` - Monitor Discord channels
+- `discord_get_channel_history` - Get history with natural dates (mentions formatted as `@username (uid:123...)`, shows replies)
+- `discord_get_unread_messages` - Get unread from monitored channels
+- `discord_send_message` - Send to Discord channels (supports `reply_to` parameter, use `<@user_id>` for mentions)
+- `discord_delete_message` - Delete any message by ID (with permissions)
+- `discord_find_user` - Search users to get user ID for mentions
+- `discord_list_channels` - Browse Discord channels
+- `discord_get_monitored_channels` - View monitoring state
+- `discord_stop_monitoring` - Stop tracking
 
 ## Installation
 
@@ -61,6 +77,29 @@ npm install -g zulip-mcp-server
 ```
 
 ## Configuration
+
+### Service Selection
+
+Enable the services you need via environment variables:
+
+```bash
+# Enable Zulip (enabled by default)
+export ENABLE_ZULIP=true
+
+# Enable Discord (disabled by default)  
+export ENABLE_DISCORD=true
+```
+
+You can enable:
+- **Just Zulip** (default): Don't set `ENABLE_DISCORD` - Only Zulip tools will be available
+- **Just Discord**: Set `ENABLE_DISCORD=true` and `ENABLE_ZULIP=false` - Only Discord tools will be available
+- **Both**: Set `ENABLE_DISCORD=true` - Both sets of tools will be available
+
+**Note:** Tools are dynamically loaded based on enabled services. If a service isn't configured, its tools won't appear in the tool list.
+
+### Authentication
+
+#### Zulip Authentication
 
 The server supports three authentication methods:
 
@@ -107,7 +146,15 @@ export ZULIP_RC_PATH="/path/to/zuliprc"
 
 **Important:** Add `zuliprc` to your `.gitignore` to avoid committing credentials!
 
-## Getting Your Zulip API Key
+#### Discord Authentication
+
+```bash
+export DISCORD_TOKEN="your-bot-token"
+```
+
+## Getting Your API Keys
+
+### Zulip API Key
 
 1. Log in to your Zulip organization
 2. Go to Settings (gear icon) → Account & Privacy
@@ -119,9 +166,25 @@ For bots:
 2. Add a new bot
 3. Copy the bot's email and API key
 
+### Discord Bot Token
+
+1. Go to https://discord.com/developers/applications
+2. Create a New Application
+3. Go to "Bot" section and click "Add Bot"
+4. Under "Token", click "Reset Token" and copy it
+5. **Enable Required Privileged Gateway Intents:**
+   - ✅ **Message Content Intent** (required for reading messages)
+   - ✅ **Server Members Intent** (required for user search)
+6. Invite bot to your server with these permissions:
+   - Read Messages/View Channels
+   - Send Messages
+   - Read Message History
+
 ## Usage with Cursor
 
 Add this to your Cursor MCP configuration (`~/.cursor/mcp.json`):
+
+### Zulip Only (Default)
 
 ```json
 {
@@ -133,6 +196,46 @@ Add this to your Cursor MCP configuration (`~/.cursor/mcp.json`):
         "ZULIP_REALM": "https://your-org.zulipchat.com",
         "ZULIP_EMAIL": "your-bot@example.com",
         "ZULIP_API_KEY": "your-api-key",
+        "ZULIP_SESSION_ID": "my_agent"
+      }
+    }
+  }
+}
+```
+
+### Discord Only
+
+```json
+{
+  "mcpServers": {
+    "discord": {
+      "command": "npx",
+      "args": ["-y", "zulip-mcp-server"],
+      "env": {
+        "ENABLE_ZULIP": "false",
+        "ENABLE_DISCORD": "true",
+        "DISCORD_TOKEN": "your-bot-token",
+        "ZULIP_SESSION_ID": "my_agent"
+      }
+    }
+  }
+}
+```
+
+### Both Zulip and Discord
+
+```json
+{
+  "mcpServers": {
+    "chat": {
+      "command": "npx",
+      "args": ["-y", "zulip-mcp-server"],
+      "env": {
+        "ENABLE_DISCORD": "true",
+        "ZULIP_REALM": "https://your-org.zulipchat.com",
+        "ZULIP_EMAIL": "your-bot@example.com",
+        "ZULIP_API_KEY": "your-api-key",
+        "DISCORD_TOKEN": "your-bot-token",
         "ZULIP_SESSION_ID": "my_agent"
       }
     }
@@ -228,12 +331,21 @@ get_monitored_channels()
 
 Once configured in Cursor, you can simply ask:
 
-- **"Start monitoring the analysts and engineering channels"**
+**Zulip:**
 - **"Get today's messages from #analysts"**
-- **"Show me unread messages from my monitored channels"**
+- **"Show me unread Zulip messages"**
 - **"Get yesterday's history from #general"**
-- **"What topics are being discussed in #engineering?"**
 - **"Send a message to #team-updates about the deployment"**
+
+**Discord:**
+- **"Get today's Discord messages from channel 123456789"**
+- **"Show me unread Discord messages"**
+- **"List all Discord channels"**
+- **"Send a message to Discord channel 123456789"**
+
+**Both:**
+- **"Check all my unread messages"** (if both enabled, check both!)
+- The agent will see unread counts from both services via Resources
 
 ### Date/Time Formats
 
@@ -267,6 +379,48 @@ The `get_channel_history` tool supports flexible date inputs:
 ```
 
 **Raw** - Complete JSON for programmatic processing
+
+### Working with Mentions
+
+#### Zulip Mentions
+
+**Inbound (Reading):**
+Mentions in retrieved messages are automatically formatted as:
+```
+@Daria Kroshka (uid:667)
+```
+
+**Outbound (Sending):**
+Use the Zulip mention syntax in your messages:
+```
+@**Daria Kroshka**
+```
+
+**Finding Users:**
+```typescript
+find_user({ query: "daria" })
+// Returns: mention_syntax: "@**Daria Kroshka**"
+```
+
+#### Discord Mentions
+
+**Inbound (Reading):**
+Mentions in retrieved messages are automatically formatted as:
+```
+@username#1234 (uid:123456789012345678)
+```
+
+**Outbound (Sending):**
+Use Discord's mention format:
+```
+<@123456789012345678>
+```
+
+**Finding Users:**
+```typescript
+discord_find_user({ username: "daria" })
+// Returns: mention_syntax: "<@123456789012345678>"
+```
 
 ## API Reference
 
@@ -390,22 +544,25 @@ Here's a typical workflow with the stateful server:
 
 ## Why This Design?
 
-### Traditional Approach (23 tools)
-❌ Complex low-level APIs  
+### Traditional Approach
+❌ Complex low-level APIs for each service  
 ❌ Need to manage anchors and message IDs manually  
 ❌ No state tracking  
 ❌ State lost on restart  
 ❌ Cognitive overhead  
 ❌ Raw data output  
+❌ Separate tools for each service with no consistency
 
-### Our Approach (9 tools)
-✅ High-level, intuitive APIs  
+### Our Approach
+✅ Unified ergonomic design across Zulip & Discord  
 ✅ Automatic state management  
 ✅ **Persistent state** across restarts  
 ✅ **Auto-monitoring** on history retrieval  
 ✅ **Multi-agent support** via session IDs  
+✅ **Ambient awareness** via MCP Resources  
 ✅ Natural date/time handling  
-✅ **Beautiful formatted output**  
+✅ **Beautiful formatted output** everywhere  
+✅ **Enable only what you need** via flags  
 ✅ "Just works" experience  
 
 ## License

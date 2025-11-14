@@ -10,25 +10,40 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import zulipInit from "zulip-js";
+import { Client as DiscordClient, GatewayIntentBits, TextChannel, Message } from "discord.js";
 
-// Initialize Zulip client
+// Startup flags
+const ENABLE_ZULIP = process.env.ENABLE_ZULIP !== "false";
+const ENABLE_DISCORD = process.env.ENABLE_DISCORD === "true";
+
+// Initialize clients
 let zulipClient: any = null;
+let discordClient: DiscordClient | null = null;
 
 // Session and state management
 interface ChannelState {
   channelName: string;
-  lastReadMessageId: number;
+  lastReadMessageId: number | string;
   subscribed: boolean;
+}
+
+interface DiscordChannelState {
+  channelId: string;
+  channelName: string;
+  guildId: string;
+  lastReadMessageId: string;
 }
 
 interface SessionState {
   sessionId: string;
   userId?: string;
   monitoredChannels: Record<string, ChannelState>;
+  monitoredDiscordChannels: Record<string, DiscordChannelState>;
 }
 
 let sessionId: string = "";
 const monitoredChannels: Map<string, ChannelState> = new Map();
+const monitoredDiscordChannels: Map<string, DiscordChannelState> = new Map();
 
 // File system for persistent state
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
@@ -44,10 +59,21 @@ function loadState(sessionId: string): void {
     try {
       const data = JSON.parse(readFileSync(stateFile, "utf-8")) as SessionState;
       monitoredChannels.clear();
-      Object.values(data.monitoredChannels).forEach(channel => {
-        monitoredChannels.set(channel.channelName, channel);
-      });
-      console.error(`Loaded state for session ${sessionId}: ${monitoredChannels.size} channels`);
+      monitoredDiscordChannels.clear();
+      
+      if (data.monitoredChannels) {
+        Object.values(data.monitoredChannels).forEach(channel => {
+          monitoredChannels.set(channel.channelName, channel);
+        });
+      }
+      
+      if (data.monitoredDiscordChannels) {
+        Object.values(data.monitoredDiscordChannels).forEach(channel => {
+          monitoredDiscordChannels.set(channel.channelId, channel);
+        });
+      }
+      
+      console.error(`Loaded state for session ${sessionId}: ${monitoredChannels.size} Zulip, ${monitoredDiscordChannels.size} Discord channels`);
     } catch (error) {
       console.error(`Failed to load state: ${error}`);
     }
@@ -65,6 +91,7 @@ function saveState(): void {
     const state: SessionState = {
       sessionId,
       monitoredChannels: Object.fromEntries(monitoredChannels),
+      monitoredDiscordChannels: Object.fromEntries(monitoredDiscordChannels),
     };
     
     writeFileSync(getStateFile(sessionId), JSON.stringify(state, null, 2));
@@ -113,6 +140,31 @@ async function initializeZulipClient(): Promise<void> {
   console.error(`Zulip MCP initialized with session: ${sessionId}`);
 }
 
+async function initializeDiscordClient(): Promise<void> {
+  if (!process.env.DISCORD_TOKEN) {
+    throw new Error("DISCORD_TOKEN must be set");
+  }
+  
+  discordClient = new DiscordClient({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+      GatewayIntentBits.GuildMembers, // Required for user search
+    ],
+  });
+  
+  await discordClient.login(process.env.DISCORD_TOKEN);
+  
+  // Wait for ready
+  await new Promise<void>((resolve) => {
+    discordClient!.once('ready', () => {
+      console.error(`Discord connected as ${discordClient!.user?.tag}`);
+      resolve();
+    });
+  });
+}
+
 // Helper function to parse date strings
 function parseDate(dateStr: string | undefined, defaultDate: Date): Date {
   if (!dateStr) return defaultDate;
@@ -136,9 +188,24 @@ function parseDate(dateStr: string | undefined, defaultDate: Date): Date {
   return new Date(dateStr);
 }
 
-// Helper function to strip HTML and format content
+// Helper function to strip HTML and format content with mention handling
 function cleanContent(html: string): string {
-  return html
+  let content = html;
+  
+  // Extract Zulip mentions first
+  content = content.replace(
+    /<span class="user-mention"[^>]*data-user-id="(\d+)"[^>]*>@([^<]+)<\/span>/g,
+    '@$2 (uid:$1)'
+  );
+  
+  // Handle silent mentions
+  content = content.replace(
+    /<span class="user-mention silent"[^>]*data-user-id="(\d+)"[^>]*>([^<]+)<\/span>/g,
+    '$2 (uid:$1)'
+  );
+  
+  // Clean up HTML
+  content = content
     .replace(/<p>/gi, '\n')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<[^>]*>/g, '')
@@ -147,6 +214,78 @@ function cleanContent(html: string): string {
     .replace(/&amp;/g, '&')
     .replace(/&quot;/g, '"')
     .trim();
+  
+  return content;
+}
+
+// Helper to format Discord mentions
+function formatDiscordContent(content: string, mentions: any): string {
+  let formatted = content;
+  
+  // Replace user mentions with readable format
+  if (mentions && mentions.users) {
+    for (const [userId, user] of mentions.users) {
+      formatted = formatted.replace(
+        new RegExp(`<@${userId}>`, 'g'),
+        `@${user.username} (uid:${userId})`
+      );
+      formatted = formatted.replace(
+        new RegExp(`<@!${userId}>`, 'g'),
+        `@${user.username} (uid:${userId})`
+      );
+    }
+  }
+  
+  // Replace channel mentions
+  if (mentions && mentions.channels) {
+    for (const [channelId, channel] of mentions.channels) {
+      formatted = formatted.replace(
+        new RegExp(`<#${channelId}>`, 'g'),
+        `#${channel.name}`
+      );
+    }
+  }
+  
+  // Replace role mentions
+  if (mentions && mentions.roles) {
+    for (const [roleId, role] of mentions.roles) {
+      formatted = formatted.replace(
+        new RegExp(`<@&${roleId}>`, 'g'),
+        `@${role.name} (role)`
+      );
+    }
+  }
+  
+  return formatted;
+}
+
+// Helper function to format Discord messages
+function formatDiscordMessages(messages: any[], format: string): string {
+  if (format === 'raw') {
+    return JSON.stringify(messages, null, 2);
+  }
+  
+  if (format === 'summary') {
+    const summary = messages.map(msg => {
+      const time = new Date(msg.timestamp * 1000).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      const content = msg.content.substring(0, 80);
+      const replyIndicator = msg.reply_to ? '↩️ ' : '';
+      return `[${time}] ${replyIndicator}${msg.author}: ${content}...`;
+    }).join('\n');
+    return `📊 ${messages.length} messages\n\n${summary}`;
+  }
+  
+  // Detailed format
+  const formatted = messages.map(msg => {
+    const time = new Date(msg.timestamp * 1000).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    const date = new Date(msg.timestamp * 1000).toLocaleDateString('en-US');
+    const replyInfo = msg.reply_to ? `\n↩️ Replying to message ID: ${msg.reply_to}` : '';
+    const attachmentInfo = msg.attachments > 0 ? `\n📎 ${msg.attachments} attachment(s)` : '';
+    
+    return `[${date} ${time}] 💬 ${msg.channel ? `#${msg.channel}` : ''}${replyInfo}\n👤 ${msg.author}\n💬 ${msg.content}${attachmentInfo}\n`;
+  }).join('\n' + '─'.repeat(80) + '\n\n');
+  
+  return `📊 Retrieved ${messages.length} messages\n${'='.repeat(80)}\n\n${formatted}`;
 }
 
 // Helper function to format messages
@@ -176,10 +315,14 @@ function formatMessages(messages: any[], format: string): string {
   return `📊 Retrieved ${messages.length} messages\n${'='.repeat(80)}\n\n${formatted}`;
 }
 
-// Define available tools
-const tools: Tool[] = [
-  {
-    name: "start_monitoring",
+// Define available tools (dynamically based on enabled services)
+function getTools(): Tool[] {
+  const tools: Tool[] = [];
+  
+  // Zulip tools
+  if (ENABLE_ZULIP) {
+    tools.push({
+      name: "start_monitoring",
     description:
       "Start monitoring one or more channels. This enables tracking of read/unread messages and allows efficient message retrieval.",
     inputSchema: {
@@ -316,6 +459,20 @@ const tools: Tool[] = [
     },
   },
   {
+    name: "delete_message",
+    description: "Delete a Zulip message by ID. You can delete your own messages, and if you have permissions, others' messages too.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_id: {
+          type: "number",
+          description: "ID of the message to delete",
+        },
+      },
+      required: ["message_id"],
+    },
+  },
+  {
     name: "list_streams",
     description: "Get all streams in the Zulip organization",
     inputSchema: {
@@ -388,12 +545,215 @@ const tools: Tool[] = [
       required: ["message_id", "emoji_name"],
     },
   },
-];
+  {
+    name: "find_user",
+    description: "Find a Zulip user by name or email to get their ID for mentions. Use @**username** format in messages to mention.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Name or email to search for",
+        },
+      },
+      required: ["query"],
+    },
+    });
+  }
+  
+  // Discord tools
+  if (ENABLE_DISCORD) {
+    tools.push({
+      name: "discord_find_user",
+    description: "Find a Discord user by username in guilds. Returns user ID for mentions. Use <@user_id> format in messages.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        username: {
+          type: "string",
+          description: "Username to search for (can include discriminator like 'user#1234')",
+        },
+        guild_id: {
+          type: "string",
+          description: "Optional: limit search to specific guild",
+        },
+      },
+      required: ["username"],
+    },
+  },
+  {
+    name: "discord_start_monitoring",
+    description:
+      "Start monitoring Discord channels. Enables tracking of read/unread messages.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Discord channel IDs to monitor (e.g., ['1234567890', '0987654321'])",
+        },
+      },
+      required: ["channel_ids"],
+    },
+  },
+  {
+    name: "discord_get_channel_history",
+    description:
+      "Get Discord channel message history with date/time filtering. Auto-monitors by default.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_id: {
+          type: "string",
+          description: "Discord channel ID",
+        },
+        start_date: {
+          type: "string",
+          description: "Start date/time ('today', 'yesterday', or ISO format). Defaults to today.",
+        },
+        end_date: {
+          type: "string",
+          description: "End date/time ('now' or ISO format). Defaults to now.",
+        },
+        max_messages: {
+          type: "number",
+          description: "Maximum messages to retrieve (default: 100, max: 100)",
+          default: 100,
+        },
+        format: {
+          type: "string",
+          enum: ["detailed", "summary", "raw"],
+          description: "Output format",
+          default: "detailed",
+        },
+        auto_monitor: {
+          type: "boolean",
+          description: "Auto-start monitoring and mark as read (default: true)",
+          default: true,
+        },
+      },
+      required: ["channel_id"],
+    },
+  },
+  {
+    name: "discord_get_unread_messages",
+    description:
+      "Get unread Discord messages from monitored channels.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Specific channels to check (optional, defaults to all monitored)",
+        },
+        format: {
+          type: "string",
+          enum: ["detailed", "summary", "raw"],
+          description: "Output format",
+          default: "detailed",
+        },
+        mark_as_read: {
+          type: "boolean",
+          description: "Mark as read after retrieving (default: true)",
+          default: true,
+        },
+      },
+    },
+  },
+  {
+    name: "discord_send_message",
+    description: "Send a message to a Discord channel. Optionally reply to another message.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_id: {
+          type: "string",
+          description: "Discord channel ID",
+        },
+        content: {
+          type: "string",
+          description: "Message content (supports Discord markdown)",
+        },
+        reply_to: {
+          type: "string",
+          description: "Optional: Message ID to reply to",
+        },
+      },
+      required: ["channel_id", "content"],
+    },
+  },
+  {
+    name: "discord_delete_message",
+    description: "Delete a Discord message by ID. Requires appropriate permissions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_id: {
+          type: "string",
+          description: "Discord channel ID",
+        },
+        message_id: {
+          type: "string",
+          description: "Message ID to delete",
+        },
+      },
+      required: ["channel_id", "message_id"],
+    },
+  },
+  {
+    name: "discord_list_channels",
+    description: "List all Discord channels (optionally filtered by guild)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        guild_id: {
+          type: "string",
+          description: "Optional: filter to specific guild/server",
+        },
+      },
+    },
+  },
+  {
+    name: "discord_get_monitored_channels",
+    description: "List all monitored Discord channels and their state",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "discord_stop_monitoring",
+    description: "Stop monitoring Discord channels",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Channel IDs to stop monitoring (optional, stops all if not provided)",
+        },
+      },
+    },
+    });
+  }
+  
+  return tools;
+}
 
 // Handle tool execution
 async function handleToolCall(name: string, args: any): Promise<any> {
-  if (!zulipClient) {
-    throw new Error("Zulip client not initialized");
+  // Check if the required client is initialized
+  const isDiscordTool = name.startsWith("discord_");
+  const isZulipTool = !isDiscordTool;
+  
+  if (isZulipTool && !zulipClient) {
+    throw new Error("Zulip client not initialized. Set ENABLE_ZULIP=true");
+  }
+  
+  if (isDiscordTool && !discordClient) {
+    throw new Error("Discord client not initialized. Set ENABLE_DISCORD=true");
   }
 
   switch (name) {
@@ -649,6 +1009,11 @@ async function handleToolCall(name: string, args: any): Promise<any> {
         content: args.content,
       });
 
+    case "delete_message":
+      return await zulipClient.messages.deleteById({
+        message_id: args.message_id,
+      });
+
     case "list_streams": {
       const result = await zulipClient.streams.retrieve({
         include_public: args.include_public ?? true,
@@ -724,6 +1089,478 @@ async function handleToolCall(name: string, args: any): Promise<any> {
         reaction_type: "unicode_emoji",
       });
 
+    case "find_user": {
+      const usersResult = await zulipClient.users.retrieve();
+      const members = usersResult.members || [];
+      const query = args.query.toLowerCase();
+      
+      const matches = members.filter((user: any) => 
+        user.full_name.toLowerCase().includes(query) ||
+        user.email.toLowerCase().includes(query)
+      );
+      
+      if (matches.length === 0) {
+        return {
+          found: false,
+          message: `No users found matching "${args.query}"`,
+        };
+      }
+      
+      const formatted = matches.map((user: any) => {
+        const status = user.is_bot ? "🤖" : "👤";
+        return `${status} **${user.full_name}** <${user.email}>\n   └─ User ID: ${user.user_id}\n   └─ Mention format: @**${user.full_name}**`;
+      }).join("\n\n");
+      
+      return {
+        found: true,
+        match_count: matches.length,
+        formatted_list: `👥 Found ${matches.length} user${matches.length !== 1 ? 's' : ''}:\n\n${formatted}`,
+        users: matches.map((u: any) => ({
+          user_id: u.user_id,
+          full_name: u.full_name,
+          email: u.email,
+          is_bot: u.is_bot,
+          mention_syntax: `@**${u.full_name}**`,
+        })),
+      };
+    }
+
+    // Discord handlers
+    case "discord_find_user": {
+      if (!discordClient) {
+        throw new Error("Discord is not enabled");
+      }
+      
+      const username = args.username.toLowerCase();
+      const guildFilter = args.guild_id;
+      const matches: any[] = [];
+      const seenUserIds = new Set<string>();
+      
+      for (const guild of discordClient.guilds.cache.values()) {
+        if (guildFilter && guild.id !== guildFilter) continue;
+        
+        try {
+          // Use Discord's search API with the query parameter (efficient)
+          const searchResults = await guild.members.fetch({ 
+            query: args.username, 
+            limit: 25 
+          });
+          
+          for (const member of searchResults.values()) {
+            const user = member.user;
+            if (seenUserIds.has(user.id)) continue;
+            
+            matches.push({
+              user_id: user.id,
+              username: user.username,
+              tag: user.tag,
+              display_name: member.displayName,
+              guild_id: guild.id,
+              guild_name: guild.name,
+              mention_syntax: `<@${user.id}>`,
+            });
+            seenUserIds.add(user.id);
+          }
+        } catch (error) {
+          // If search fails, check cache as fallback
+          for (const member of guild.members.cache.values()) {
+            const user = member.user;
+            if (seenUserIds.has(user.id)) continue;
+            
+            if (
+              user.username.toLowerCase().includes(username) ||
+              user.tag.toLowerCase().includes(username) ||
+              (member.displayName && member.displayName.toLowerCase().includes(username))
+            ) {
+              matches.push({
+                user_id: user.id,
+                username: user.username,
+                tag: user.tag,
+                display_name: member.displayName,
+                guild_id: guild.id,
+                guild_name: guild.name,
+                mention_syntax: `<@${user.id}>`,
+              });
+              seenUserIds.add(user.id);
+            }
+          }
+        }
+      }
+      
+      if (matches.length === 0) {
+        return {
+          found: false,
+          message: `No users found matching "${args.username}".`,
+        };
+      }
+      
+      const formatted = matches.map(user => 
+        `👤 **${user.tag}** (${user.guild_name})\n   └─ User ID: ${user.user_id}\n   └─ Mention format: <@${user.user_id}>`
+      ).join("\n\n");
+      
+      return {
+        found: true,
+        match_count: matches.length,
+        formatted_list: `👥 Found ${matches.length} user${matches.length !== 1 ? 's' : ''}:\n\n${formatted}`,
+        users: matches,
+      };
+    }
+    case "discord_start_monitoring": {
+      if (!discordClient) {
+        throw new Error("Discord is not enabled. Set ENABLE_DISCORD=true");
+      }
+      
+      const channelIds: string[] = args.channel_ids;
+      const results: any[] = [];
+      
+      for (const channelId of channelIds) {
+        try {
+          const channel = await discordClient.channels.fetch(channelId);
+          if (!channel || !(channel instanceof TextChannel)) {
+            results.push({
+              channel_id: channelId,
+              status: "error",
+              error: "Not a text channel or not found",
+            });
+            continue;
+          }
+          
+          // Get latest message
+          const messages = await channel.messages.fetch({ limit: 1 });
+          const lastMessageId = messages.size > 0 ? messages.first()!.id : "0";
+          
+          monitoredDiscordChannels.set(channelId, {
+            channelId,
+            channelName: channel.name,
+            guildId: channel.guildId,
+            lastReadMessageId: lastMessageId,
+          });
+          
+          results.push({
+            channel_id: channelId,
+            channel_name: channel.name,
+            guild_name: channel.guild.name,
+            status: "monitoring",
+            last_message_id: lastMessageId,
+          });
+        } catch (error) {
+          results.push({
+            channel_id: channelId,
+            status: "error",
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      
+      saveState();
+      
+      return {
+        session_id: sessionId,
+        monitored_count: monitoredDiscordChannels.size,
+        channels: results,
+      };
+    }
+
+    case "discord_get_channel_history": {
+      if (!discordClient) {
+        throw new Error("Discord is not enabled. Set ENABLE_DISCORD=true");
+      }
+      
+      const channelId = args.channel_id;
+      const channel = await discordClient.channels.fetch(channelId);
+      
+      if (!channel || !(channel instanceof TextChannel)) {
+        throw new Error("Channel not found or not a text channel");
+      }
+      
+      // Parse dates
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const now = new Date();
+      
+      const startDate = parseDate(args.start_date, today);
+      const endDate = parseDate(args.end_date, now);
+      
+      // Fetch messages (Discord limit is 100 per request)
+      const maxMessages = Math.min(args.max_messages || 100, 100);
+      const fetchedMessages = await channel.messages.fetch({ limit: maxMessages });
+      
+      // Filter by date range
+      const filteredMessages = Array.from(fetchedMessages.values())
+        .filter(msg => {
+          const msgTime = msg.createdAt;
+          return msgTime >= startDate && msgTime <= endDate;
+        })
+        .reverse(); // Oldest first
+      
+      // Auto-monitor
+      const autoMonitor = args.auto_monitor !== false;
+      let monitoringStatus = "not_monitored";
+      
+      if (autoMonitor && filteredMessages.length > 0) {
+        const latestMessageId = filteredMessages[filteredMessages.length - 1].id;
+        
+        if (!monitoredDiscordChannels.has(channelId)) {
+          monitoredDiscordChannels.set(channelId, {
+            channelId,
+            channelName: channel.name,
+            guildId: channel.guildId,
+            lastReadMessageId: latestMessageId,
+          });
+          monitoringStatus = "started_monitoring";
+          saveState();
+        } else {
+          const state = monitoredDiscordChannels.get(channelId)!;
+          state.lastReadMessageId = latestMessageId;
+          monitoringStatus = "updated_read_position";
+          saveState();
+        }
+      }
+      
+      // Format messages
+      const format = args.format || "detailed";
+      const formattedMessages = filteredMessages.map(msg => ({
+        id: msg.id,
+        author: msg.author.tag,
+        content: formatDiscordContent(msg.content, msg.mentions),
+        timestamp: Math.floor(msg.createdTimestamp / 1000),
+        attachments: msg.attachments.size,
+        reply_to: msg.reference?.messageId,
+      }));
+      
+      const formattedOutput = formatDiscordMessages(formattedMessages, format);
+      
+      return {
+        channel_id: channelId,
+        channel_name: channel.name,
+        guild_name: channel.guild.name,
+        start_date: startDate.toISOString(),
+        end_date: endDate.toISOString(),
+        message_count: filteredMessages.length,
+        monitoring_status: monitoringStatus,
+        formatted_history: formattedOutput,
+      };
+    }
+
+    case "discord_get_unread_messages": {
+      if (!discordClient) {
+        throw new Error("Discord is not enabled. Set ENABLE_DISCORD=true");
+      }
+      
+      const channelIdsToCheck = args.channel_ids || Array.from(monitoredDiscordChannels.keys());
+      
+      if (channelIdsToCheck.length === 0) {
+        return {
+          message: "No Discord channels being monitored",
+          total_unread: 0,
+          formatted_messages: "📊 0 messages\n\n",
+        };
+      }
+      
+      const allUnreadMessages: any[] = [];
+      const channelResults: any[] = [];
+      
+      for (const channelId of channelIdsToCheck) {
+        const state = monitoredDiscordChannels.get(channelId);
+        
+        if (!state) {
+          channelResults.push({
+            channel_id: channelId,
+            status: "not_monitored",
+            unread_count: 0,
+          });
+          continue;
+        }
+        
+        try {
+          const channel = await discordClient.channels.fetch(channelId);
+          if (!channel || !(channel instanceof TextChannel)) {
+            channelResults.push({
+              channel_id: channelId,
+              status: "error",
+              error: "Not a text channel",
+            });
+            continue;
+          }
+          
+          // Fetch recent messages
+          const messages = await channel.messages.fetch({ limit: 100 });
+          const unreadMessages = Array.from(messages.values())
+            .filter(msg => msg.id > state.lastReadMessageId)
+            .reverse();
+          
+          allUnreadMessages.push(...unreadMessages.map(msg => ({
+            id: msg.id,
+            author: msg.author.tag,
+            content: formatDiscordContent(msg.content, msg.mentions),
+            timestamp: Math.floor(msg.createdTimestamp / 1000),
+            channel: state.channelName,
+            guild: channel.guild.name,
+            reply_to: msg.reference?.messageId,
+          })));
+          
+          // Update state if mark_as_read
+          if (args.mark_as_read !== false && unreadMessages.length > 0) {
+            state.lastReadMessageId = unreadMessages[unreadMessages.length - 1].id;
+            saveState();
+          }
+          
+          channelResults.push({
+            channel_id: channelId,
+            channel_name: state.channelName,
+            status: "checked",
+            unread_count: unreadMessages.length,
+          });
+        } catch (error) {
+          channelResults.push({
+            channel_id: channelId,
+            status: "error",
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      
+      const format = args.format || "detailed";
+      const formattedOutput = formatDiscordMessages(allUnreadMessages, format);
+      
+      return {
+        total_unread: allUnreadMessages.length,
+        channels_checked: channelResults,
+        formatted_messages: formattedOutput,
+      };
+    }
+
+    case "discord_send_message": {
+      if (!discordClient) {
+        throw new Error("Discord is not enabled. Set ENABLE_DISCORD=true");
+      }
+      
+      const channel = await discordClient.channels.fetch(args.channel_id);
+      if (!channel || !(channel instanceof TextChannel)) {
+        throw new Error("Channel not found or not a text channel");
+      }
+      
+      const messageOptions: any = {
+        content: args.content,
+      };
+      
+      // Add reply reference if provided
+      if (args.reply_to) {
+        messageOptions.reply = {
+          messageReference: args.reply_to,
+        };
+      }
+      
+      const sentMessage = await channel.send(messageOptions);
+      
+      return {
+        success: true,
+        message_id: sentMessage.id,
+        channel_name: channel.name,
+        guild_name: channel.guild.name,
+        reply_to: args.reply_to,
+      };
+    }
+
+    case "discord_delete_message": {
+      if (!discordClient) {
+        throw new Error("Discord is not enabled. Set ENABLE_DISCORD=true");
+      }
+      
+      const channel = await discordClient.channels.fetch(args.channel_id);
+      if (!channel || !(channel instanceof TextChannel)) {
+        throw new Error("Channel not found or not a text channel");
+      }
+      
+      const message = await channel.messages.fetch(args.message_id);
+      await message.delete();
+      
+      return {
+        success: true,
+        message_id: args.message_id,
+        channel_name: channel.name,
+        deleted: true,
+      };
+    }
+
+    case "discord_list_channels": {
+      if (!discordClient) {
+        throw new Error("Discord is not enabled. Set ENABLE_DISCORD=true");
+      }
+      
+      const guildFilter = args.guild_id;
+      const allChannels: any[] = [];
+      
+      for (const guild of discordClient.guilds.cache.values()) {
+        if (guildFilter && guild.id !== guildFilter) continue;
+        
+        const textChannels = guild.channels.cache
+          .filter(ch => ch instanceof TextChannel)
+          .map(ch => ({
+            id: ch.id,
+            name: ch.name,
+            guild_id: guild.id,
+            guild_name: guild.name,
+            topic: (ch as TextChannel).topic || "",
+          }));
+        
+        allChannels.push(...textChannels);
+      }
+      
+      // Format nicely
+      const formatted = allChannels
+        .map(ch => `💬 **#${ch.name}** (${ch.guild_name})\n   └─ ID: ${ch.id}${ch.topic ? `\n   └─ ${ch.topic}` : ""}`)
+        .join("\n\n");
+      
+      return {
+        total_channels: allChannels.length,
+        formatted_list: `📋 **${allChannels.length} Discord Channels**\n\n${formatted}`,
+        raw_data: allChannels,
+      };
+    }
+
+    case "discord_get_monitored_channels": {
+      const channels = Array.from(monitoredDiscordChannels.values());
+      return {
+        monitored_count: channels.length,
+        channels: channels.map(c => ({
+          channel_id: c.channelId,
+          channel_name: c.channelName,
+          guild_id: c.guildId,
+          last_read_message_id: c.lastReadMessageId,
+        })),
+      };
+    }
+
+    case "discord_stop_monitoring": {
+      const channelIds: string[] = args.channel_ids;
+      
+      if (!channelIds || channelIds.length === 0) {
+        const stopped = Array.from(monitoredDiscordChannels.keys());
+        monitoredDiscordChannels.clear();
+        saveState();
+        return {
+          message: "Stopped monitoring all Discord channels",
+          stopped_channels: stopped,
+        };
+      }
+      
+      const stopped: string[] = [];
+      for (const channelId of channelIds) {
+        if (monitoredDiscordChannels.has(channelId)) {
+          monitoredDiscordChannels.delete(channelId);
+          stopped.push(channelId);
+        }
+      }
+      
+      saveState();
+      
+      return {
+        stopped_channels: stopped,
+        still_monitoring: Array.from(monitoredDiscordChannels.keys()),
+      };
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -745,7 +1582,7 @@ const server = new Server(
 
 // Register handlers
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools,
+  tools: getTools(),
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -775,29 +1612,62 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Register resource handlers
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  const resources: any[] = [
-    {
-      uri: "zulip://unread/summary",
-      name: "Unread Messages Summary",
-      description: "Count of unread messages across all monitored channels",
-      mimeType: "text/plain",
-    },
-    {
-      uri: "zulip://monitoring/status",
-      name: "Monitoring Status",
-      description: "Current monitoring state and channel list",
-      mimeType: "application/json",
-    },
-  ];
+  const resources: any[] = [];
   
-  // Add a resource for each monitored channel
-  for (const channel of monitoredChannels.keys()) {
-    resources.push({
-      uri: `zulip://channel/${channel}/unread`,
-      name: `${channel} - Unread Messages`,
-      description: `Unread message count for #${channel}`,
-      mimeType: "text/plain",
-    });
+  // Zulip resources
+  if (ENABLE_ZULIP && zulipClient) {
+    resources.push(
+      {
+        uri: "zulip://unread/summary",
+        name: "Zulip - Unread Messages Summary",
+        description: "Count of unread messages across all monitored Zulip channels",
+        mimeType: "text/plain",
+      },
+      {
+        uri: "zulip://monitoring/status",
+        name: "Zulip - Monitoring Status",
+        description: "Current Zulip monitoring state and channel list",
+        mimeType: "application/json",
+      }
+    );
+    
+    // Add a resource for each monitored Zulip channel
+    for (const channel of monitoredChannels.keys()) {
+      resources.push({
+        uri: `zulip://channel/${channel}/unread`,
+        name: `Zulip #${channel} - Unread Messages`,
+        description: `Unread message count for Zulip #${channel}`,
+        mimeType: "text/plain",
+      });
+    }
+  }
+  
+  // Discord resources
+  if (ENABLE_DISCORD && discordClient) {
+    resources.push(
+      {
+        uri: "discord://unread/summary",
+        name: "Discord - Unread Messages Summary",
+        description: "Count of unread messages across all monitored Discord channels",
+        mimeType: "text/plain",
+      },
+      {
+        uri: "discord://monitoring/status",
+        name: "Discord - Monitoring Status",
+        description: "Current Discord monitoring state and channel list",
+        mimeType: "application/json",
+      }
+    );
+    
+    // Add a resource for each monitored Discord channel
+    for (const [channelId, state] of monitoredDiscordChannels) {
+      resources.push({
+        uri: `discord://channel/${channelId}/unread`,
+        name: `Discord #${state.channelName} - Unread Messages`,
+        description: `Unread message count for Discord #${state.channelName}`,
+        mimeType: "text/plain",
+      });
+    }
   }
   
   return { resources };
@@ -924,6 +1794,125 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       }
     }
     
+    // Discord resource handlers
+    if (uri === "discord://unread/summary") {
+      if (!discordClient) {
+        return {
+          contents: [{
+            uri,
+            mimeType: "text/plain",
+            text: "Discord is not enabled",
+          }],
+        };
+      }
+      
+      let totalUnread = 0;
+      const channelSummaries: string[] = [];
+      
+      for (const [channelId, state] of monitoredDiscordChannels) {
+        try {
+          const channel = await discordClient.channels.fetch(channelId);
+          if (!channel || !(channel instanceof TextChannel)) continue;
+          
+          const messages = await channel.messages.fetch({ limit: 50 });
+          const unread = Array.from(messages.values()).filter(msg => msg.id > state.lastReadMessageId);
+          totalUnread += unread.length;
+          
+          if (unread.length > 0) {
+            channelSummaries.push(`📬 #${state.channelName}: ${unread.length} unread`);
+          }
+        } catch (error) {
+          // Skip channels with errors
+        }
+      }
+      
+      const summary = totalUnread > 0
+        ? `🔔 ${totalUnread} unread Discord message${totalUnread !== 1 ? 's' : ''}\n\n${channelSummaries.join('\n')}`
+        : "✅ No unread Discord messages";
+      
+      return {
+        contents: [{
+          uri,
+          mimeType: "text/plain",
+          text: summary,
+        }],
+      };
+    }
+    
+    if (uri === "discord://monitoring/status") {
+      const status = {
+        session_id: sessionId,
+        monitored_count: monitoredDiscordChannels.size,
+        channels: Array.from(monitoredDiscordChannels.values()).map(c => ({
+          channel_id: c.channelId,
+          channel_name: c.channelName,
+          guild_id: c.guildId,
+          last_read_message_id: c.lastReadMessageId,
+        })),
+      };
+      
+      return {
+        contents: [{
+          uri,
+          mimeType: "application/json",
+          text: JSON.stringify(status, null, 2),
+        }],
+      };
+    }
+    
+    const discordChannelMatch = uri.match(/^discord:\/\/channel\/([^/]+)\/unread$/);
+    if (discordChannelMatch) {
+      const channelId = discordChannelMatch[1];
+      const state = monitoredDiscordChannels.get(channelId);
+      
+      if (!state || !discordClient) {
+        return {
+          contents: [{
+            uri,
+            mimeType: "text/plain",
+            text: `Discord channel "${channelId}" is not being monitored`,
+          }],
+        };
+      }
+      
+      try {
+        const channel = await discordClient.channels.fetch(channelId);
+        if (!channel || !(channel instanceof TextChannel)) {
+          return {
+            contents: [{
+              uri,
+              mimeType: "text/plain",
+              text: "Not a text channel",
+            }],
+          };
+        }
+        
+        const messages = await channel.messages.fetch({ limit: 50 });
+        const unread = Array.from(messages.values()).filter(msg => msg.id > state.lastReadMessageId);
+        const count = unread.length;
+        
+        const text = count > 0
+          ? `📬 ${count} unread message${count !== 1 ? 's' : ''} in #${state.channelName}`
+          : `✅ No unread messages in #${state.channelName}`;
+        
+        return {
+          contents: [{
+            uri,
+            mimeType: "text/plain",
+            text,
+          }],
+        };
+      } catch (error) {
+        return {
+          contents: [{
+            uri,
+            mimeType: "text/plain",
+            text: `Error checking #${state.channelName}: ${error}`,
+          }],
+        };
+      }
+    }
+    
     throw new Error(`Unknown resource: ${uri}`);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -934,12 +1923,38 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 // Start the server
 async function main() {
   try {
-    await initializeZulipClient();
+    const enabledServices: string[] = [];
+    
+    // Initialize Zulip if enabled
+    if (ENABLE_ZULIP) {
+      try {
+        await initializeZulipClient();
+        enabledServices.push("Zulip");
+      } catch (error) {
+        console.error("Failed to initialize Zulip:", error);
+        if (!ENABLE_DISCORD) throw error; // If only Zulip was requested, fail
+      }
+    }
+    
+    // Initialize Discord if enabled
+    if (ENABLE_DISCORD) {
+      try {
+        await initializeDiscordClient();
+        enabledServices.push("Discord");
+      } catch (error) {
+        console.error("Failed to initialize Discord:", error);
+        if (!ENABLE_ZULIP) throw error; // If only Discord was requested, fail
+      }
+    }
+    
+    if (enabledServices.length === 0) {
+      throw new Error("No services enabled. Set ENABLE_ZULIP=true or ENABLE_DISCORD=true");
+    }
     
     const transport = new StdioServerTransport();
     await server.connect(transport);
     
-    console.error("Zulip MCP server running on stdio");
+    console.error(`MCP server running with: ${enabledServices.join(", ")}`);
   } catch (error) {
     console.error("Failed to start server:", error);
     process.exit(1);
