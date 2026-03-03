@@ -488,6 +488,11 @@ function getTools(): Tool[] {
           description: "Include subscribed streams",
           default: true,
         },
+        verbose: {
+          type: "boolean",
+          description: "Include full raw API response (warning: very large)",
+          default: false,
+        },
       },
     },
   },
@@ -500,6 +505,11 @@ function getTools(): Tool[] {
         stream_id: {
           type: "number",
           description: "ID of the stream",
+        },
+        verbose: {
+          type: "boolean",
+          description: "Include full raw API response (warning: very large)",
+          default: false,
         },
       },
       required: ["stream_id"],
@@ -514,6 +524,11 @@ function getTools(): Tool[] {
         client_gravatar: {
           type: "boolean",
           description: "Whether to include gravatar URLs",
+          default: false,
+        },
+        verbose: {
+          type: "boolean",
+          description: "Include full raw API response (warning: very large)",
           default: false,
         },
       },
@@ -1035,7 +1050,8 @@ async function handleToolCall(name: string, args: any): Promise<any> {
       return {
         total_streams: streams.length,
         formatted_list: `📋 **${streams.length} Streams**\n\n${formatted}`,
-        raw_data: result,
+        stream_ids: Object.fromEntries(streams.map((s: any) => [s.name, s.stream_id])),
+        ...(args.verbose && { raw_data: result }),
       };
     }
 
@@ -1052,7 +1068,7 @@ async function handleToolCall(name: string, args: any): Promise<any> {
       return {
         topic_count: topics.length,
         formatted_list: `📑 **${topics.length} Topics**\n\n${formatted}`,
-        raw_data: result,
+        ...(args.verbose && { raw_data: result }),
       };
     }
 
@@ -1075,7 +1091,7 @@ async function handleToolCall(name: string, args: any): Promise<any> {
         total_users: users.length,
         active_users: users.filter((u: any) => u.is_active).length,
         formatted_list: `👥 **${users.length} Users** (${users.filter((u: any) => u.is_active).length} active)\n\n${formatted}`,
-        raw_data: result,
+        ...(args.verbose && { raw_data: result }),
       };
     }
 
