@@ -12,9 +12,23 @@ import {
 import zulipInit from "zulip-js";
 import { Client as DiscordClient, GatewayIntentBits, TextChannel, Message } from "discord.js";
 
+// MCPL imports
+import { McplClient } from './mcpl/client.js';
+import { McplDispatcher } from './mcpl/dispatcher.js';
+import { McplTransport } from './mcpl/transport.js';
+import { ChannelManager } from './mcpl/channels.js';
+import { ContextProvider } from './mcpl/context.js';
+import { ZulipEventLoop } from './mcpl/zulip-events.js';
+import { buildServerCapabilities } from './mcpl/feature-sets.js';
+import { McplMethod } from './mcpl/types.js';
+import type { ChannelIncomingMessage, McplTextContent, ChannelsPublishParams, ChannelsOpenParams, ChannelsCloseParams, BeforeInferenceParams, FeatureSetsUpdateParams } from './mcpl/types.js';
+
 // Startup flags
 const ENABLE_ZULIP = process.env.ENABLE_ZULIP !== "false";
 const ENABLE_DISCORD = process.env.ENABLE_DISCORD === "true";
+const MCPL_ENABLED = process.env.MCPL_ENABLED !== "false";
+const MCPL_BATCH_WINDOW_MS = parseInt(process.env.MCPL_BATCH_WINDOW_MS || "500", 10);
+const MCPL_CONTEXT_HISTORY_SIZE = parseInt(process.env.MCPL_CONTEXT_HISTORY_SIZE || "20", 10);
 
 // Initialize clients
 let zulipClient: any = null;
@@ -189,7 +203,7 @@ function parseDate(dateStr: string | undefined, defaultDate: Date): Date {
 }
 
 // Helper function to strip HTML and format content with mention handling
-function cleanContent(html: string): string {
+export function cleanContent(html: string): string {
   let content = html;
   
   // Extract Zulip mentions first
@@ -219,7 +233,7 @@ function cleanContent(html: string): string {
 }
 
 // Helper to format Discord mentions
-function formatDiscordContent(content: string, mentions: any): string {
+export function formatDiscordContent(content: string, mentions: any): string {
   let formatted = content;
   
   // Replace user mentions with readable format
@@ -260,7 +274,7 @@ function formatDiscordContent(content: string, mentions: any): string {
 }
 
 // Helper function to format Discord messages
-function formatDiscordMessages(messages: any[], format: string): string {
+export function formatDiscordMessages(messages: any[], format: string): string {
   if (format === 'raw') {
     return JSON.stringify(messages, null, 2);
   }
@@ -289,7 +303,7 @@ function formatDiscordMessages(messages: any[], format: string): string {
 }
 
 // Helper function to format messages
-function formatMessages(messages: any[], format: string): string {
+export function formatMessages(messages: any[], format: string): string {
   if (format === 'raw') {
     return JSON.stringify(messages, null, 2);
   }
@@ -1582,6 +1596,9 @@ async function handleToolCall(name: string, args: any): Promise<any> {
   }
 }
 
+// Build MCPL capabilities (used in server constructor when MCPL is enabled)
+const mcplServerCaps = MCPL_ENABLED ? buildServerCapabilities(ENABLE_ZULIP, ENABLE_DISCORD) : null;
+
 // Create and configure the server
 const server = new Server(
   {
@@ -1592,6 +1609,7 @@ const server = new Server(
     capabilities: {
       tools: {},
       resources: {},
+      ...(mcplServerCaps ? { experimental: { mcpl: mcplServerCaps } } : {}),
     },
   }
 );
@@ -1940,7 +1958,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 async function main() {
   try {
     const enabledServices: string[] = [];
-    
+
     // Initialize Zulip if enabled
     if (ENABLE_ZULIP) {
       try {
@@ -1951,7 +1969,7 @@ async function main() {
         if (!ENABLE_DISCORD) throw error; // If only Zulip was requested, fail
       }
     }
-    
+
     // Initialize Discord if enabled
     if (ENABLE_DISCORD) {
       try {
@@ -1962,15 +1980,113 @@ async function main() {
         if (!ENABLE_ZULIP) throw error; // If only Discord was requested, fail
       }
     }
-    
+
     if (enabledServices.length === 0) {
       throw new Error("No services enabled. Set ENABLE_ZULIP=true or ENABLE_DISCORD=true");
     }
-    
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    
-    console.error(`MCP server running with: ${enabledServices.join(", ")}`);
+
+    if (MCPL_ENABLED) {
+      // -- MCPL mode --
+      const client = new McplClient();
+      const dispatcher = new McplDispatcher();
+      const channelManager = new ChannelManager(
+        client, zulipClient, discordClient, MCPL_BATCH_WINDOW_MS,
+      );
+      const contextProvider = new ContextProvider(
+        channelManager, zulipClient, discordClient, cleanContent, MCPL_CONTEXT_HISTORY_SIZE,
+      );
+
+      // Register dispatcher handlers
+      dispatcher.register(McplMethod.BeforeInference, (params) =>
+        contextProvider.handleBeforeInference(params as unknown as BeforeInferenceParams),
+      );
+      dispatcher.register(McplMethod.AfterInference, () => ({}));
+      dispatcher.register(McplMethod.FeatureSetsUpdate, (_params) => {
+        // Acknowledge feature set updates from the host
+        return {};
+      });
+      dispatcher.register(McplMethod.ChannelsOpen, (params) =>
+        channelManager.openChannel(params as unknown as ChannelsOpenParams),
+      );
+      dispatcher.register(McplMethod.ChannelsClose, (params) =>
+        channelManager.closeChannel(params as unknown as ChannelsCloseParams),
+      );
+      dispatcher.register(McplMethod.ChannelsList, () =>
+        channelManager.listChannels(),
+      );
+      dispatcher.register(McplMethod.ChannelsPublish, (params) =>
+        channelManager.publish(params as unknown as ChannelsPublishParams),
+      );
+
+      // Create MCPL transport and connect
+      const transport = new McplTransport(dispatcher, client);
+      await server.connect(transport);
+
+      // After handshake completes, register channels and start event loops
+      // Use a small delay to ensure the initialize handshake is complete
+      setTimeout(async () => {
+        try {
+          await channelManager.registerChannels();
+        } catch (error) {
+          console.error('Failed to register channels after connect:', error);
+        }
+      }, 1000);
+
+      // Start Zulip event loop for real-time messages
+      if (zulipClient) {
+        const zulipEventLoop = new ZulipEventLoop();
+        zulipEventLoop.start(zulipClient, (streamName, msg) => {
+          const channelId = `zulip:${streamName}`;
+          const incoming: ChannelIncomingMessage = {
+            channelId,
+            messageId: String(msg.id),
+            threadId: msg.subject || undefined,
+            author: { id: String(msg.sender_id), name: msg.sender_full_name },
+            timestamp: new Date(msg.timestamp * 1000).toISOString(),
+            content: [{ type: 'text', text: cleanContent(msg.content) }],
+            metadata: {
+              senderEmail: msg.sender_email,
+              topic: msg.subject,
+              botUserId: sessionId,
+            },
+          };
+          channelManager.onIncomingMessage(channelId, incoming);
+        }).catch(error => {
+          console.error('Zulip event loop failed:', error);
+        });
+      }
+
+      // Wire Discord messageCreate for real-time messages
+      if (discordClient) {
+        discordClient.on('messageCreate', (msg) => {
+          // Ignore bot's own messages
+          if (msg.author.id === discordClient!.user?.id) return;
+          if (!msg.guild) return; // Ignore DMs
+
+          const channelId = `discord:${msg.guild.id}:${msg.channelId}`;
+          const incoming: ChannelIncomingMessage = {
+            channelId,
+            messageId: msg.id,
+            author: { id: msg.author.id, name: msg.author.tag },
+            timestamp: msg.createdAt.toISOString(),
+            content: [{ type: 'text', text: formatDiscordContent(msg.content, msg.mentions) }],
+            metadata: {
+              mentionIds: Array.from(msg.mentions.users.keys()),
+              replyToAuthorId: msg.reference?.messageId ? msg.author.id : undefined,
+              botUserId: discordClient!.user?.id,
+            },
+          };
+          channelManager.onIncomingMessage(channelId, incoming);
+        });
+      }
+
+      console.error(`MCPL server running with: ${enabledServices.join(", ")}`);
+    } else {
+      // -- Plain MCP mode --
+      const transport = new StdioServerTransport();
+      await server.connect(transport);
+      console.error(`MCP server running with: ${enabledServices.join(", ")}`);
+    }
   } catch (error) {
     console.error("Failed to start server:", error);
     process.exit(1);
