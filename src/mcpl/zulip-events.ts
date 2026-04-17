@@ -48,11 +48,15 @@ export class ZulipEventLoop {
   }
 
   private async pollLoop(zulipClient: any, onMessage: OnZulipMessage): Promise<void> {
-    // Register event queue
+    // Register event queue.
+    // Two zulip-js quirks to work around:
+    //   - Booleans crash FormData serialization; pass "true"/"false" as strings.
+    //   - Arrays must be raw JS arrays (the library JSON.stringifies them);
+    //     pre-stringified JSON produces "event_types is not a list" at Zulip.
     const registration = await zulipClient.queues.register({
-      event_types: JSON.stringify(['message']),
-      all_public_streams: true,
-      apply_markdown: false,
+      event_types: ['message'],
+      all_public_streams: 'true',
+      apply_markdown: 'false',
     });
 
     this.queueId = registration.queue_id;
