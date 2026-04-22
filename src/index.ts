@@ -2126,8 +2126,12 @@ async function main() {
         channelManager.publish(params as unknown as ChannelsPublishParams),
       );
       dispatcher.register(McplMethod.ChannelsTyping, async (params) => {
-        const p = params as { channelId: string; metadata?: Record<string, unknown> };
-        await channelManager.sendTyping(p.channelId, p.metadata);
+        const p = params as {
+          channelId: string;
+          metadata?: Record<string, unknown>;
+          op?: 'start' | 'stop';
+        };
+        await channelManager.sendTyping(p.channelId, p.metadata, p.op);
         return {};
       });
 

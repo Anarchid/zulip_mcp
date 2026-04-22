@@ -195,7 +195,11 @@ export class ChannelManager {
    * throws a TypeError before the HTTP request is made. The Zulip server ignores
    * `to` when `type:'stream'` is set.
    */
-  async sendTyping(channelId: string, metadata?: Record<string, unknown>): Promise<void> {
+  async sendTyping(
+    channelId: string,
+    metadata?: Record<string, unknown>,
+    op: 'start' | 'stop' = 'start',
+  ): Promise<void> {
     if (!channelId.startsWith('zulip:')) return;
     if (!this.zulipClient) return;
 
@@ -213,15 +217,15 @@ export class ChannelManager {
         type: 'stream',
         stream_id: streamId,
         topic,
-        op: 'start',
+        op,
         to: [],
       });
       if (result?.result && result.result !== 'success') {
-        console.error(`[zulip-mcp] typing.send non-success: ${result.result} ${result.msg ?? ''}`);
+        console.error(`[zulip-mcp] typing.send(${op}) non-success: ${result.result} ${result.msg ?? ''}`);
       }
     } catch (err) {
       // Best-effort — swallow errors so typing never breaks the agent.
-      console.error('[zulip-mcp] typing.send failed:', (err as Error).message);
+      console.error(`[zulip-mcp] typing.send(${op}) failed:`, (err as Error).message);
     }
   }
 
