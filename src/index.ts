@@ -2125,6 +2125,11 @@ async function main() {
       dispatcher.register(McplMethod.ChannelsPublish, (params) =>
         channelManager.publish(params as unknown as ChannelsPublishParams),
       );
+      dispatcher.register(McplMethod.ChannelsTyping, async (params) => {
+        const p = params as { channelId: string; metadata?: Record<string, unknown> };
+        await channelManager.sendTyping(p.channelId, p.metadata);
+        return {};
+      });
 
       // Create MCPL transport and connect
       const transport = new McplTransport(dispatcher, client);

@@ -180,6 +180,52 @@ export class ChannelManager {
   }
 
   /**
+   * Handle channels/typing — best-effort typing indicator.
+   *
+   * Routing metadata travels with the notification; the host (via whatever
+   * inference logic it uses — most commonly the most recent incoming message
+   * on this channel) provides a `topic` key pointing at the active Zulip
+   * thread. Falls back to 'mcpl' if the host didn't provide one.
+   *
+   * Zulip typing events auto-expire server-side (~15s), so there's no stop op;
+   * the host refreshes every 7s while inference is active.
+   *
+   * Note: zulip-js's `typing.send` unconditionally dereferences `params.to.length`,
+   * so we must pass `to: []` even for the stream form — otherwise the library
+   * throws a TypeError before the HTTP request is made. The Zulip server ignores
+   * `to` when `type:'stream'` is set.
+   */
+  async sendTyping(channelId: string, metadata?: Record<string, unknown>): Promise<void> {
+    if (!channelId.startsWith('zulip:')) return;
+    if (!this.zulipClient) return;
+
+    const descriptor = this.allChannels.get(channelId);
+    const streamId = descriptor?.address?.stream_id as number | undefined;
+    if (!streamId) {
+      console.error(`[zulip-mcp] sendTyping: no stream_id for ${channelId} (descriptor=${descriptor ? 'present' : 'missing'})`);
+      return;
+    }
+
+    const topic = typeof metadata?.topic === 'string' ? metadata.topic : 'mcpl';
+
+    try {
+      const result = await (this.zulipClient.typing.send as (p: unknown) => Promise<{ result?: string; msg?: string }>)({
+        type: 'stream',
+        stream_id: streamId,
+        topic,
+        op: 'start',
+        to: [],
+      });
+      if (result?.result && result.result !== 'success') {
+        console.error(`[zulip-mcp] typing.send non-success: ${result.result} ${result.msg ?? ''}`);
+      }
+    } catch (err) {
+      // Best-effort — swallow errors so typing never breaks the agent.
+      console.error('[zulip-mcp] typing.send failed:', (err as Error).message);
+    }
+  }
+
+  /**
    * Get the set of currently open channel IDs.
    */
   getOpenChannels(): Set<string> {
