@@ -32,6 +32,7 @@ const MCPL_CONTEXT_HISTORY_SIZE = parseInt(process.env.MCPL_CONTEXT_HISTORY_SIZE
 
 // Initialize clients
 let zulipClient: any = null;
+let zulipSelfUserId: number | null = null;
 let discordClient: DiscordClient | null = null;
 
 // Session and state management
@@ -146,11 +147,41 @@ async function initializeZulipClient(): Promise<void> {
   }
 
   zulipClient = await zulipInit(config);
-  
+
   // Set up session ID and load persistent state
   sessionId = process.env.ZULIP_SESSION_ID || process.env.ZULIP_EMAIL || process.env.ZULIP_USERNAME || "default";
   loadState(sessionId);
-  
+
+  // Fail-open: if profile fetch fails, leave zulipSelfUserId null (no self-filter).
+  try {
+    const profile = await zulipClient.users.me.getProfile();
+    if (profile && typeof profile.user_id === "number") {
+      zulipSelfUserId = profile.user_id;
+      console.error(`Zulip MCP bot user_id: ${zulipSelfUserId}`);
+    }
+  } catch (err) {
+    console.error("Failed to fetch bot profile for self-filter:", err);
+  }
+
+  // Auto-subscribe to streams named in ZULIP_SUBSCRIBE (comma-separated).
+  // Needed because Zulip's event queue only delivers message events for streams
+  // the bot is subscribed to, even with all_public_streams: true on the queue.
+  if (process.env.ZULIP_SUBSCRIBE) {
+    const streams = process.env.ZULIP_SUBSCRIBE.split(",").map(s => s.trim()).filter(Boolean);
+    if (streams.length > 0) {
+      try {
+        const result = await zulipClient.users.me.subscriptions.add({
+          subscriptions: streams.map(name => ({ name })),
+        });
+        const subscribed = result?.subscribed ?? {};
+        const already = result?.already_subscribed ?? {};
+        console.error(`Zulip MCP auto-subscribed: new=${JSON.stringify(subscribed)} already=${JSON.stringify(already)}`);
+      } catch (err) {
+        console.error(`Zulip MCP auto-subscribe failed for [${streams.join(", ")}]:`, err);
+      }
+    }
+  }
+
   console.error(`Zulip MCP initialized with session: ${sessionId}`);
 }
 
@@ -364,6 +395,38 @@ function getTools(): Tool[] {
           description: "Channel names to stop monitoring. If not provided, stops all.",
         },
       },
+    },
+  },
+  {
+    name: "listen",
+    description:
+      "Subscribe the bot to one or more Zulip streams. Required before the bot can receive real-time message events from a stream — event queues with all_public_streams only deliver events for streams the bot is subscribed to. Subscription persists server-side across session restarts.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channels: {
+          type: "array",
+          items: { type: "string" },
+          description: "Stream names to subscribe to (e.g., ['tracker-miner-f', 'infra']).",
+        },
+      },
+      required: ["channels"],
+    },
+  },
+  {
+    name: "unlisten",
+    description:
+      "Unsubscribe the bot from one or more Zulip streams. After this, the bot stops receiving real-time events for those streams until listen is called again. Unsubscription persists server-side.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channels: {
+          type: "array",
+          items: { type: "string" },
+          description: "Stream names to unsubscribe from.",
+        },
+      },
+      required: ["channels"],
     },
   },
   {
@@ -861,6 +924,51 @@ async function handleToolCall(name: string, args: any): Promise<any> {
         stopped_channels: stopped,
         still_monitoring: Array.from(monitoredChannels.keys()),
       };
+    }
+
+    case "listen": {
+      const channels: string[] = args.channels;
+      if (!Array.isArray(channels) || channels.length === 0) {
+        return { error: "channels array is required and must be non-empty" };
+      }
+      try {
+        const result = await zulipClient.users.me.subscriptions.add({
+          subscriptions: channels.map(name => ({ name })),
+        });
+        return {
+          result: result?.result,
+          subscribed: result?.subscribed ?? {},
+          already_subscribed: result?.already_subscribed ?? {},
+          unauthorized: result?.unauthorized ?? [],
+          msg: result?.msg,
+        };
+      } catch (error) {
+        return {
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+
+    case "unlisten": {
+      const channels: string[] = args.channels;
+      if (!Array.isArray(channels) || channels.length === 0) {
+        return { error: "channels array is required and must be non-empty" };
+      }
+      try {
+        const result = await zulipClient.users.me.subscriptions.remove({
+          subscriptions: JSON.stringify(channels),
+        });
+        return {
+          result: result?.result,
+          removed: result?.removed ?? [],
+          not_removed: result?.not_removed ?? [],
+          msg: result?.msg,
+        };
+      } catch (error) {
+        return {
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
     }
 
     case "get_monitored_channels": {
@@ -2017,6 +2125,15 @@ async function main() {
       dispatcher.register(McplMethod.ChannelsPublish, (params) =>
         channelManager.publish(params as unknown as ChannelsPublishParams),
       );
+      dispatcher.register(McplMethod.ChannelsTyping, async (params) => {
+        const p = params as {
+          channelId: string;
+          metadata?: Record<string, unknown>;
+          op?: 'start' | 'stop';
+        };
+        await channelManager.sendTyping(p.channelId, p.metadata, p.op);
+        return {};
+      });
 
       // Create MCPL transport and connect
       const transport = new McplTransport(dispatcher, client);
@@ -2036,6 +2153,7 @@ async function main() {
       if (zulipClient) {
         const zulipEventLoop = new ZulipEventLoop();
         zulipEventLoop.start(zulipClient, (streamName, msg) => {
+          if (zulipSelfUserId !== null && msg.sender_id === zulipSelfUserId) return;
           const channelId = `zulip:${streamName}`;
           const incoming: ChannelIncomingMessage = {
             channelId,
@@ -2047,7 +2165,7 @@ async function main() {
             metadata: {
               senderEmail: msg.sender_email,
               topic: msg.subject,
-              botUserId: sessionId,
+              botUserId: zulipSelfUserId !== null ? String(zulipSelfUserId) : sessionId,
             },
           };
           channelManager.onIncomingMessage(channelId, incoming);

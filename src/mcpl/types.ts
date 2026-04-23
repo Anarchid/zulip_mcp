@@ -192,6 +192,7 @@ export const McplMethod = {
   ChannelsClose: 'channels/close',
   ChannelsPublish: 'channels/publish',
   ChannelsIncoming: 'channels/incoming',
+  ChannelsTyping: 'channels/typing',
 } as const;
 
 export type McplMethodName = (typeof McplMethod)[keyof typeof McplMethod];
