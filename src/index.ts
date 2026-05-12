@@ -33,7 +33,62 @@ const MCPL_CONTEXT_HISTORY_SIZE = parseInt(process.env.MCPL_CONTEXT_HISTORY_SIZE
 // Initialize clients
 let zulipClient: any = null;
 let zulipSelfUserId: number | null = null;
+let zulipRealm: string = "";
+let zulipAuthHeader: string = "";
 let discordClient: DiscordClient | null = null;
+
+// Anthropic refuses images larger than this; mirror their cap server-side
+// so an over-eager fetch can't poison the agent's next turn.
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+
+interface AttachmentRef {
+  path: string;       // e.g. "/user_uploads/2/Ab/cd/screenshot.png"
+  name: string;       // basename for human display
+  mimeType: string;   // best-effort from extension
+  isImage: boolean;
+}
+
+const IMAGE_EXT_MIME: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+};
+
+const NONIMAGE_EXT_MIME: Record<string, string> = {
+  pdf: 'application/pdf',
+  txt: 'text/plain',
+  md: 'text/markdown',
+  json: 'application/json',
+  csv: 'text/csv',
+};
+
+function classifyExtension(name: string): { mimeType: string; isImage: boolean } {
+  const ext = name.split('.').pop()?.toLowerCase() ?? '';
+  if (IMAGE_EXT_MIME[ext]) return { mimeType: IMAGE_EXT_MIME[ext], isImage: true };
+  if (NONIMAGE_EXT_MIME[ext]) return { mimeType: NONIMAGE_EXT_MIME[ext], isImage: false };
+  return { mimeType: 'application/octet-stream', isImage: false };
+}
+
+// Zulip uploads appear in markdown as `[name](/user_uploads/X/Yy/Zz/name.ext)`
+// or inline-image syntax `![name](/user_uploads/...)`. We pull paths out so the
+// agent can request the bytes on demand via fetch_attachment.
+export function extractZulipAttachments(rawContent: string): AttachmentRef[] {
+  const refs: AttachmentRef[] = [];
+  const seen = new Set<string>();
+  const re = /\/user_uploads\/[^\s)>\]"']+/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(rawContent)) !== null) {
+    const path = m[0];
+    if (seen.has(path)) continue;
+    seen.add(path);
+    const name = decodeURIComponent(path.split('/').pop() ?? 'attachment');
+    const { mimeType, isImage } = classifyExtension(name);
+    refs.push({ path, name, mimeType, isImage });
+  }
+  return refs;
+}
 
 // Session and state management
 interface ChannelState {
@@ -147,6 +202,16 @@ async function initializeZulipClient(): Promise<void> {
   }
 
   zulipClient = await zulipInit(config);
+
+  // Capture realm + auth for direct fetches (zulip-js doesn't expose user_uploads).
+  // zulip-js stores the resolved config on the client; fall back to the input config.
+  const resolved = (zulipClient && zulipClient.config) || config;
+  zulipRealm = (resolved.realm || config.realm || "").replace(/\/+$/, "");
+  const email = resolved.username || config.username || process.env.ZULIP_EMAIL || process.env.ZULIP_USERNAME || "";
+  const apiKey = resolved.apiKey || config.apiKey || process.env.ZULIP_API_KEY || "";
+  if (email && apiKey) {
+    zulipAuthHeader = "Basic " + Buffer.from(`${email}:${apiKey}`).toString("base64");
+  }
 
   // Set up session ID and load persistent state
   sessionId = process.env.ZULIP_SESSION_ID || process.env.ZULIP_EMAIL || process.env.ZULIP_USERNAME || "default";
@@ -650,6 +715,24 @@ function getTools(): Tool[] {
       },
       required: ["query"],
     },
+  },
+  {
+    name: "fetch_attachment",
+    description:
+      "Fetch a Zulip user-upload attachment by path and return its bytes as an inline content block. " +
+      "For images (png/jpg/jpeg/gif/webp), returns an image block usable by vision models. " +
+      "For other types, returns a base64 data block. Paths look like '/user_uploads/X/Yy/Zz/name.ext' " +
+      "and appear in incoming message attachment refs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Attachment path (e.g. '/user_uploads/2/Ab/cd/screenshot.png') or full Zulip URL.",
+        },
+      },
+      required: ["path"],
+    },
     });
   }
   
@@ -827,6 +910,23 @@ function getTools(): Tool[] {
           description: "Channel IDs to stop monitoring (optional, stops all if not provided)",
         },
       },
+    },
+  },
+  {
+    name: "discord_fetch_attachment",
+    description:
+      "Fetch a Discord attachment by URL and return its bytes as an inline content block. " +
+      "For images, returns an image block usable by vision models. URLs are provided in " +
+      "incoming Discord message attachment refs (Discord CDN, no auth required).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "Full Discord CDN URL of the attachment.",
+        },
+      },
+      required: ["url"],
     },
     });
   }
@@ -1260,6 +1360,82 @@ async function handleToolCall(name: string, args: any): Promise<any> {
           is_bot: u.is_bot,
           mention_syntax: `@**${u.full_name}**`,
         })),
+      };
+    }
+
+    case "fetch_attachment": {
+      const rawPath = String(args.path || "");
+      if (!rawPath) throw new Error("path is required");
+      let url: string;
+      if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
+        url = rawPath;
+      } else {
+        if (!zulipRealm) throw new Error("Zulip realm not configured");
+        url = `${zulipRealm}${rawPath.startsWith("/") ? "" : "/"}${rawPath}`;
+      }
+      const headers: Record<string, string> = {};
+      if (zulipAuthHeader) headers["Authorization"] = zulipAuthHeader;
+      const resp = await fetch(url, { headers, redirect: "follow" });
+      if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
+        throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
+      }
+      const headerMime = resp.headers.get("content-type")?.split(";")[0].trim();
+      const name = decodeURIComponent(rawPath.split("/").pop() || "attachment");
+      const classified = classifyExtension(name);
+      const mimeType = headerMime || classified.mimeType;
+      const isImage = mimeType.startsWith("image/");
+      const base64 = buf.toString("base64");
+      if (isImage) {
+        return {
+          _content: [
+            { type: "text", text: `Fetched ${name} (${mimeType}, ${buf.byteLength} bytes):` },
+            { type: "image", data: base64, mimeType },
+          ],
+        };
+      }
+      return {
+        name,
+        mimeType,
+        size: buf.byteLength,
+        base64,
+        note: "Non-image attachment returned as base64. Decode externally as needed.",
+      };
+    }
+
+    case "discord_fetch_attachment": {
+      const url = String(args.url || "");
+      if (!url) throw new Error("url is required");
+      if (!url.startsWith("http://") && !url.startsWith("https://")) {
+        throw new Error("url must be a full https:// link");
+      }
+      const resp = await fetch(url, { redirect: "follow" });
+      if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
+        throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
+      }
+      const headerMime = resp.headers.get("content-type")?.split(";")[0].trim();
+      const name = decodeURIComponent(url.split("?")[0].split("/").pop() || "attachment");
+      const classified = classifyExtension(name);
+      const mimeType = headerMime || classified.mimeType;
+      const isImage = mimeType.startsWith("image/");
+      const base64 = buf.toString("base64");
+      if (isImage) {
+        return {
+          _content: [
+            { type: "text", text: `Fetched ${name} (${mimeType}, ${buf.byteLength} bytes):` },
+            { type: "image", data: base64, mimeType },
+          ],
+        };
+      }
+      return {
+        name,
+        mimeType,
+        size: buf.byteLength,
+        base64,
+        note: "Non-image attachment returned as base64. Decode externally as needed.",
       };
     }
 
@@ -1730,6 +1906,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     const result = await handleToolCall(request.params.name, request.params.arguments);
+    // Tools that need to return image/non-text content set `_content` directly.
+    if (result && typeof result === "object" && Array.isArray((result as any)._content)) {
+      return { content: (result as any)._content };
+    }
     return {
       content: [
         {
@@ -2155,17 +2335,32 @@ async function main() {
         zulipEventLoop.start(zulipClient, (streamName, msg) => {
           if (zulipSelfUserId !== null && msg.sender_id === zulipSelfUserId) return;
           const channelId = `zulip:${streamName}`;
+          const cleaned = cleanContent(msg.content);
+          const attachments = extractZulipAttachments(msg.content);
+          const content: McplTextContent[] = [{ type: 'text', text: cleaned }];
+          if (attachments.length > 0) {
+            // Reference-only by default: agent reads the note, then decides
+            // whether to call fetch_attachment to pull bytes into context.
+            const lines = attachments.map(a =>
+              `- ${a.name} (${a.mimeType})${a.isImage ? ' — image, fetchable via fetch_attachment' : ''}: ${a.path}`,
+            );
+            content.push({
+              type: 'text',
+              text: `[attachments: ${attachments.length}]\n${lines.join('\n')}`,
+            });
+          }
           const incoming: ChannelIncomingMessage = {
             channelId,
             messageId: String(msg.id),
             threadId: msg.subject || undefined,
             author: { id: String(msg.sender_id), name: msg.sender_full_name },
             timestamp: new Date(msg.timestamp * 1000).toISOString(),
-            content: [{ type: 'text', text: cleanContent(msg.content) }],
+            content,
             metadata: {
               senderEmail: msg.sender_email,
               topic: msg.subject,
               botUserId: zulipSelfUserId !== null ? String(zulipSelfUserId) : sessionId,
+              ...(attachments.length > 0 ? { attachments } : {}),
             },
           };
           channelManager.onIncomingMessage(channelId, incoming);
@@ -2182,16 +2377,38 @@ async function main() {
           if (!msg.guild) return; // Ignore DMs
 
           const channelId = `discord:${msg.guild.id}:${msg.channelId}`;
+          const cleaned = formatDiscordContent(msg.content, msg.mentions);
+          const attachments: AttachmentRef[] = Array.from(msg.attachments.values()).map((a: any) => {
+            const name = a.name ?? 'attachment';
+            const { mimeType, isImage } = classifyExtension(name);
+            return {
+              path: a.url,            // Discord CDN URL, no auth needed
+              name,
+              mimeType: a.contentType || mimeType,
+              isImage: (a.contentType || mimeType).startsWith('image/'),
+            };
+          });
+          const content: McplTextContent[] = [{ type: 'text', text: cleaned }];
+          if (attachments.length > 0) {
+            const lines = attachments.map(a =>
+              `- ${a.name} (${a.mimeType})${a.isImage ? ' — image, fetchable via discord_fetch_attachment' : ''}: ${a.path}`,
+            );
+            content.push({
+              type: 'text',
+              text: `[attachments: ${attachments.length}]\n${lines.join('\n')}`,
+            });
+          }
           const incoming: ChannelIncomingMessage = {
             channelId,
             messageId: msg.id,
             author: { id: msg.author.id, name: msg.author.tag },
             timestamp: msg.createdAt.toISOString(),
-            content: [{ type: 'text', text: formatDiscordContent(msg.content, msg.mentions) }],
+            content,
             metadata: {
               mentionIds: Array.from(msg.mentions.users.keys()),
               replyToAuthorId: msg.reference?.messageId ? msg.author.id : undefined,
               botUserId: discordClient!.user?.id,
+              ...(attachments.length > 0 ? { attachments } : {}),
             },
           };
           channelManager.onIncomingMessage(channelId, incoming);
