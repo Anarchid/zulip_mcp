@@ -41,6 +41,10 @@ let discordClient: DiscordClient | null = null;
 // so an over-eager fetch can't poison the agent's next turn.
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
+// MIME types we decode and return as `content_text` instead of base64,
+// so the agent can read them directly (CSVs, JSON, plain text, etc).
+const TEXT_MIME_RE = /^(text\/|application\/(json|xml|x-yaml|yaml|csv|x-www-form-urlencoded)\b)/i;
+
 interface AttachmentRef {
   path: string;       // e.g. "/user_uploads/2/Ab/cd/screenshot.png"
   name: string;       // basename for human display
@@ -204,11 +208,30 @@ async function initializeZulipClient(): Promise<void> {
   zulipClient = await zulipInit(config);
 
   // Capture realm + auth for direct fetches (zulip-js doesn't expose user_uploads).
-  // zulip-js stores the resolved config on the client; fall back to the input config.
+  // Preference order: resolved client config, input config, env vars, zuliprc file.
   const resolved = (zulipClient && zulipClient.config) || config;
-  zulipRealm = (resolved.realm || config.realm || "").replace(/\/+$/, "");
-  const email = resolved.username || config.username || process.env.ZULIP_EMAIL || process.env.ZULIP_USERNAME || "";
-  const apiKey = resolved.apiKey || config.apiKey || process.env.ZULIP_API_KEY || "";
+  let realm = (resolved.realm || config.realm || "").replace(/\/+$/, "");
+  let email = resolved.username || config.username || process.env.ZULIP_EMAIL || process.env.ZULIP_USERNAME || "";
+  let apiKey = resolved.apiKey || config.apiKey || process.env.ZULIP_API_KEY || "";
+
+  // Final fallback: parse the zuliprc file directly if any field is still missing.
+  if ((!realm || !email || !apiKey) && config.zuliprc) {
+    try {
+      const raw = readFileSync(config.zuliprc, "utf-8");
+      const parsed: Record<string, string> = {};
+      for (const line of raw.split(/\r?\n/)) {
+        const m = line.match(/^\s*(email|key|site)\s*=\s*(.+?)\s*$/);
+        if (m) parsed[m[1]] = m[2];
+      }
+      if (!realm && parsed.site) realm = parsed.site.replace(/\/+$/, "");
+      if (!email && parsed.email) email = parsed.email;
+      if (!apiKey && parsed.key) apiKey = parsed.key;
+    } catch (err) {
+      console.error("Failed to parse zuliprc for direct-HTTP credentials:", err);
+    }
+  }
+
+  zulipRealm = realm;
   if (email && apiKey) {
     zulipAuthHeader = "Basic " + Buffer.from(`${email}:${apiKey}`).toString("base64");
   }
@@ -298,22 +321,50 @@ function parseDate(dateStr: string | undefined, defaultDate: Date): Date {
   return new Date(dateStr);
 }
 
-// Helper function to strip HTML and format content with mention handling
+// Helper function to strip HTML and format content with mention handling.
+// Used on paths where Zulip returns rendered HTML (get_channel_history,
+// context/beforeInference message history). The push-event path receives raw
+// markdown (apply_markdown:false) where /user_uploads/ paths are already
+// textual, so attachment refs there are extracted by extractZulipAttachments.
 export function cleanContent(html: string): string {
   let content = html;
-  
+
   // Extract Zulip mentions first
   content = content.replace(
     /<span class="user-mention"[^>]*data-user-id="(\d+)"[^>]*>@([^<]+)<\/span>/g,
     '@$2 (uid:$1)'
   );
-  
+
   // Handle silent mentions
   content = content.replace(
     /<span class="user-mention silent"[^>]*data-user-id="(\d+)"[^>]*>([^<]+)<\/span>/g,
     '$2 (uid:$1)'
   );
-  
+
+  // Preserve attachment / inline-image URLs before the generic tag strip below
+  // eats them. Zulip renders uploads as `<a href="/user_uploads/...">name</a>`
+  // and inline images as the same anchor wrapping an `<img>`. Without this,
+  // history fetches lose the URL and the agent can't call fetch_attachment.
+  content = content.replace(
+    /<a [^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g,
+    (_match, href: string, inner: string) => {
+      const hasImg = /<img\b/i.test(inner);
+      const text = inner.replace(/<[^>]*>/g, '').trim();
+      if (href.startsWith('/user_uploads/')) {
+        if (hasImg) return `[image: ${href}]`;
+        return text ? `[attachment: ${text} — ${href}]` : `[attachment: ${href}]`;
+      }
+      if (hasImg) return `[image: ${href}]`;
+      return text ? `${text} (${href})` : href;
+    }
+  );
+
+  // Bare `<img>` tags (rare in Zulip, but possible via external image previews).
+  content = content.replace(
+    /<img [^>]*src="([^"]+)"[^>]*>/g,
+    '[image: $1]'
+  );
+
   // Clean up HTML
   content = content
     .replace(/<p>/gi, '\n')
@@ -324,7 +375,7 @@ export function cleanContent(html: string): string {
     .replace(/&amp;/g, '&')
     .replace(/&quot;/g, '"')
     .trim();
-  
+
   return content;
 }
 
@@ -1368,7 +1419,15 @@ async function handleToolCall(name: string, args: any): Promise<any> {
       if (!rawPath) throw new Error("path is required");
       let url: string;
       if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
-        url = rawPath;
+        // Allow full URLs only when they target the configured realm; refuse
+        // arbitrary egress with the bot's credentials.
+        if (!zulipRealm) throw new Error("Zulip realm not configured");
+        const target = new URL(rawPath);
+        const realmHost = new URL(zulipRealm).host;
+        if (target.host !== realmHost) {
+          throw new Error(`refusing to fetch from foreign host ${target.host}; expected ${realmHost}`);
+        }
+        url = target.toString();
       } else {
         if (!zulipRealm) throw new Error("Zulip realm not configured");
         url = `${zulipRealm}${rawPath.startsWith("/") ? "" : "/"}${rawPath}`;
@@ -1386,21 +1445,30 @@ async function handleToolCall(name: string, args: any): Promise<any> {
       const classified = classifyExtension(name);
       const mimeType = headerMime || classified.mimeType;
       const isImage = mimeType.startsWith("image/");
-      const base64 = buf.toString("base64");
       if (isImage) {
         return {
           _content: [
             { type: "text", text: `Fetched ${name} (${mimeType}, ${buf.byteLength} bytes):` },
-            { type: "image", data: base64, mimeType },
+            { type: "image", data: buf.toString("base64"), mimeType },
           ],
+        };
+      }
+      // Text-ish payloads: decode inline so the agent can read directly
+      // instead of round-tripping through base64.
+      if (TEXT_MIME_RE.test(mimeType)) {
+        return {
+          name,
+          mimeType,
+          size: buf.byteLength,
+          content_text: buf.toString("utf-8"),
         };
       }
       return {
         name,
         mimeType,
         size: buf.byteLength,
-        base64,
-        note: "Non-image attachment returned as base64. Decode externally as needed.",
+        base64: buf.toString("base64"),
+        note: "Non-image, non-text attachment returned as base64. Decode externally as needed.",
       };
     }
 
