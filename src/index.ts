@@ -45,6 +45,96 @@ const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 // so the agent can read them directly (CSVs, JSON, plain text, etc).
 const TEXT_MIME_RE = /^(text\/|application\/(json|xml|x-yaml|yaml|csv|x-www-form-urlencoded)\b)/i;
 
+interface FetchedAttachment {
+  buf: Buffer;
+  mimeType: string;
+  name: string;
+}
+
+/**
+ * Authenticated GET with an enforced size cap. Checks Content-Length when the
+ * server provides one, and streams with a running byte budget as defense in
+ * depth so a missing or lying header can't OOM the process.
+ */
+export async function fetchAttachmentBytes(
+  url: string,
+  fallbackName: string,
+  opts: { headers?: Record<string, string> } = {},
+): Promise<FetchedAttachment> {
+  const resp = await fetch(url, { headers: opts.headers ?? {}, redirect: "follow" });
+  if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
+
+  // Pre-check Content-Length so an oversized declared body never starts buffering.
+  const declared = resp.headers.get("content-length");
+  if (declared !== null) {
+    const n = Number(declared);
+    if (Number.isFinite(n) && n > MAX_ATTACHMENT_BYTES) {
+      throw new Error(`attachment too large: ${n} bytes (max ${MAX_ATTACHMENT_BYTES})`);
+    }
+  }
+
+  const reader = resp.body?.getReader();
+  let buf: Buffer;
+  if (!reader) {
+    // No streaming body: fall back to arrayBuffer with a post-read check.
+    buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
+      throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
+    }
+  } else {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > MAX_ATTACHMENT_BYTES) {
+        reader.cancel().catch(() => {});
+        throw new Error(`attachment too large: streamed past ${MAX_ATTACHMENT_BYTES} bytes`);
+      }
+      chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+    }
+    buf = Buffer.concat(chunks, total);
+  }
+
+  const headerMime = resp.headers.get("content-type")?.split(";")[0].trim();
+  const classified = classifyExtension(fallbackName);
+  const mimeType = headerMime || classified.mimeType;
+  return { buf, mimeType, name: fallbackName };
+}
+
+/**
+ * Shape a successful fetch into the tool's response. Images return as native
+ * MCP content blocks (via `_content`), text-ish MIME types return decoded
+ * `content_text`, other binary returns `base64`.
+ */
+function toFetchResult({ buf, mimeType, name }: FetchedAttachment): Record<string, unknown> {
+  if (mimeType.startsWith("image/")) {
+    return {
+      _content: [
+        { type: "text", text: `Fetched ${name} (${mimeType}, ${buf.byteLength} bytes):` },
+        { type: "image", data: buf.toString("base64"), mimeType },
+      ],
+    };
+  }
+  if (TEXT_MIME_RE.test(mimeType)) {
+    return {
+      name,
+      mimeType,
+      size: buf.byteLength,
+      content_text: buf.toString("utf-8"),
+    };
+  }
+  return {
+    name,
+    mimeType,
+    size: buf.byteLength,
+    base64: buf.toString("base64"),
+    note: "Non-image, non-text attachment returned as base64. Decode externally as needed.",
+  };
+}
+
 interface AttachmentRef {
   path: string;       // e.g. "/user_uploads/2/Ab/cd/screenshot.png"
   name: string;       // basename for human display
@@ -354,8 +444,11 @@ export function cleanContent(html: string): string {
         if (hasImg) return `[image: ${href}]`;
         return text ? `[attachment: ${text} — ${href}]` : `[attachment: ${href}]`;
       }
+      // External anchors with an inline image preview: keep `[image: ...]` so
+      // the agent can choose to fetch. Plain external links keep the prior
+      // text-only behaviour (no scope creep on non-attachment links).
       if (hasImg) return `[image: ${href}]`;
-      return text ? `${text} (${href})` : href;
+      return text || href;
     }
   );
 
@@ -770,10 +863,11 @@ function getTools(): Tool[] {
   {
     name: "fetch_attachment",
     description:
-      "Fetch a Zulip user-upload attachment by path and return its bytes as an inline content block. " +
-      "For images (png/jpg/jpeg/gif/webp), returns an image block usable by vision models. " +
-      "For other types, returns a base64 data block. Paths look like '/user_uploads/X/Yy/Zz/name.ext' " +
-      "and appear in incoming message attachment refs.",
+      "Fetch a Zulip user-upload attachment by path and return its bytes inline. " +
+      "Images (png/jpg/jpeg/gif/webp) return as an image content block usable by vision models. " +
+      "Text-ish MIME types (text/*, JSON, CSV, YAML) return as `content_text` so the model can read directly. " +
+      "Other binaries return as `base64`. Paths look like '/user_uploads/X/Yy/Zz/name.ext' and appear in " +
+      "incoming message attachment refs. Only paths under /user_uploads/ on the configured realm are allowed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -966,9 +1060,10 @@ function getTools(): Tool[] {
   {
     name: "discord_fetch_attachment",
     description:
-      "Fetch a Discord attachment by URL and return its bytes as an inline content block. " +
-      "For images, returns an image block usable by vision models. URLs are provided in " +
-      "incoming Discord message attachment refs (Discord CDN, no auth required).",
+      "Fetch a Discord attachment by URL and return its bytes inline. " +
+      "Images return as an image content block usable by vision models. " +
+      "Text-ish MIME types return as `content_text`; other binaries return as `base64`. " +
+      "URLs come from incoming Discord message attachment refs (Discord CDN, no auth required).",
     inputSchema: {
       type: "object",
       properties: {
@@ -1417,59 +1512,31 @@ async function handleToolCall(name: string, args: any): Promise<any> {
     case "fetch_attachment": {
       const rawPath = String(args.path || "");
       if (!rawPath) throw new Error("path is required");
-      let url: string;
+      if (!zulipRealm) throw new Error("Zulip realm not configured");
+
+      let url: URL;
       if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
-        // Allow full URLs only when they target the configured realm; refuse
-        // arbitrary egress with the bot's credentials.
-        if (!zulipRealm) throw new Error("Zulip realm not configured");
-        const target = new URL(rawPath);
+        url = new URL(rawPath);
         const realmHost = new URL(zulipRealm).host;
-        if (target.host !== realmHost) {
-          throw new Error(`refusing to fetch from foreign host ${target.host}; expected ${realmHost}`);
+        if (url.host !== realmHost) {
+          throw new Error(`refusing to fetch from foreign host ${url.host}; expected ${realmHost}`);
         }
-        url = target.toString();
       } else {
-        if (!zulipRealm) throw new Error("Zulip realm not configured");
-        url = `${zulipRealm}${rawPath.startsWith("/") ? "" : "/"}${rawPath}`;
+        const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+        url = new URL(zulipRealm + path);
       }
+      // Both branches: the bot's credentials must only be applied to the
+      // user-upload endpoint. The agent's tool input is influenced by message
+      // content from untrusted senders, so `/api/v1/users` (or any other path)
+      // must not be a reachable target via this tool.
+      if (!url.pathname.startsWith("/user_uploads/")) {
+        throw new Error(`fetch_attachment only serves /user_uploads/ paths (got ${url.pathname})`);
+      }
+
       const headers: Record<string, string> = {};
       if (zulipAuthHeader) headers["Authorization"] = zulipAuthHeader;
-      const resp = await fetch(url, { headers, redirect: "follow" });
-      if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
-      const buf = Buffer.from(await resp.arrayBuffer());
-      if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
-        throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
-      }
-      const headerMime = resp.headers.get("content-type")?.split(";")[0].trim();
-      const name = decodeURIComponent(rawPath.split("/").pop() || "attachment");
-      const classified = classifyExtension(name);
-      const mimeType = headerMime || classified.mimeType;
-      const isImage = mimeType.startsWith("image/");
-      if (isImage) {
-        return {
-          _content: [
-            { type: "text", text: `Fetched ${name} (${mimeType}, ${buf.byteLength} bytes):` },
-            { type: "image", data: buf.toString("base64"), mimeType },
-          ],
-        };
-      }
-      // Text-ish payloads: decode inline so the agent can read directly
-      // instead of round-tripping through base64.
-      if (TEXT_MIME_RE.test(mimeType)) {
-        return {
-          name,
-          mimeType,
-          size: buf.byteLength,
-          content_text: buf.toString("utf-8"),
-        };
-      }
-      return {
-        name,
-        mimeType,
-        size: buf.byteLength,
-        base64: buf.toString("base64"),
-        note: "Non-image, non-text attachment returned as base64. Decode externally as needed.",
-      };
+      const name = decodeURIComponent(url.pathname.split("/").pop() || "attachment");
+      return toFetchResult(await fetchAttachmentBytes(url.toString(), name, { headers }));
     }
 
     case "discord_fetch_attachment": {
@@ -1478,33 +1545,8 @@ async function handleToolCall(name: string, args: any): Promise<any> {
       if (!url.startsWith("http://") && !url.startsWith("https://")) {
         throw new Error("url must be a full https:// link");
       }
-      const resp = await fetch(url, { redirect: "follow" });
-      if (!resp.ok) throw new Error(`fetch failed: ${resp.status} ${resp.statusText}`);
-      const buf = Buffer.from(await resp.arrayBuffer());
-      if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
-        throw new Error(`attachment too large: ${buf.byteLength} bytes (max ${MAX_ATTACHMENT_BYTES})`);
-      }
-      const headerMime = resp.headers.get("content-type")?.split(";")[0].trim();
       const name = decodeURIComponent(url.split("?")[0].split("/").pop() || "attachment");
-      const classified = classifyExtension(name);
-      const mimeType = headerMime || classified.mimeType;
-      const isImage = mimeType.startsWith("image/");
-      const base64 = buf.toString("base64");
-      if (isImage) {
-        return {
-          _content: [
-            { type: "text", text: `Fetched ${name} (${mimeType}, ${buf.byteLength} bytes):` },
-            { type: "image", data: base64, mimeType },
-          ],
-        };
-      }
-      return {
-        name,
-        mimeType,
-        size: buf.byteLength,
-        base64,
-        note: "Non-image attachment returned as base64. Decode externally as needed.",
-      };
+      return toFetchResult(await fetchAttachmentBytes(url, name));
     }
 
     // Discord handlers
@@ -2446,14 +2488,15 @@ async function main() {
 
           const channelId = `discord:${msg.guild.id}:${msg.channelId}`;
           const cleaned = formatDiscordContent(msg.content, msg.mentions);
-          const attachments: AttachmentRef[] = Array.from(msg.attachments.values()).map((a: any) => {
+          const attachments: AttachmentRef[] = msg.attachments.map((a) => {
             const name = a.name ?? 'attachment';
-            const { mimeType, isImage } = classifyExtension(name);
+            const { mimeType: extMime } = classifyExtension(name);
+            const mime = a.contentType ?? extMime;
             return {
               path: a.url,            // Discord CDN URL, no auth needed
               name,
-              mimeType: a.contentType || mimeType,
-              isImage: (a.contentType || mimeType).startsWith('image/'),
+              mimeType: mime,
+              isImage: mime.startsWith('image/'),
             };
           });
           const content: McplTextContent[] = [{ type: 'text', text: cleaned }];
@@ -2496,4 +2539,9 @@ async function main() {
   }
 }
 
-main();
+// Only auto-start when run as a CLI. Importing this module (e.g. from tests)
+// should not boot the MCP server or require Zulip credentials.
+import { pathToFileURL } from "node:url";
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  main();
+}

@@ -10,6 +10,7 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch",
+    "test": "node --import tsx --test test/**/*.test.ts",
     "prepare": "npm run build"
   },
   "keywords": [
@@ -43,6 +44,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.1",
+    "tsx": "^4.19.0",
     "typescript": "^5.7.2"
   }
 }
