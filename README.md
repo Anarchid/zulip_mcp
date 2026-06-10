@@ -1,4 +1,4 @@
-# Zulip & Discord MCP Server
+# Zulip, Discord & Slack MCP Server
 
 [![npm version](https://img.shields.io/npm/v/zulip-mcp-server.svg)](https://www.npmjs.com/package/zulip-mcp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -60,6 +60,21 @@ The agent can passively see unread message notifications when activated for any 
 - `discord_get_monitored_channels` - View monitoring state
 - `discord_stop_monitoring` - Stop tracking
 
+### 💼 **Slack Tools**
+- `slack_list_channels` - Browse Slack conversations (channels, private channels, **DMs, group DMs**)
+- `slack_start_monitoring` - Monitor Slack conversations
+- `slack_get_channel_history` - Get history with natural dates (mentions formatted as `@username (uid:U123...)`, shows threads)
+- `slack_get_unread_messages` - Get unread from monitored conversations
+- `slack_send_message` - Send to channels or DMs (supports `thread_ts` for in-thread replies, use `<@user_id>` for mentions)
+- `slack_delete_message` - Delete a message by ts (with permissions)
+- `slack_add_reaction` - Add emoji reactions
+- `slack_find_user` - Search users to get user ID for mentions
+- `slack_fetch_attachment` - Fetch file bytes inline (auth-locked to `*.slack.com`)
+- `slack_get_monitored_channels` - View monitoring state
+- `slack_stop_monitoring` - Stop tracking
+
+Slack resources for ambient awareness: `slack://unread/summary`, `slack://monitoring/status`, `slack://channel/{id}/unread`.
+
 ## Installation
 
 **No installation needed!** Just use `npx` to run directly from npm:
@@ -88,12 +103,16 @@ export ENABLE_ZULIP=true
 
 # Enable Discord (disabled by default)  
 export ENABLE_DISCORD=true
+
+# Enable Slack (disabled by default)
+export ENABLE_SLACK=true
 ```
 
-You can enable:
-- **Just Zulip** (default): Don't set `ENABLE_DISCORD` - Only Zulip tools will be available
-- **Just Discord**: Set `ENABLE_DISCORD=true` and `ENABLE_ZULIP=false` - Only Discord tools will be available
-- **Both**: Set `ENABLE_DISCORD=true` - Both sets of tools will be available
+You can enable any combination:
+- **Just Zulip** (default): Don't set `ENABLE_DISCORD`/`ENABLE_SLACK` - Only Zulip tools will be available
+- **Just Discord**: Set `ENABLE_DISCORD=true` and `ENABLE_ZULIP=false`
+- **Just Slack**: Set `ENABLE_SLACK=true` and `ENABLE_ZULIP=false`
+- **Any mix**: Enable multiple platforms - each contributes its own tool set, channels, and feature sets
 
 **Note:** Tools are dynamically loaded based on enabled services. If a service isn't configured, its tools won't appear in the tool list.
 
@@ -152,6 +171,16 @@ export ZULIP_RC_PATH="/path/to/zuliprc"
 export DISCORD_TOKEN="your-bot-token"
 ```
 
+#### Slack Authentication
+
+Slack uses two tokens — a bot token for Web API calls and an app-level token for Socket Mode (real-time events without a public webhook URL):
+
+```bash
+export SLACK_BOT_TOKEN="xoxb-..."   # Bot User OAuth Token
+export SLACK_APP_TOKEN="xapp-..."   # App-level token with connections:write
+export SLACK_SESSION_ID="agent_name"  # Optional: persistent state (defaults to workspace name)
+```
+
 ## Getting Your API Keys
 
 ### Zulip API Key
@@ -179,6 +208,47 @@ For bots:
    - Read Messages/View Channels
    - Send Messages
    - Read Message History
+
+### Slack App Tokens
+
+1. Go to https://api.slack.com/apps → **Create New App** → *From a manifest*, and paste:
+
+```yaml
+display_information:
+  name: Connectome Agent
+features:
+  bot_user:
+    display_name: connectome-agent
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - channels:history
+      - channels:read
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - im:write
+      - mpim:history
+      - mpim:read
+      - chat:write
+      - users:read
+      - reactions:write
+      - files:read
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  socket_mode_enabled: true
+```
+
+2. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-...`) → `SLACK_BOT_TOKEN`
+3. Under **Basic Information → App-Level Tokens**, generate a token with the `connections:write` scope (`xapp-...`) → `SLACK_APP_TOKEN`
+4. Invite the bot to channels you want it to see: `/invite @connectome-agent` (DMs work without invites — users can message the bot directly)
 
 ## Usage with Cursor
 
