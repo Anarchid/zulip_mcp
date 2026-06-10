@@ -38,6 +38,10 @@ import {
   formatDiscordContent,
   formatSlackText,
   extractSlackUserIds,
+  resolveSlackUserNames,
+  parseSlackAttachmentUrl,
+  parseZulipAttachmentUrl,
+  isMainModule,
 } from './content.js';
 export { fetchAttachmentBytes, extractZulipAttachments, cleanContent, formatDiscordContent } from './content.js';
 
@@ -390,21 +394,13 @@ export function formatMessages(messages: any[], format: string): string {
   return `📊 Retrieved ${messages.length} messages\n${'='.repeat(80)}\n\n${formatted}`;
 }
 
-// Slack user-name cache for the tool layer (the MCPL adapter keeps its own).
+// Slack user-name cache for the tool layer (the MCPL adapter keeps its own
+// cache; the resolution logic is shared via content.ts).
 const slackUserNames = new Map<string, string>();
 
 async function resolveSlackUsers(userIds: string[]): Promise<void> {
   if (!slackWebClient) return;
-  const unresolved = Array.from(new Set(userIds)).filter(id => id && !slackUserNames.has(id));
-  await Promise.all(unresolved.map(async (id) => {
-    try {
-      const result = await slackWebClient!.users.info({ user: id });
-      const user = result.user as any;
-      slackUserNames.set(id, user?.profile?.display_name || user?.real_name || user?.name || id);
-    } catch {
-      slackUserNames.set(id, id);
-    }
-  }));
+  await resolveSlackUserNames(slackWebClient, slackUserNames, userIds);
 }
 
 /** Resolve author + mention names for raw Slack history messages and shape
@@ -1614,28 +1610,9 @@ async function handleToolCall(name: string, args: any): Promise<any> {
     }
 
     case "fetch_attachment": {
-      const rawPath = String(args.path || "");
-      if (!rawPath) throw new Error("path is required");
-      if (!zulipRealm) throw new Error("Zulip realm not configured");
-
-      let url: URL;
-      if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
-        url = new URL(rawPath);
-        const realmHost = new URL(zulipRealm).host;
-        if (url.host !== realmHost) {
-          throw new Error(`refusing to fetch from foreign host ${url.host}; expected ${realmHost}`);
-        }
-      } else {
-        const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
-        url = new URL(zulipRealm + path);
-      }
-      // Both branches: the bot's credentials must only be applied to the
-      // user-upload endpoint. The agent's tool input is influenced by message
-      // content from untrusted senders, so `/api/v1/users` (or any other path)
-      // must not be a reachable target via this tool.
-      if (!url.pathname.startsWith("/user_uploads/")) {
-        throw new Error(`fetch_attachment only serves /user_uploads/ paths (got ${url.pathname})`);
-      }
+      // Validation (realm host + /user_uploads/ prefix, with the URL
+      // dot-segment normalization invariant) lives in parseZulipAttachmentUrl.
+      const url = parseZulipAttachmentUrl(String(args.path || ""), zulipRealm);
 
       const headers: Record<string, string> = {};
       if (zulipAuthHeader) headers["Authorization"] = zulipAuthHeader;
@@ -2458,18 +2435,9 @@ async function handleToolCall(name: string, args: any): Promise<any> {
     }
 
     case "slack_fetch_attachment": {
-      const rawUrl = String(args.url || "");
-      if (!rawUrl) throw new Error("url is required");
-      if (!rawUrl.startsWith("https://")) {
-        throw new Error("url must be a full https:// link");
-      }
-      const url = new URL(rawUrl);
-      // The bot token must only be sent to Slack's file hosts. The agent's
-      // tool input is influenced by message content from untrusted senders,
-      // so a foreign host must never receive the Authorization header.
-      if (url.host !== "files.slack.com" && !url.host.endsWith(".slack.com")) {
-        throw new Error(`refusing to fetch from foreign host ${url.host}; expected a *.slack.com file URL`);
-      }
+      // The bot token must only be sent to files.slack.com — never to
+      // workspace hosts. Enforcement lives in parseSlackAttachmentUrl.
+      const url = parseSlackAttachmentUrl(String(args.url || ""));
       const botToken = process.env.SLACK_BOT_TOKEN || "";
       const headers: Record<string, string> = botToken
         ? { Authorization: `Bearer ${botToken}` }
@@ -2899,7 +2867,9 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
             channelSummaries.push(`📬 #${state.channelName}: ${unread.length} unread`);
           }
         } catch (error) {
-          // Skip channels with errors
+          // Skip the channel but leave a trace — a silently swallowed 403
+          // makes the summary undercount forever with no way to notice.
+          console.error(`Failed to read unread count for Slack #${state.channelName} (${channelId}):`, error);
         }
       }
 
@@ -3119,8 +3089,9 @@ async function main() {
 }
 
 // Only auto-start when run as a CLI. Importing this module (e.g. from tests)
-// should not boot the MCP server or require Zulip credentials.
-import { pathToFileURL } from "node:url";
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+// should not boot the MCP server or require Zulip credentials. isMainModule
+// realpaths argv[1] so the guard also passes when launched through an npm
+// bin symlink (npx zulip-mcp-server).
+if (isMainModule(import.meta.url, process.argv[1])) {
   main();
 }

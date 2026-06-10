@@ -69,7 +69,7 @@ The agent can passively see unread message notifications when activated for any 
 - `slack_delete_message` - Delete a message by ts (with permissions)
 - `slack_add_reaction` - Add emoji reactions
 - `slack_find_user` - Search users to get user ID for mentions
-- `slack_fetch_attachment` - Fetch file bytes inline (auth-locked to `*.slack.com`)
+- `slack_fetch_attachment` - Fetch file bytes inline (auth-locked to `files.slack.com`)
 - `slack_get_monitored_channels` - View monitoring state
 - `slack_stop_monitoring` - Stop tracking
 

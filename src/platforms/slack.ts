@@ -28,12 +28,42 @@ import type {
   McplTextContent,
 } from '../mcpl/types.js';
 import type { PlatformAdapter, PublishResult, RoutingHints, OnIncomingMessage } from './adapter.js';
-import { formatSlackText, extractSlackUserIds, type AttachmentRef } from '../content.js';
+import { formatSlackText, extractSlackUserIds, resolveSlackUserNames, type AttachmentRef } from '../content.js';
 
 /** Message subtypes that represent real user content. Everything else
  * (message_changed, message_deleted, channel_join, bot_message, …) is noise
  * for the inference loop. */
 const CONTENT_SUBTYPES = new Set([undefined, 'file_share', 'thread_broadcast', 'me_message']);
+
+/** The fields of a Socket Mode message event this adapter dereferences.
+ * Payloads come off the wire — everything is optional until checked. */
+interface SlackMessageEvent {
+  type?: string;
+  subtype?: string;
+  channel?: string;
+  user?: string;
+  text?: string;
+  ts?: string;
+  thread_ts?: string;
+  bot_id?: string;
+  channel_type?: string;
+  team?: string;
+  files?: Array<{ url_private?: string; name?: string; mimetype?: string }>;
+}
+
+/** The fields of a conversations.list entry this adapter dereferences —
+ * structurally satisfied by @slack/web-api's Channel type. */
+interface SlackConversation {
+  id?: string;
+  name?: string;
+  user?: string;
+  is_im?: boolean;
+  is_mpim?: boolean;
+  is_private?: boolean;
+  is_member?: boolean;
+  num_members?: number;
+  topic?: { value?: string };
+}
 
 export class SlackAdapter implements PlatformAdapter {
   readonly type = 'slack';
@@ -145,7 +175,7 @@ export class SlackAdapter implements PlatformAdapter {
   }
 
   startEvents(onMessage: OnIncomingMessage): void {
-    this.socket.on('message', async ({ event, ack }: { event: any; ack: () => Promise<void> }) => {
+    this.socket.on('message', async ({ event, ack }: { event: SlackMessageEvent; ack: () => Promise<void> }) => {
       // Always ack first — Slack redelivers unacked envelopes.
       try { await ack(); } catch { /* ignore */ }
       try {
@@ -172,14 +202,17 @@ export class SlackAdapter implements PlatformAdapter {
 
   // -- Private --
 
-  private async handleMessageEvent(event: any, onMessage: OnIncomingMessage): Promise<void> {
+  private async handleMessageEvent(event: SlackMessageEvent, onMessage: OnIncomingMessage): Promise<void> {
     if (!event || event.type !== 'message') return;
     if (!CONTENT_SUBTYPES.has(event.subtype)) return;
     // Self-filter: skip our own messages and other bots' (bot_id covers
     // bot_message-without-subtype edge cases like app-posted file shares).
     if (event.bot_id) return;
     if (this.selfUserId !== null && event.user === this.selfUserId) return;
-    if (!event.channel) return;
+    // A real user content message always carries channel, user, and ts;
+    // a malformed payload missing any of them is dropped, not crashed on
+    // (parseFloat(undefined) → NaN → toISOString() throws).
+    if (!event.channel || !event.user || !event.ts) return;
 
     const channelId = `slack:${event.channel}`;
 
@@ -191,8 +224,8 @@ export class SlackAdapter implements PlatformAdapter {
     const cleaned = formatSlackText(event.text ?? '', this.userNameCache);
 
     const attachments: AttachmentRef[] = (event.files ?? [])
-      .filter((f: any) => f.url_private)
-      .map((f: any) => {
+      .filter((f): f is { url_private: string; name?: string; mimetype?: string } => !!f.url_private)
+      .map((f) => {
         const mime = f.mimetype || 'application/octet-stream';
         return {
           path: f.url_private,    // needs Bearer bot-token auth to fetch
@@ -236,11 +269,13 @@ export class SlackAdapter implements PlatformAdapter {
     onMessage(incoming);
   }
 
-  private async describeConversation(conv: any): Promise<ChannelDescriptor | null> {
+  private async describeConversation(conv: SlackConversation): Promise<ChannelDescriptor | null> {
+    if (!conv.id) return null;
+
     if (conv.is_im) {
       // DM: label with the human's name so the host can scope/whitelist it.
       await this.resolveUserNames([conv.user]);
-      const userName = this.userNameCache.get(conv.user) ?? conv.user;
+      const userName = (conv.user ? this.userNameCache.get(conv.user) : undefined) ?? conv.user ?? conv.id;
       return {
         id: `slack:${conv.id}`,
         type: 'slack',
@@ -277,19 +312,12 @@ export class SlackAdapter implements PlatformAdapter {
     };
   }
 
-  /** Resolve user IDs to display names via users.info, memoized for the
-   * process lifetime. Failures leave the raw ID in place (best-effort). */
-  private async resolveUserNames(userIds: string[]): Promise<void> {
-    const unresolved = userIds.filter(id => id && !this.userNameCache.has(id));
-    await Promise.all(unresolved.map(async (id) => {
-      try {
-        const result = await this.web.users.info({ user: id });
-        const user = result.user as any;
-        const name = user?.profile?.display_name || user?.real_name || user?.name || id;
-        this.userNameCache.set(id, name);
-      } catch {
-        this.userNameCache.set(id, id);
-      }
-    }));
+  /** Resolve user IDs into this adapter's cache (shared logic in content.ts). */
+  private async resolveUserNames(userIds: Array<string | undefined>): Promise<void> {
+    await resolveSlackUserNames(
+      this.web,
+      this.userNameCache,
+      userIds.filter((id): id is string => !!id),
+    );
   }
 }

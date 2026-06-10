@@ -6,6 +6,24 @@
  * sides can import without cycles.
  */
 
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+/**
+ * Run-as-main detection that survives npm bin symlinks. Node resolves the
+ * entry module to its realpath while process.argv[1] keeps the symlink path,
+ * so a naive `import.meta.url === pathToFileURL(argv[1]).href` is false when
+ * launched via `npx`/a bin shim — realpath argv[1] before comparing.
+ */
+export function isMainModule(importMetaUrl: string, argv1: string | undefined): boolean {
+  if (!argv1) return false;
+  try {
+    return importMetaUrl === pathToFileURL(realpathSync(argv1)).href;
+  } catch {
+    return false;
+  }
+}
+
 // Anthropic refuses images larger than this; mirror their cap server-side
 // so an over-eager fetch can't poison the agent's next turn.
 export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
@@ -102,6 +120,58 @@ export function toFetchResult({ buf, mimeType, name }: FetchedAttachment): Recor
     base64: buf.toString("base64"),
     note: "Non-image, non-text attachment returned as base64. Decode externally as needed.",
   };
+}
+
+/**
+ * Validate a Slack attachment URL before the bot token is attached to the
+ * request. The host must be exactly files.slack.com — `url_private` is always
+ * served from there. A `*.slack.com` wildcard would be a token leak: every
+ * workspace lives at `<name>.slack.com` and serves `/api/*`, and the tool's
+ * input is influenced by message content from untrusted senders.
+ */
+export function parseSlackAttachmentUrl(rawUrl: string): URL {
+  if (!rawUrl) throw new Error("url is required");
+  if (!rawUrl.startsWith("https://")) {
+    throw new Error("url must be a full https:// link");
+  }
+  const url = new URL(rawUrl);
+  if (url.host !== "files.slack.com") {
+    throw new Error(`refusing to fetch from host ${url.host}; Slack attachments are served from files.slack.com only`);
+  }
+  return url;
+}
+
+/**
+ * Validate a Zulip attachment path or URL against the configured realm before
+ * the bot's credentials are attached. Tool input is influenced by message
+ * content from untrusted senders, so only `/user_uploads/` on the realm host
+ * may be reachable.
+ *
+ * SAFETY INVARIANT: the prefix check relies on `new URL()` normalizing dot
+ * segments BEFORE `pathname` is read — '/user_uploads/../api/v1/users/me'
+ * (and its percent-encoded variants; the WHATWG parser treats '%2e%2e' as
+ * '..') normalizes to '/api/v1/users/me' and is rejected. Never replace this
+ * with a check on the raw input string.
+ */
+export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): URL {
+  if (!rawPath) throw new Error("path is required");
+  if (!zulipRealm) throw new Error("Zulip realm not configured");
+
+  let url: URL;
+  if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
+    url = new URL(rawPath);
+    const realmHost = new URL(zulipRealm).host;
+    if (url.host !== realmHost) {
+      throw new Error(`refusing to fetch from foreign host ${url.host}; expected ${realmHost}`);
+    }
+  } else {
+    const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+    url = new URL(zulipRealm + path);
+  }
+  if (!url.pathname.startsWith("/user_uploads/")) {
+    throw new Error(`fetch_attachment only serves /user_uploads/ paths (got ${url.pathname})`);
+  }
+  return url;
 }
 
 export interface AttachmentRef {
@@ -214,6 +284,14 @@ export function cleanContent(html: string): string {
   return content;
 }
 
+// Slack user/channel IDs are documented as uppercase alphanumerics. Single
+// source of truth for every mention regex below — if Slack ever widens the
+// ID alphabet, this is the only line to change. Fresh RegExp per use: 'g'
+// regexes carry lastIndex state and must not be shared between callers.
+const SLACK_ID = "[A-Z0-9]+";
+const slackUserMentionRe = () => new RegExp(`<@(${SLACK_ID})(?:\\|([^>]*))?>`, "g");
+const slackChannelMentionRe = () => new RegExp(`<#(${SLACK_ID})(?:\\|([^>]*))?>`, "g");
+
 // Slack message text uses mrkdwn escapes: <@U123> user mentions,
 // <#C123|name> channel mentions, <!here>/<!channel> broadcasts, and
 // <url|label> links. Rewrite them into the same readable shape the other
@@ -223,13 +301,13 @@ export function formatSlackText(text: string, userNames: Map<string, string>): s
   let formatted = text;
 
   // User mentions: <@U123> or <@U123|fallback>
-  formatted = formatted.replace(/<@([A-Z0-9]+)(?:\|([^>]*))?>/g, (_m, id: string, fallback?: string) => {
+  formatted = formatted.replace(slackUserMentionRe(), (_m, id: string, fallback?: string) => {
     const name = userNames.get(id) || fallback || id;
     return `@${name} (uid:${id})`;
   });
 
   // Channel mentions: <#C123|name> or <#C123>
-  formatted = formatted.replace(/<#([A-Z0-9]+)(?:\|([^>]*))?>/g, (_m, id: string, name?: string) => {
+  formatted = formatted.replace(slackChannelMentionRe(), (_m, id: string, name?: string) => {
     return name ? `#${name}` : `#${id}`;
   });
 
@@ -252,10 +330,41 @@ export function formatSlackText(text: string, userNames: Map<string, string>): s
 /** Extract user IDs referenced as <@U123> in Slack mrkdwn, for pre-resolution. */
 export function extractSlackUserIds(text: string): string[] {
   const ids = new Set<string>();
-  const re = /<@([A-Z0-9]+)(?:\|[^>]*)?>/g;
+  const re = slackUserMentionRe();
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) ids.add(m[1]);
   return Array.from(ids);
+}
+
+/** The minimal users.info surface resolveSlackUserNames needs — structurally
+ * satisfied by @slack/web-api's WebClient without importing the SDK here. */
+export interface SlackUserInfoClient {
+  users: {
+    info(args: { user: string }): Promise<{
+      user?: { profile?: { display_name?: string }; real_name?: string; name?: string };
+    }>;
+  };
+}
+
+/**
+ * Resolve Slack user IDs to display names into the caller's cache, memoized
+ * for the cache's lifetime. Failures leave the raw ID in place (best-effort).
+ * Shared by the MCPL adapter and the tool layer, each with its own cache.
+ */
+export async function resolveSlackUserNames(
+  client: SlackUserInfoClient,
+  cache: Map<string, string>,
+  userIds: string[],
+): Promise<void> {
+  const unresolved = Array.from(new Set(userIds)).filter(id => id && !cache.has(id));
+  await Promise.all(unresolved.map(async (id) => {
+    try {
+      const { user } = await client.users.info({ user: id });
+      cache.set(id, user?.profile?.display_name || user?.real_name || user?.name || id);
+    } catch {
+      cache.set(id, id);
+    }
+  }));
 }
 
 // Helper to format Discord mentions
