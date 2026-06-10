@@ -18,7 +18,9 @@ export interface ZulipEventMessage {
   type: string;
 }
 
-export type OnZulipMessage = (streamName: string, message: ZulipEventMessage) => void;
+/** `flags` are the receiving user's message flags from the event envelope
+ * (e.g. 'mentioned', 'wildcard_mentioned') — computed server-side by Zulip. */
+export type OnZulipMessage = (streamName: string, message: ZulipEventMessage, flags: string[]) => void;
 
 export class ZulipEventLoop {
   private stopped = false;
@@ -84,7 +86,7 @@ export class ZulipEventLoop {
               : null;
 
             if (streamName && msg.type === 'stream') {
-              onMessage(streamName, msg);
+              onMessage(streamName, msg, event.flags ?? []);
             }
           }
         }

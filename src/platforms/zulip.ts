@@ -170,7 +170,7 @@ export class ZulipAdapter implements PlatformAdapter {
 
   startEvents(onMessage: OnIncomingMessage): void {
     this.eventLoop = new ZulipEventLoop();
-    this.eventLoop.start(this.zulipClient, (streamName, msg) => {
+    this.eventLoop.start(this.zulipClient, (streamName, msg, flags) => {
       if (this.selfUserId !== null && msg.sender_id === this.selfUserId) return;
       const channelId = `zulip:${streamName}`;
       const cleaned = cleanContent(msg.content);
@@ -197,6 +197,9 @@ export class ZulipAdapter implements PlatformAdapter {
         metadata: {
           senderEmail: msg.sender_email,
           topic: msg.subject,
+          // Zulip's server-computed flag: personal or user-group mention of
+          // the bot. Wildcards (@all/@everyone) deliberately don't count.
+          mentioned: flags.includes('mentioned'),
           botUserId: this.selfUserId !== null ? String(this.selfUserId) : this.sessionId,
           ...(attachments.length > 0 ? { attachments } : {}),
         },

@@ -141,6 +141,9 @@ export class DiscordAdapter implements PlatformAdapter {
         content,
         metadata: {
           mentionIds: Array.from(msg.mentions.users.keys()),
+          // Personal mention of the bot — @everyone/@here and role mentions
+          // deliberately don't count (mentions.users only).
+          mentioned: this.discordClient.user ? msg.mentions.users.has(this.discordClient.user.id) : false,
           replyToAuthorId: msg.reference?.messageId ? msg.author.id : undefined,
           botUserId: this.discordClient.user?.id,
           ...(attachments.length > 0 ? { attachments } : {}),

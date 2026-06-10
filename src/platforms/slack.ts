@@ -222,6 +222,10 @@ export class SlackAdapter implements PlatformAdapter {
       content,
       metadata: {
         mentionIds,
+        // Personal mention of the bot — hosts use this to gate spawn/inference
+        // policy (e.g. "respond on-mention in channels"). @here/@channel
+        // broadcasts deliberately don't count.
+        mentioned: this.selfUserId !== null && mentionIds.includes(this.selfUserId),
         thread_ts: event.thread_ts,
         channel_type: event.channel_type,
         team: event.team,
