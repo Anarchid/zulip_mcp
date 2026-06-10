@@ -26,6 +26,9 @@ import type { ChannelsPublishParams, ChannelsOpenParams, ChannelsCloseParams, Be
 import type { PlatformAdapter } from './platforms/adapter.js';
 import { ZulipAdapter } from './platforms/zulip.js';
 import { DiscordAdapter } from './platforms/discord.js';
+import { SlackAdapter } from './platforms/slack.js';
+import { WebClient as SlackWebClient } from '@slack/web-api';
+import { SocketModeClient as SlackSocketModeClient } from '@slack/socket-mode';
 
 // Content helpers (re-exported for tests and downstream importers)
 import {
@@ -39,6 +42,7 @@ export { fetchAttachmentBytes, extractZulipAttachments, cleanContent, formatDisc
 // Startup flags
 const ENABLE_ZULIP = process.env.ENABLE_ZULIP !== "false";
 const ENABLE_DISCORD = process.env.ENABLE_DISCORD === "true";
+const ENABLE_SLACK = process.env.ENABLE_SLACK === "true";
 const MCPL_ENABLED = process.env.MCPL_ENABLED !== "false";
 const MCPL_BATCH_WINDOW_MS = parseInt(process.env.MCPL_BATCH_WINDOW_MS || "500", 10);
 const MCPL_CONTEXT_HISTORY_SIZE = parseInt(process.env.MCPL_CONTEXT_HISTORY_SIZE || "20", 10);
@@ -49,6 +53,10 @@ let zulipSelfUserId: number | null = null;
 let zulipRealm: string = "";
 let zulipAuthHeader: string = "";
 let discordClient: DiscordClient | null = null;
+let slackWebClient: SlackWebClient | null = null;
+let slackSocketClient: SlackSocketModeClient | null = null;
+let slackSelfUserId: string | null = null;
+let slackTeamName: string = "";
 
 // Session and state management
 interface ChannelState {
@@ -227,6 +235,37 @@ async function initializeZulipClient(): Promise<void> {
   }
 
   console.error(`Zulip MCP initialized with session: ${sessionId}`);
+}
+
+async function initializeSlackClient(): Promise<void> {
+  const botToken = process.env.SLACK_BOT_TOKEN;
+  const appToken = process.env.SLACK_APP_TOKEN;
+  if (!botToken) {
+    throw new Error("SLACK_BOT_TOKEN must be set (bot token, xoxb-...)");
+  }
+  if (!appToken) {
+    throw new Error("SLACK_APP_TOKEN must be set (Socket Mode app-level token, xapp-...)");
+  }
+
+  slackWebClient = new SlackWebClient(botToken);
+
+  // Resolve bot identity for self-filtering and workspace labeling.
+  const auth = await slackWebClient.auth.test();
+  slackSelfUserId = (auth.user_id as string) ?? null;
+  slackTeamName = (auth.team as string) ?? "";
+
+  // Socket Mode client — started later by the adapter (MCPL mode only);
+  // plain MCP mode uses the Web API exclusively.
+  slackSocketClient = new SlackSocketModeClient({ appToken });
+
+  // Set up session ID and load persistent state (Zulip init may have done
+  // this already; only fill in when Slack is the first/only platform).
+  if (!sessionId) {
+    sessionId = process.env.SLACK_SESSION_ID || slackTeamName || "default";
+    loadState(sessionId);
+  }
+
+  console.error(`Slack MCP initialized: bot ${auth.user} (${slackSelfUserId}) in ${slackTeamName}`);
 }
 
 async function initializeDiscordClient(): Promise<void> {
@@ -1758,6 +1797,7 @@ async function handleToolCall(name: string, args: any): Promise<any> {
 const ENABLED_PLATFORMS = [
   ...(ENABLE_ZULIP ? ['zulip'] : []),
   ...(ENABLE_DISCORD ? ['discord'] : []),
+  ...(ENABLE_SLACK ? ['slack'] : []),
 ];
 const mcplServerCaps = MCPL_ENABLED ? buildServerCapabilities(ENABLED_PLATFORMS) : null;
 
@@ -2124,6 +2164,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 async function main() {
   try {
     const enabledServices: string[] = [];
+    let firstInitError: unknown = null;
 
     // Initialize Zulip if enabled
     if (ENABLE_ZULIP) {
@@ -2132,7 +2173,7 @@ async function main() {
         enabledServices.push("Zulip");
       } catch (error) {
         console.error("Failed to initialize Zulip:", error);
-        if (!ENABLE_DISCORD) throw error; // If only Zulip was requested, fail
+        firstInitError ??= error;
       }
     }
 
@@ -2143,12 +2184,25 @@ async function main() {
         enabledServices.push("Discord");
       } catch (error) {
         console.error("Failed to initialize Discord:", error);
-        if (!ENABLE_ZULIP) throw error; // If only Discord was requested, fail
+        firstInitError ??= error;
+      }
+    }
+
+    // Initialize Slack if enabled
+    if (ENABLE_SLACK) {
+      try {
+        await initializeSlackClient();
+        enabledServices.push("Slack");
+      } catch (error) {
+        console.error("Failed to initialize Slack:", error);
+        firstInitError ??= error;
       }
     }
 
     if (enabledServices.length === 0) {
-      throw new Error("No services enabled. Set ENABLE_ZULIP=true or ENABLE_DISCORD=true");
+      throw firstInitError ?? new Error(
+        "No services enabled. Set ENABLE_ZULIP=true, ENABLE_DISCORD=true, or ENABLE_SLACK=true"
+      );
     }
 
     if (MCPL_ENABLED) {
@@ -2163,6 +2217,9 @@ async function main() {
       }
       if (discordClient) {
         adapters.set('discord', new DiscordAdapter(discordClient));
+      }
+      if (slackWebClient && slackSocketClient) {
+        adapters.set('slack', new SlackAdapter(slackWebClient, slackSocketClient, slackSelfUserId, slackTeamName));
       }
 
       const channelManager = new ChannelManager(client, adapters, MCPL_BATCH_WINDOW_MS);

@@ -214,6 +214,50 @@ export function cleanContent(html: string): string {
   return content;
 }
 
+// Slack message text uses mrkdwn escapes: <@U123> user mentions,
+// <#C123|name> channel mentions, <!here>/<!channel> broadcasts, and
+// <url|label> links. Rewrite them into the same readable shape the other
+// platforms use (`@name (uid:U123)`), resolving user IDs via the provided
+// map (best-effort: unresolved IDs keep the raw ID as the name).
+export function formatSlackText(text: string, userNames: Map<string, string>): string {
+  let formatted = text;
+
+  // User mentions: <@U123> or <@U123|fallback>
+  formatted = formatted.replace(/<@([A-Z0-9]+)(?:\|([^>]*))?>/g, (_m, id: string, fallback?: string) => {
+    const name = userNames.get(id) || fallback || id;
+    return `@${name} (uid:${id})`;
+  });
+
+  // Channel mentions: <#C123|name> or <#C123>
+  formatted = formatted.replace(/<#([A-Z0-9]+)(?:\|([^>]*))?>/g, (_m, id: string, name?: string) => {
+    return name ? `#${name}` : `#${id}`;
+  });
+
+  // Broadcasts: <!here>, <!channel>, <!everyone>
+  formatted = formatted.replace(/<!(here|channel|everyone)(?:\|[^>]*)?>/g, '@$1');
+
+  // Links: <url|label> → label (url), <url> → url
+  formatted = formatted.replace(/<(https?:\/\/[^|>]+)\|([^>]*)>/g, '$2 ($1)');
+  formatted = formatted.replace(/<(https?:\/\/[^>]+)>/g, '$1');
+
+  // Unescape Slack's HTML entities
+  formatted = formatted
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+
+  return formatted;
+}
+
+/** Extract user IDs referenced as <@U123> in Slack mrkdwn, for pre-resolution. */
+export function extractSlackUserIds(text: string): string[] {
+  const ids = new Set<string>();
+  const re = /<@([A-Z0-9]+)(?:\|[^>]*)?>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) ids.add(m[1]);
+  return Array.from(ids);
+}
+
 // Helper to format Discord mentions
 export function formatDiscordContent(content: string, mentions: any): string {
   let formatted = content;
