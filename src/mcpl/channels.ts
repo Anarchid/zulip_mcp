@@ -1,25 +1,26 @@
 /**
  * Channel Manager — Maps platform channels to MCPL channels.
  *
- * Channel ID formats:
- *   Zulip:   zulip:{stream_name}
- *   Discord: discord:{guildId}:{channelId}
+ * Platform-agnostic: routes every operation to a PlatformAdapter by the
+ * channel ID prefix (the part before the first ':'). Channel ID formats are
+ * owned by the adapters (e.g. zulip:{stream_name}, discord:{guildId}:{channelId},
+ * slack:{channelId}).
  *
  * Handles registration, open/close lifecycle, incoming message batching,
- * publish routing, and channel listing.
+ * publish routing (with last-incoming thread tracking for in-thread replies),
+ * and channel listing.
  */
 
-import type { Client as DiscordClient, TextChannel } from 'discord.js';
 import type {
   ChannelDescriptor,
   ChannelIncomingMessage,
-  McplTextContent,
   ChannelsPublishParams,
   ChannelsOpenParams,
   ChannelsCloseParams,
   ChannelsListResult,
 } from './types.js';
 import type { McplClient } from './client.js';
+import type { PlatformAdapter, RoutingHints } from '../platforms/adapter.js';
 
 const DEFAULT_BATCH_WINDOW_MS = 500;
 
@@ -29,68 +30,33 @@ export class ChannelManager {
   private batchBuffer = new Map<string, ChannelIncomingMessage[]>();
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private batchWindowMs: number;
+  /** Per-channel routing hints from the most recent incoming message,
+   *  so publishes can land in the active thread/topic. */
+  private lastIncoming = new Map<string, RoutingHints>();
 
   constructor(
     private mcplClient: McplClient,
-    private zulipClient: any | null,
-    private discordClient: DiscordClient | null,
+    private adapters: Map<string, PlatformAdapter>,
     batchWindowMs?: number,
   ) {
     this.batchWindowMs = batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS;
   }
 
   /**
-   * Discover all available channels and register them with the host.
+   * Discover all available channels across adapters and register them with the host.
    */
   async registerChannels(): Promise<void> {
     const channels: ChannelDescriptor[] = [];
 
-    // Discover Zulip streams
-    if (this.zulipClient) {
+    for (const adapter of this.adapters.values()) {
       try {
-        const result = await this.zulipClient.streams.retrieve({
-          include_public: true,
-          include_subscribed: true,
-        });
-        const streams = result.streams || [];
-        for (const stream of streams) {
-          const descriptor: ChannelDescriptor = {
-            id: `zulip:${stream.name}`,
-            type: 'zulip',
-            label: `#${stream.name}`,
-            direction: 'bidirectional',
-            address: { stream_name: stream.name, stream_id: stream.stream_id },
-            metadata: {
-              subscriber_count: stream.subscriber_count,
-              is_public: !stream.invite_only,
-            },
-          };
+        const discovered = await adapter.discoverChannels();
+        for (const descriptor of discovered) {
           channels.push(descriptor);
           this.allChannels.set(descriptor.id, descriptor);
         }
       } catch (error) {
-        console.error('Failed to discover Zulip streams:', error);
-      }
-    }
-
-    // Discover Discord text channels
-    if (this.discordClient) {
-      for (const guild of this.discordClient.guilds.cache.values()) {
-        for (const channel of guild.channels.cache.values()) {
-          if (channel.isTextBased() && 'name' in channel) {
-            const textChannel = channel as TextChannel;
-            const descriptor: ChannelDescriptor = {
-              id: `discord:${guild.id}:${textChannel.id}`,
-              type: 'discord',
-              label: `#${textChannel.name} (${guild.name})`,
-              direction: 'bidirectional',
-              address: { guild_id: guild.id, guild_name: guild.name, channel_id: textChannel.id },
-              metadata: { topic: textChannel.topic || undefined },
-            };
-            channels.push(descriptor);
-            this.allChannels.set(descriptor.id, descriptor);
-          }
-        }
+        console.error(`Failed to discover ${adapter.type} channels:`, error);
       }
     }
 
@@ -144,6 +110,12 @@ export class ChannelManager {
   onIncomingMessage(channelId: string, message: ChannelIncomingMessage): void {
     if (!this.openChannels.has(channelId)) return; // channel not opened by host
 
+    // Remember where the conversation is, so publishes reply in-thread.
+    this.lastIncoming.set(channelId, {
+      threadId: message.threadId,
+      metadata: message.metadata,
+    });
+
     let buffer = this.batchBuffer.get(channelId);
     if (!buffer) {
       buffer = [];
@@ -155,78 +127,35 @@ export class ChannelManager {
   }
 
   /**
-   * Handle channels/publish from the host — send a message to Zulip or Discord.
+   * Handle channels/publish from the host — route to the owning adapter.
    */
   async publish(params: ChannelsPublishParams): Promise<{ delivered: boolean; messageId?: string }> {
     const channelId = params.channelId;
-    const textContent = params.content
-      .filter((c): c is McplTextContent => c.type === 'text')
-      .map(c => c.text)
-      .join('\n');
-
-    if (!textContent) {
-      return { delivered: false };
+    const adapter = this.adapterFor(channelId);
+    if (!adapter) {
+      throw new Error(`Unknown channel format: ${channelId}`);
     }
 
-    if (channelId.startsWith('zulip:')) {
-      return this.publishToZulip(channelId, textContent);
-    }
-
-    if (channelId.startsWith('discord:')) {
-      return this.publishToDiscord(channelId, textContent);
-    }
-
-    throw new Error(`Unknown channel format: ${channelId}`);
+    return adapter.publish(
+      channelId,
+      this.allChannels.get(channelId),
+      params.content,
+      this.lastIncoming.get(channelId),
+    );
   }
 
   /**
-   * Handle channels/typing — best-effort typing indicator.
-   *
-   * Routing metadata travels with the notification; the host (via whatever
-   * inference logic it uses — most commonly the most recent incoming message
-   * on this channel) provides a `topic` key pointing at the active Zulip
-   * thread. Falls back to 'mcpl' if the host didn't provide one.
-   *
-   * Zulip typing events auto-expire server-side (~15s), so there's no stop op;
-   * the host refreshes every 7s while inference is active.
-   *
-   * Note: zulip-js's `typing.send` unconditionally dereferences `params.to.length`,
-   * so we must pass `to: []` even for the stream form — otherwise the library
-   * throws a TypeError before the HTTP request is made. The Zulip server ignores
-   * `to` when `type:'stream'` is set.
+   * Handle channels/typing — best-effort typing indicator, routed to the
+   * owning adapter when it supports one.
    */
   async sendTyping(
     channelId: string,
     metadata?: Record<string, unknown>,
     op: 'start' | 'stop' = 'start',
   ): Promise<void> {
-    if (!channelId.startsWith('zulip:')) return;
-    if (!this.zulipClient) return;
-
-    const descriptor = this.allChannels.get(channelId);
-    const streamId = descriptor?.address?.stream_id as number | undefined;
-    if (!streamId) {
-      console.error(`[zulip-mcp] sendTyping: no stream_id for ${channelId} (descriptor=${descriptor ? 'present' : 'missing'})`);
-      return;
-    }
-
-    const topic = typeof metadata?.topic === 'string' ? metadata.topic : 'mcpl';
-
-    try {
-      const result = await (this.zulipClient.typing.send as (p: unknown) => Promise<{ result?: string; msg?: string }>)({
-        type: 'stream',
-        stream_id: streamId,
-        topic,
-        op,
-        to: [],
-      });
-      if (result?.result && result.result !== 'success') {
-        console.error(`[zulip-mcp] typing.send(${op}) non-success: ${result.result} ${result.msg ?? ''}`);
-      }
-    } catch (err) {
-      // Best-effort — swallow errors so typing never breaks the agent.
-      console.error(`[zulip-mcp] typing.send(${op}) failed:`, (err as Error).message);
-    }
+    const adapter = this.adapterFor(channelId);
+    if (!adapter?.sendTyping) return;
+    await adapter.sendTyping(channelId, this.allChannels.get(channelId), metadata, op);
   }
 
   /**
@@ -241,6 +170,23 @@ export class ChannelManager {
    */
   getChannel(id: string): ChannelDescriptor | undefined {
     return this.allChannels.get(id);
+  }
+
+  /**
+   * Resolve the adapter owning a channel ID by its prefix.
+   */
+  adapterFor(channelId: string): PlatformAdapter | undefined {
+    const prefix = channelId.split(':', 1)[0];
+    return this.adapters.get(prefix);
+  }
+
+  /**
+   * Type of the first registered adapter — used as a fallback when an
+   * operation can't be attributed to a single platform.
+   */
+  firstAdapterType(): string {
+    const first = this.adapters.values().next().value as PlatformAdapter | undefined;
+    return first?.type ?? 'unknown';
   }
 
   /**
@@ -278,38 +224,5 @@ export class ChannelManager {
     } catch (error) {
       console.error('Failed to send incoming messages to host:', error);
     }
-  }
-
-  private async publishToZulip(channelId: string, content: string): Promise<{ delivered: boolean; messageId?: string }> {
-    if (!this.zulipClient) throw new Error('Zulip client not initialized');
-
-    // channelId format: zulip:{stream_name}
-    const streamName = channelId.slice('zulip:'.length);
-
-    // Default topic — the host can override via content conventions
-    const result = await this.zulipClient.messages.send({
-      type: 'stream',
-      to: streamName,
-      topic: 'mcpl',
-      content,
-    });
-
-    return { delivered: true, messageId: String(result.id) };
-  }
-
-  private async publishToDiscord(channelId: string, content: string): Promise<{ delivered: boolean; messageId?: string }> {
-    if (!this.discordClient) throw new Error('Discord client not initialized');
-
-    // channelId format: discord:{guildId}:{channelId}
-    const parts = channelId.split(':');
-    const discordChannelId = parts[2];
-
-    const channel = await this.discordClient.channels.fetch(discordChannelId);
-    if (!channel || !('send' in channel)) {
-      throw new Error(`Discord channel ${discordChannelId} not found or not a text channel`);
-    }
-
-    const sent = await (channel as TextChannel).send(content);
-    return { delivered: true, messageId: sent.id };
   }
 }
