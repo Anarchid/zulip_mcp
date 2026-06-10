@@ -36,6 +36,8 @@ import {
   toFetchResult,
   cleanContent,
   formatDiscordContent,
+  formatSlackText,
+  extractSlackUserIds,
 } from './content.js';
 export { fetchAttachmentBytes, extractZulipAttachments, cleanContent, formatDiscordContent } from './content.js';
 
@@ -72,16 +74,24 @@ interface DiscordChannelState {
   lastReadMessageId: string;
 }
 
+interface SlackChannelState {
+  channelId: string;
+  channelName: string;
+  lastReadTs: string;
+}
+
 interface SessionState {
   sessionId: string;
   userId?: string;
   monitoredChannels: Record<string, ChannelState>;
   monitoredDiscordChannels: Record<string, DiscordChannelState>;
+  monitoredSlackChannels?: Record<string, SlackChannelState>;
 }
 
 let sessionId: string = "";
 const monitoredChannels: Map<string, ChannelState> = new Map();
 const monitoredDiscordChannels: Map<string, DiscordChannelState> = new Map();
+const monitoredSlackChannels: Map<string, SlackChannelState> = new Map();
 
 // File system for persistent state
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
@@ -98,20 +108,27 @@ function loadState(sessionId: string): void {
       const data = JSON.parse(readFileSync(stateFile, "utf-8")) as SessionState;
       monitoredChannels.clear();
       monitoredDiscordChannels.clear();
-      
+      monitoredSlackChannels.clear();
+
       if (data.monitoredChannels) {
         Object.values(data.monitoredChannels).forEach(channel => {
           monitoredChannels.set(channel.channelName, channel);
         });
       }
-      
+
       if (data.monitoredDiscordChannels) {
         Object.values(data.monitoredDiscordChannels).forEach(channel => {
           monitoredDiscordChannels.set(channel.channelId, channel);
         });
       }
-      
-      console.error(`Loaded state for session ${sessionId}: ${monitoredChannels.size} Zulip, ${monitoredDiscordChannels.size} Discord channels`);
+
+      if (data.monitoredSlackChannels) {
+        Object.values(data.monitoredSlackChannels).forEach(channel => {
+          monitoredSlackChannels.set(channel.channelId, channel);
+        });
+      }
+
+      console.error(`Loaded state for session ${sessionId}: ${monitoredChannels.size} Zulip, ${monitoredDiscordChannels.size} Discord, ${monitoredSlackChannels.size} Slack channels`);
     } catch (error) {
       console.error(`Failed to load state: ${error}`);
     }
@@ -130,6 +147,7 @@ function saveState(): void {
       sessionId,
       monitoredChannels: Object.fromEntries(monitoredChannels),
       monitoredDiscordChannels: Object.fromEntries(monitoredDiscordChannels),
+      monitoredSlackChannels: Object.fromEntries(monitoredSlackChannels),
     };
     
     writeFileSync(getStateFile(sessionId), JSON.stringify(state, null, 2));
@@ -369,6 +387,73 @@ export function formatMessages(messages: any[], format: string): string {
     return `[${date} ${time}] 📝 Topic: ${msg.subject}\n👤 ${msg.sender_full_name}\n💬 ${content}\n`;
   }).join('\n' + '─'.repeat(80) + '\n\n');
   
+  return `📊 Retrieved ${messages.length} messages\n${'='.repeat(80)}\n\n${formatted}`;
+}
+
+// Slack user-name cache for the tool layer (the MCPL adapter keeps its own).
+const slackUserNames = new Map<string, string>();
+
+async function resolveSlackUsers(userIds: string[]): Promise<void> {
+  if (!slackWebClient) return;
+  const unresolved = Array.from(new Set(userIds)).filter(id => id && !slackUserNames.has(id));
+  await Promise.all(unresolved.map(async (id) => {
+    try {
+      const result = await slackWebClient!.users.info({ user: id });
+      const user = result.user as any;
+      slackUserNames.set(id, user?.profile?.display_name || user?.real_name || user?.name || id);
+    } catch {
+      slackUserNames.set(id, id);
+    }
+  }));
+}
+
+/** Resolve author + mention names for raw Slack history messages and shape
+ * them for formatSlackMessages. */
+async function shapeSlackMessages(messages: any[], channelName?: string): Promise<any[]> {
+  const ids = new Set<string>();
+  for (const msg of messages) {
+    if (msg.user) ids.add(msg.user);
+    for (const id of extractSlackUserIds(msg.text ?? '')) ids.add(id);
+  }
+  await resolveSlackUsers(Array.from(ids));
+
+  return messages.map(msg => ({
+    ts: msg.ts,
+    author: msg.user ? (slackUserNames.get(msg.user) ?? msg.user) : (msg.username ?? 'bot'),
+    content: formatSlackText(msg.text ?? '', slackUserNames),
+    timestamp: Math.floor(parseFloat(msg.ts ?? '0')),
+    thread_ts: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
+    attachments: (msg.files ?? []).length,
+    channel: channelName,
+  }));
+}
+
+// Helper function to format Slack messages (shaped by shapeSlackMessages)
+function formatSlackMessages(messages: any[], format: string): string {
+  if (format === 'raw') {
+    return JSON.stringify(messages, null, 2);
+  }
+
+  if (format === 'summary') {
+    const summary = messages.map(msg => {
+      const time = new Date(msg.timestamp * 1000).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      const content = msg.content.substring(0, 80);
+      const threadIndicator = msg.thread_ts ? '🧵 ' : '';
+      return `[${time}] ${threadIndicator}${msg.author}: ${content}...`;
+    }).join('\n');
+    return `📊 ${messages.length} messages\n\n${summary}`;
+  }
+
+  // Detailed format
+  const formatted = messages.map(msg => {
+    const time = new Date(msg.timestamp * 1000).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    const date = new Date(msg.timestamp * 1000).toLocaleDateString('en-US');
+    const threadInfo = msg.thread_ts ? `\n🧵 In thread: ${msg.thread_ts}` : '';
+    const attachmentInfo = msg.attachments > 0 ? `\n📎 ${msg.attachments} attachment(s)` : '';
+
+    return `[${date} ${time}] 💬 ${msg.channel ? `#${msg.channel}` : ''} (ts: ${msg.ts})${threadInfo}\n👤 ${msg.author}\n💬 ${msg.content}${attachmentInfo}\n`;
+  }).join('\n' + '─'.repeat(80) + '\n\n');
+
   return `📊 Retrieved ${messages.length} messages\n${'='.repeat(80)}\n\n${formatted}`;
 }
 
@@ -879,7 +964,218 @@ function getTools(): Tool[] {
     },
     });
   }
-  
+
+  // Slack tools
+  if (ENABLE_SLACK) {
+    tools.push({
+      name: "slack_list_channels",
+      description: "List Slack conversations: channels, private channels, DMs, and group DMs. Returns conversation IDs used by other slack_ tools.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          types: {
+            type: "string",
+            description: "Comma-separated conversation types (default: 'public_channel,private_channel,im,mpim')",
+          },
+        },
+      },
+    },
+    {
+      name: "slack_start_monitoring",
+      description: "Start monitoring Slack conversations. Enables tracking of read/unread messages.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "Slack conversation IDs to monitor (e.g., ['C0123ABC', 'D0456DEF'])",
+          },
+        },
+        required: ["channel_ids"],
+      },
+    },
+    {
+      name: "slack_get_channel_history",
+      description: "Get Slack conversation history with date/time filtering. Auto-monitors by default.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_id: {
+            type: "string",
+            description: "Slack conversation ID (C… channel, D… DM, G… group)",
+          },
+          start_date: {
+            type: "string",
+            description: "Start date/time ('today', 'yesterday', or ISO format). Defaults to today.",
+          },
+          end_date: {
+            type: "string",
+            description: "End date/time ('now' or ISO format). Defaults to now.",
+          },
+          max_messages: {
+            type: "number",
+            description: "Maximum messages to retrieve (default: 100, max: 200)",
+            default: 100,
+          },
+          format: {
+            type: "string",
+            enum: ["detailed", "summary", "raw"],
+            description: "Output format",
+            default: "detailed",
+          },
+          auto_monitor: {
+            type: "boolean",
+            description: "Auto-start monitoring and mark as read (default: true)",
+            default: true,
+          },
+        },
+        required: ["channel_id"],
+      },
+    },
+    {
+      name: "slack_get_unread_messages",
+      description: "Get unread Slack messages from monitored conversations.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "Specific conversations to check (optional, defaults to all monitored)",
+          },
+          format: {
+            type: "string",
+            enum: ["detailed", "summary", "raw"],
+            description: "Output format",
+            default: "detailed",
+          },
+          mark_as_read: {
+            type: "boolean",
+            description: "Mark as read after retrieving (default: true)",
+            default: true,
+          },
+        },
+      },
+    },
+    {
+      name: "slack_send_message",
+      description: "Send a message to a Slack conversation (channel or DM). Use <@user_id> for mentions. Optionally reply in a thread via thread_ts.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_id: {
+            type: "string",
+            description: "Slack conversation ID",
+          },
+          content: {
+            type: "string",
+            description: "Message text (supports Slack mrkdwn)",
+          },
+          thread_ts: {
+            type: "string",
+            description: "Optional: thread timestamp to reply in (the ts of the thread's parent message)",
+          },
+        },
+        required: ["channel_id", "content"],
+      },
+    },
+    {
+      name: "slack_delete_message",
+      description: "Delete a Slack message by channel and ts. Requires appropriate permissions.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_id: {
+            type: "string",
+            description: "Slack conversation ID",
+          },
+          message_ts: {
+            type: "string",
+            description: "Timestamp (ts) of the message to delete",
+          },
+        },
+        required: ["channel_id", "message_ts"],
+      },
+    },
+    {
+      name: "slack_add_reaction",
+      description: "Add an emoji reaction to a Slack message.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_id: {
+            type: "string",
+            description: "Slack conversation ID",
+          },
+          message_ts: {
+            type: "string",
+            description: "Timestamp (ts) of the message to react to",
+          },
+          emoji_name: {
+            type: "string",
+            description: "Emoji name without colons (e.g., 'thumbsup')",
+          },
+        },
+        required: ["channel_id", "message_ts", "emoji_name"],
+      },
+    },
+    {
+      name: "slack_find_user",
+      description: "Find a Slack user by name. Returns user ID for mentions. Use <@user_id> format in messages.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Name to search for (matches username, real name, or display name)",
+          },
+        },
+        required: ["query"],
+      },
+    },
+    {
+      name: "slack_get_monitored_channels",
+      description: "List all monitored Slack conversations and their state",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
+      name: "slack_stop_monitoring",
+      description: "Stop monitoring Slack conversations",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "Conversation IDs to stop monitoring (optional, stops all if not provided)",
+          },
+        },
+      },
+    },
+    {
+      name: "slack_fetch_attachment",
+      description:
+        "Fetch a Slack file attachment by URL and return its bytes inline. " +
+        "Images return as an image content block usable by vision models. " +
+        "Text-ish MIME types return as `content_text`; other binaries return as `base64`. " +
+        "URLs come from incoming Slack message attachment refs (url_private, fetched with bot auth).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description: "Full url_private of the Slack file.",
+          },
+        },
+        required: ["url"],
+      },
+    });
+  }
+
   return tools;
 }
 
@@ -887,14 +1183,19 @@ function getTools(): Tool[] {
 async function handleToolCall(name: string, args: any): Promise<any> {
   // Check if the required client is initialized
   const isDiscordTool = name.startsWith("discord_");
-  const isZulipTool = !isDiscordTool;
-  
+  const isSlackTool = name.startsWith("slack_");
+  const isZulipTool = !isDiscordTool && !isSlackTool;
+
   if (isZulipTool && !zulipClient) {
     throw new Error("Zulip client not initialized. Set ENABLE_ZULIP=true");
   }
-  
+
   if (isDiscordTool && !discordClient) {
     throw new Error("Discord client not initialized. Set ENABLE_DISCORD=true");
+  }
+
+  if (isSlackTool && !slackWebClient) {
+    throw new Error("Slack client not initialized. Set ENABLE_SLACK=true");
   }
 
   switch (name) {
@@ -1788,6 +2089,395 @@ async function handleToolCall(name: string, args: any): Promise<any> {
       };
     }
 
+    // Slack handlers
+    case "slack_list_channels": {
+      const types = typeof args?.types === "string" && args.types
+        ? args.types
+        : "public_channel,private_channel,im,mpim";
+
+      const allChannels: any[] = [];
+      let cursor: string | undefined;
+      do {
+        const result = await slackWebClient!.conversations.list({
+          types,
+          exclude_archived: true,
+          limit: 200,
+          cursor,
+        });
+        for (const conv of (result.channels ?? []) as any[]) {
+          if (conv.is_im) {
+            await resolveSlackUsers([conv.user]);
+            allChannels.push({
+              id: conv.id,
+              kind: "dm",
+              name: slackUserNames.get(conv.user) ?? conv.user,
+              user_id: conv.user,
+            });
+          } else if (conv.is_mpim) {
+            allChannels.push({ id: conv.id, kind: "group_dm", name: conv.name });
+          } else {
+            allChannels.push({
+              id: conv.id,
+              kind: conv.is_private ? "private_channel" : "channel",
+              name: conv.name,
+              topic: conv.topic?.value || "",
+              is_member: !!conv.is_member,
+            });
+          }
+        }
+        cursor = (result.response_metadata?.next_cursor as string) || undefined;
+      } while (cursor);
+
+      const formatted = allChannels
+        .map(ch => {
+          const icon = ch.kind === "dm" ? "👤" : ch.kind === "group_dm" ? "👥" : "💬";
+          const label = ch.kind === "dm" ? `DM: @${ch.name}` : `#${ch.name}`;
+          const member = ch.kind === "channel" || ch.kind === "private_channel"
+            ? (ch.is_member ? "" : " (not a member)")
+            : "";
+          return `${icon} **${label}**${member}\n   └─ ID: ${ch.id}${ch.topic ? `\n   └─ ${ch.topic}` : ""}`;
+        })
+        .join("\n\n");
+
+      return {
+        total_channels: allChannels.length,
+        formatted_list: `📋 **${allChannels.length} Slack Conversations**\n\n${formatted}`,
+        raw_data: allChannels,
+      };
+    }
+
+    case "slack_start_monitoring": {
+      const channelIds: string[] = args.channel_ids;
+      const results: any[] = [];
+
+      for (const channelId of channelIds) {
+        try {
+          const info = await slackWebClient!.conversations.info({ channel: channelId });
+          const conv = info.channel as any;
+          const channelName = conv.is_im
+            ? `DM:${conv.user}`
+            : (conv.name ?? channelId);
+
+          // Get latest message ts as the read cursor
+          const history = await slackWebClient!.conversations.history({ channel: channelId, limit: 1 });
+          const lastTs = history.messages?.[0]?.ts ?? "0";
+
+          monitoredSlackChannels.set(channelId, {
+            channelId,
+            channelName,
+            lastReadTs: String(lastTs),
+          });
+
+          results.push({
+            channel_id: channelId,
+            channel_name: channelName,
+            status: "monitoring",
+            last_read_ts: lastTs,
+          });
+        } catch (error) {
+          results.push({
+            channel_id: channelId,
+            status: "error",
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      saveState();
+
+      return {
+        session_id: sessionId,
+        monitored_count: monitoredSlackChannels.size,
+        channels: results,
+      };
+    }
+
+    case "slack_get_channel_history": {
+      const channelId = args.channel_id;
+
+      const info = await slackWebClient!.conversations.info({ channel: channelId });
+      const conv = info.channel as any;
+      const channelName = conv.is_im ? `DM:${conv.user}` : (conv.name ?? channelId);
+
+      // Parse dates
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const now = new Date();
+
+      const startDate = parseDate(args.start_date, today);
+      const endDate = parseDate(args.end_date, now);
+
+      const maxMessages = Math.min(args.max_messages || 100, 200);
+      const result = await slackWebClient!.conversations.history({
+        channel: channelId,
+        oldest: String(startDate.getTime() / 1000),
+        latest: String(endDate.getTime() / 1000),
+        inclusive: true,
+        limit: maxMessages,
+      });
+
+      // Newest-first from the API; oldest-first for reading.
+      const rawMessages = ((result.messages ?? []) as any[]).slice().reverse();
+
+      // Auto-monitor
+      const autoMonitor = args.auto_monitor !== false;
+      let monitoringStatus = "not_monitored";
+
+      if (autoMonitor && rawMessages.length > 0) {
+        const latestTs = String(rawMessages[rawMessages.length - 1].ts);
+
+        if (!monitoredSlackChannels.has(channelId)) {
+          monitoredSlackChannels.set(channelId, {
+            channelId,
+            channelName,
+            lastReadTs: latestTs,
+          });
+          monitoringStatus = "started_monitoring";
+          saveState();
+        } else {
+          const state = monitoredSlackChannels.get(channelId)!;
+          state.lastReadTs = latestTs;
+          monitoringStatus = "updated_read_position";
+          saveState();
+        }
+      }
+
+      const format = args.format || "detailed";
+      const shaped = await shapeSlackMessages(rawMessages, channelName);
+      const formattedOutput = formatSlackMessages(shaped, format);
+
+      return {
+        channel_id: channelId,
+        channel_name: channelName,
+        start_date: startDate.toISOString(),
+        end_date: endDate.toISOString(),
+        message_count: rawMessages.length,
+        monitoring_status: monitoringStatus,
+        formatted_history: formattedOutput,
+      };
+    }
+
+    case "slack_get_unread_messages": {
+      const channelIdsToCheck = args.channel_ids || Array.from(monitoredSlackChannels.keys());
+
+      if (channelIdsToCheck.length === 0) {
+        return {
+          message: "No Slack conversations being monitored",
+          total_unread: 0,
+          formatted_messages: "📊 0 messages\n\n",
+        };
+      }
+
+      const allUnreadMessages: any[] = [];
+      const channelResults: any[] = [];
+
+      for (const channelId of channelIdsToCheck) {
+        const state = monitoredSlackChannels.get(channelId);
+
+        if (!state) {
+          channelResults.push({
+            channel_id: channelId,
+            status: "not_monitored",
+            unread_count: 0,
+          });
+          continue;
+        }
+
+        try {
+          // oldest is exclusive by default — returns strictly newer messages.
+          const result = await slackWebClient!.conversations.history({
+            channel: channelId,
+            oldest: state.lastReadTs,
+            limit: 100,
+          });
+          const unread = ((result.messages ?? []) as any[]).slice().reverse();
+
+          const shaped = await shapeSlackMessages(unread, state.channelName);
+          allUnreadMessages.push(...shaped);
+
+          if (args.mark_as_read !== false && unread.length > 0) {
+            state.lastReadTs = String(unread[unread.length - 1].ts);
+            saveState();
+          }
+
+          channelResults.push({
+            channel_id: channelId,
+            channel_name: state.channelName,
+            status: "checked",
+            unread_count: unread.length,
+          });
+        } catch (error) {
+          channelResults.push({
+            channel_id: channelId,
+            status: "error",
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      const format = args.format || "detailed";
+      const formattedOutput = formatSlackMessages(allUnreadMessages, format);
+
+      return {
+        total_unread: allUnreadMessages.length,
+        channels_checked: channelResults,
+        formatted_messages: formattedOutput,
+      };
+    }
+
+    case "slack_send_message": {
+      const result = await slackWebClient!.chat.postMessage({
+        channel: args.channel_id,
+        text: args.content,
+        ...(args.thread_ts ? { thread_ts: args.thread_ts } : {}),
+      });
+
+      return {
+        success: true,
+        message_ts: result.ts,
+        channel_id: args.channel_id,
+        thread_ts: args.thread_ts,
+      };
+    }
+
+    case "slack_delete_message": {
+      await slackWebClient!.chat.delete({
+        channel: args.channel_id,
+        ts: args.message_ts,
+      });
+
+      return {
+        success: true,
+        message_ts: args.message_ts,
+        channel_id: args.channel_id,
+        deleted: true,
+      };
+    }
+
+    case "slack_add_reaction": {
+      await slackWebClient!.reactions.add({
+        channel: args.channel_id,
+        timestamp: args.message_ts,
+        name: String(args.emoji_name).replace(/:/g, ""),
+      });
+
+      return {
+        success: true,
+        message_ts: args.message_ts,
+        emoji: args.emoji_name,
+      };
+    }
+
+    case "slack_find_user": {
+      const query = String(args.query || "").toLowerCase();
+      if (!query) throw new Error("query is required");
+
+      const matches: any[] = [];
+      let cursor: string | undefined;
+      do {
+        const result = await slackWebClient!.users.list({ limit: 200, cursor });
+        for (const user of (result.members ?? []) as any[]) {
+          if (user.deleted || user.is_bot) continue;
+          const name = user.name?.toLowerCase() ?? "";
+          const realName = user.real_name?.toLowerCase() ?? "";
+          const displayName = user.profile?.display_name?.toLowerCase() ?? "";
+          if (name.includes(query) || realName.includes(query) || displayName.includes(query)) {
+            matches.push({
+              user_id: user.id,
+              username: user.name,
+              real_name: user.real_name,
+              display_name: user.profile?.display_name,
+              mention_syntax: `<@${user.id}>`,
+            });
+            if (matches.length >= 25) break;
+          }
+        }
+        cursor = matches.length >= 25
+          ? undefined
+          : ((result.response_metadata?.next_cursor as string) || undefined);
+      } while (cursor);
+
+      if (matches.length === 0) {
+        return {
+          found: false,
+          message: `No users found matching "${args.query}".`,
+        };
+      }
+
+      const formatted = matches.map(user =>
+        `👤 **${user.real_name || user.username}**\n   └─ User ID: ${user.user_id}\n   └─ Mention format: <@${user.user_id}>`
+      ).join("\n\n");
+
+      return {
+        found: true,
+        match_count: matches.length,
+        formatted_list: `👥 Found ${matches.length} user${matches.length !== 1 ? 's' : ''}:\n\n${formatted}`,
+        users: matches,
+      };
+    }
+
+    case "slack_get_monitored_channels": {
+      const channels = Array.from(monitoredSlackChannels.values());
+      return {
+        monitored_count: channels.length,
+        channels: channels.map(c => ({
+          channel_id: c.channelId,
+          channel_name: c.channelName,
+          last_read_ts: c.lastReadTs,
+        })),
+      };
+    }
+
+    case "slack_stop_monitoring": {
+      const channelIds: string[] = args.channel_ids;
+
+      if (!channelIds || channelIds.length === 0) {
+        const stopped = Array.from(monitoredSlackChannels.keys());
+        monitoredSlackChannels.clear();
+        saveState();
+        return {
+          message: "Stopped monitoring all Slack conversations",
+          stopped_channels: stopped,
+        };
+      }
+
+      const stopped: string[] = [];
+      for (const channelId of channelIds) {
+        if (monitoredSlackChannels.has(channelId)) {
+          monitoredSlackChannels.delete(channelId);
+          stopped.push(channelId);
+        }
+      }
+
+      saveState();
+
+      return {
+        stopped_channels: stopped,
+        still_monitoring: Array.from(monitoredSlackChannels.keys()),
+      };
+    }
+
+    case "slack_fetch_attachment": {
+      const rawUrl = String(args.url || "");
+      if (!rawUrl) throw new Error("url is required");
+      if (!rawUrl.startsWith("https://")) {
+        throw new Error("url must be a full https:// link");
+      }
+      const url = new URL(rawUrl);
+      // The bot token must only be sent to Slack's file hosts. The agent's
+      // tool input is influenced by message content from untrusted senders,
+      // so a foreign host must never receive the Authorization header.
+      if (url.host !== "files.slack.com" && !url.host.endsWith(".slack.com")) {
+        throw new Error(`refusing to fetch from foreign host ${url.host}; expected a *.slack.com file URL`);
+      }
+      const botToken = process.env.SLACK_BOT_TOKEN || "";
+      const headers: Record<string, string> = botToken
+        ? { Authorization: `Bearer ${botToken}` }
+        : {};
+      const fileName = decodeURIComponent(url.pathname.split("/").pop() || "attachment");
+      return toFetchResult(await fetchAttachmentBytes(url.toString(), fileName, { headers }));
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -1909,7 +2599,35 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
       });
     }
   }
-  
+
+  // Slack resources
+  if (ENABLE_SLACK && slackWebClient) {
+    resources.push(
+      {
+        uri: "slack://unread/summary",
+        name: "Slack - Unread Messages Summary",
+        description: "Count of unread messages across all monitored Slack conversations",
+        mimeType: "text/plain",
+      },
+      {
+        uri: "slack://monitoring/status",
+        name: "Slack - Monitoring Status",
+        description: "Current Slack monitoring state and conversation list",
+        mimeType: "application/json",
+      }
+    );
+
+    // Add a resource for each monitored Slack conversation
+    for (const [channelId, state] of monitoredSlackChannels) {
+      resources.push({
+        uri: `slack://channel/${channelId}/unread`,
+        name: `Slack #${state.channelName} - Unread Messages`,
+        description: `Unread message count for Slack #${state.channelName}`,
+        mimeType: "text/plain",
+      });
+    }
+  }
+
   return { resources };
 });
 
@@ -2153,6 +2871,116 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       }
     }
     
+    if (uri === "slack://unread/summary") {
+      if (!slackWebClient) {
+        return {
+          contents: [{
+            uri,
+            mimeType: "text/plain",
+            text: "Slack is not enabled",
+          }],
+        };
+      }
+
+      let totalUnread = 0;
+      const channelSummaries: string[] = [];
+
+      for (const [channelId, state] of monitoredSlackChannels) {
+        try {
+          const result = await slackWebClient.conversations.history({
+            channel: channelId,
+            oldest: state.lastReadTs,
+            limit: 50,
+          });
+          const unread = result.messages ?? [];
+          totalUnread += unread.length;
+
+          if (unread.length > 0) {
+            channelSummaries.push(`📬 #${state.channelName}: ${unread.length} unread`);
+          }
+        } catch (error) {
+          // Skip channels with errors
+        }
+      }
+
+      const summary = totalUnread > 0
+        ? `🔔 ${totalUnread} unread Slack message${totalUnread !== 1 ? 's' : ''}\n\n${channelSummaries.join('\n')}`
+        : "✅ No unread Slack messages";
+
+      return {
+        contents: [{
+          uri,
+          mimeType: "text/plain",
+          text: summary,
+        }],
+      };
+    }
+
+    if (uri === "slack://monitoring/status") {
+      const status = {
+        session_id: sessionId,
+        monitored_count: monitoredSlackChannels.size,
+        channels: Array.from(monitoredSlackChannels.values()).map(c => ({
+          channel_id: c.channelId,
+          channel_name: c.channelName,
+          last_read_ts: c.lastReadTs,
+        })),
+      };
+
+      return {
+        contents: [{
+          uri,
+          mimeType: "application/json",
+          text: JSON.stringify(status, null, 2),
+        }],
+      };
+    }
+
+    const slackChannelMatch = uri.match(/^slack:\/\/channel\/([^/]+)\/unread$/);
+    if (slackChannelMatch) {
+      const channelId = slackChannelMatch[1];
+      const state = monitoredSlackChannels.get(channelId);
+
+      if (!state || !slackWebClient) {
+        return {
+          contents: [{
+            uri,
+            mimeType: "text/plain",
+            text: `Slack conversation "${channelId}" is not being monitored`,
+          }],
+        };
+      }
+
+      try {
+        const result = await slackWebClient.conversations.history({
+          channel: channelId,
+          oldest: state.lastReadTs,
+          limit: 50,
+        });
+        const count = (result.messages ?? []).length;
+
+        const text = count > 0
+          ? `📬 ${count} unread message${count !== 1 ? 's' : ''} in #${state.channelName}`
+          : `✅ No unread messages in #${state.channelName}`;
+
+        return {
+          contents: [{
+            uri,
+            mimeType: "text/plain",
+            text,
+          }],
+        };
+      } catch (error) {
+        return {
+          contents: [{
+            uri,
+            mimeType: "text/plain",
+            text: `Error checking #${state.channelName}: ${error}`,
+          }],
+        };
+      }
+    }
+
     throw new Error(`Unknown resource: ${uri}`);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
