@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
+  parseDiscordAttachmentUrl,
   parseSlackAttachmentUrl,
   parseZulipAttachmentUrl,
   isMainModule,
@@ -65,6 +66,33 @@ test('parseZulipAttachmentUrl rejects foreign hosts and non-upload paths', () =>
   assert.throws(() => parseZulipAttachmentUrl('/api/v1/users/me', REALM), /user_uploads/);
   assert.throws(() => parseZulipAttachmentUrl('', REALM), /required/);
   assert.throws(() => parseZulipAttachmentUrl('/user_uploads/x', ''), /realm/);
+});
+
+// --- discord_fetch_attachment host allowlist (SSRF guard) -------------------
+
+test('parseDiscordAttachmentUrl accepts the Discord CDN hosts', () => {
+  assert.equal(
+    parseDiscordAttachmentUrl('https://cdn.discordapp.com/attachments/1/2/shot.png').host,
+    'cdn.discordapp.com',
+  );
+  assert.equal(
+    parseDiscordAttachmentUrl('https://media.discordapp.net/attachments/1/2/shot.png?width=400').host,
+    'media.discordapp.net',
+  );
+});
+
+test('parseDiscordAttachmentUrl rejects non-CDN hosts (SSRF)', () => {
+  // No credentials attached, but the URL comes from untrusted message
+  // content — without an allowlist this is an open fetch proxy.
+  assert.throws(() => parseDiscordAttachmentUrl('https://169.254.169.254/latest/meta-data/'), /refusing to fetch/);
+  assert.throws(() => parseDiscordAttachmentUrl('https://localhost:8080/admin'), /refusing to fetch/);
+  assert.throws(() => parseDiscordAttachmentUrl('https://cdn.discordapp.com.evil.example/x'), /refusing to fetch/);
+  assert.throws(() => parseDiscordAttachmentUrl('https://cdn.discordapp.com@evil.example/x'), /refusing to fetch/);
+});
+
+test('parseDiscordAttachmentUrl rejects http:// and empty input', () => {
+  assert.throws(() => parseDiscordAttachmentUrl('http://cdn.discordapp.com/attachments/1/2/x.png'), /https/);
+  assert.throws(() => parseDiscordAttachmentUrl(''), /required/);
 });
 
 // --- run-as-main guard (npm bin symlink regression) -------------------------

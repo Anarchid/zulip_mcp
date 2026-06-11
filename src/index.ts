@@ -26,7 +26,7 @@ import type { ChannelsPublishParams, ChannelsOpenParams, ChannelsCloseParams, Be
 import type { PlatformAdapter } from './platforms/adapter.js';
 import { ZulipAdapter } from './platforms/zulip.js';
 import { DiscordAdapter } from './platforms/discord.js';
-import { SlackAdapter } from './platforms/slack.js';
+import { SlackAdapter, type SlackConversation } from './platforms/slack.js';
 import { WebClient as SlackWebClient } from '@slack/web-api';
 import { SocketModeClient as SlackSocketModeClient } from '@slack/socket-mode';
 
@@ -39,8 +39,11 @@ import {
   formatSlackText,
   extractSlackUserIds,
   resolveSlackUserNames,
+  parseDiscordAttachmentUrl,
   parseSlackAttachmentUrl,
   parseZulipAttachmentUrl,
+  fetchSlackHistory,
+  type SlackHistoryMessage,
   isMainModule,
 } from './content.js';
 export { fetchAttachmentBytes, extractZulipAttachments, cleanContent, formatDiscordContent } from './content.js';
@@ -403,9 +406,25 @@ async function resolveSlackUsers(userIds: string[]): Promise<void> {
   await resolveSlackUserNames(slackWebClient, slackUserNames, userIds);
 }
 
+interface ShapedSlackAttachment {
+  name: string;
+  mimetype?: string;
+  url_private?: string;
+}
+
+interface ShapedSlackMessage {
+  ts?: string;
+  author: string;
+  content: string;
+  timestamp: number;
+  thread_ts?: string;
+  attachments: ShapedSlackAttachment[];
+  channel?: string;
+}
+
 /** Resolve author + mention names for raw Slack history messages and shape
  * them for formatSlackMessages. */
-async function shapeSlackMessages(messages: any[], channelName?: string): Promise<any[]> {
+async function shapeSlackMessages(messages: SlackHistoryMessage[], channelName?: string): Promise<ShapedSlackMessage[]> {
   const ids = new Set<string>();
   for (const msg of messages) {
     if (msg.user) ids.add(msg.user);
@@ -419,13 +438,17 @@ async function shapeSlackMessages(messages: any[], channelName?: string): Promis
     content: formatSlackText(msg.text ?? '', slackUserNames),
     timestamp: Math.floor(parseFloat(msg.ts ?? '0')),
     thread_ts: msg.thread_ts && msg.thread_ts !== msg.ts ? msg.thread_ts : undefined,
-    attachments: (msg.files ?? []).length,
+    attachments: (msg.files ?? []).map(f => ({
+      name: f.name ?? 'attachment',
+      mimetype: f.mimetype,
+      url_private: f.url_private,
+    })),
     channel: channelName,
   }));
 }
 
 // Helper function to format Slack messages (shaped by shapeSlackMessages)
-function formatSlackMessages(messages: any[], format: string): string {
+function formatSlackMessages(messages: ShapedSlackMessage[], format: string): string {
   if (format === 'raw') {
     return JSON.stringify(messages, null, 2);
   }
@@ -433,9 +456,9 @@ function formatSlackMessages(messages: any[], format: string): string {
   if (format === 'summary') {
     const summary = messages.map(msg => {
       const time = new Date(msg.timestamp * 1000).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-      const content = msg.content.substring(0, 80);
+      const content = msg.content.length > 80 ? `${msg.content.substring(0, 80)}…` : msg.content;
       const threadIndicator = msg.thread_ts ? '🧵 ' : '';
-      return `[${time}] ${threadIndicator}${msg.author}: ${content}...`;
+      return `[${time}] ${threadIndicator}${msg.author}: ${content}`;
     }).join('\n');
     return `📊 ${messages.length} messages\n\n${summary}`;
   }
@@ -445,7 +468,11 @@ function formatSlackMessages(messages: any[], format: string): string {
     const time = new Date(msg.timestamp * 1000).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
     const date = new Date(msg.timestamp * 1000).toLocaleDateString('en-US');
     const threadInfo = msg.thread_ts ? `\n🧵 In thread: ${msg.thread_ts}` : '';
-    const attachmentInfo = msg.attachments > 0 ? `\n📎 ${msg.attachments} attachment(s)` : '';
+    const attachmentInfo = msg.attachments.length > 0
+      ? '\n' + msg.attachments.map(a =>
+          `📎 ${a.name}${a.mimetype ? ` (${a.mimetype})` : ''}${a.url_private ? ` — fetchable via slack_fetch_attachment: ${a.url_private}` : ''}`,
+        ).join('\n')
+      : '';
 
     return `[${date} ${time}] 💬 ${msg.channel ? `#${msg.channel}` : ''} (ts: ${msg.ts})${threadInfo}\n👤 ${msg.author}\n💬 ${msg.content}${attachmentInfo}\n`;
   }).join('\n' + '─'.repeat(80) + '\n\n');
@@ -947,7 +974,8 @@ function getTools(): Tool[] {
       "Fetch a Discord attachment by URL and return its bytes inline. " +
       "Images return as an image content block usable by vision models. " +
       "Text-ish MIME types return as `content_text`; other binaries return as `base64`. " +
-      "URLs come from incoming Discord message attachment refs (Discord CDN, no auth required).",
+      "URLs come from incoming Discord message attachment refs and must be on the Discord CDN " +
+      "(cdn.discordapp.com / media.discordapp.net); other hosts are refused.",
     inputSchema: {
       type: "object",
       properties: {
@@ -993,7 +1021,7 @@ function getTools(): Tool[] {
     },
     {
       name: "slack_get_channel_history",
-      description: "Get Slack conversation history with date/time filtering. Auto-monitors by default.",
+      description: "Get Slack conversation history with date/time filtering. Auto-monitors by default. Note: covers channel-level messages only — replies inside threads are not returned (Slack requires conversations.replies per thread), so an active thread can look quiet here.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1031,7 +1059,7 @@ function getTools(): Tool[] {
     },
     {
       name: "slack_get_unread_messages",
-      description: "Get unread Slack messages from monitored conversations.",
+      description: "Get unread Slack messages from monitored conversations. Note: covers channel-level messages only — replies inside threads are not returned (Slack requires conversations.replies per thread), so an active thread can look quiet here.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1621,13 +1649,11 @@ async function handleToolCall(name: string, args: any): Promise<any> {
     }
 
     case "discord_fetch_attachment": {
-      const url = String(args.url || "");
-      if (!url) throw new Error("url is required");
-      if (!url.startsWith("http://") && !url.startsWith("https://")) {
-        throw new Error("url must be a full https:// link");
-      }
-      const name = decodeURIComponent(url.split("?")[0].split("/").pop() || "attachment");
-      return toFetchResult(await fetchAttachmentBytes(url, name));
+      // No credentials attached, but the URL comes from untrusted message
+      // content — host allowlisting lives in parseDiscordAttachmentUrl.
+      const url = parseDiscordAttachmentUrl(String(args.url || ""));
+      const name = decodeURIComponent(url.pathname.split("/").pop() || "attachment");
+      return toFetchResult(await fetchAttachmentBytes(url.toString(), name));
     }
 
     // Discord handlers
@@ -2081,13 +2107,13 @@ async function handleToolCall(name: string, args: any): Promise<any> {
           limit: 200,
           cursor,
         });
-        for (const conv of (result.channels ?? []) as any[]) {
+        for (const conv of (result.channels ?? []) as SlackConversation[]) {
           if (conv.is_im) {
-            await resolveSlackUsers([conv.user]);
+            await resolveSlackUsers(conv.user ? [conv.user] : []);
             allChannels.push({
               id: conv.id,
               kind: "dm",
-              name: slackUserNames.get(conv.user) ?? conv.user,
+              name: conv.user ? (slackUserNames.get(conv.user) ?? conv.user) : (conv.id ?? "unknown"),
               user_id: conv.user,
             });
           } else if (conv.is_mpim) {
@@ -2130,9 +2156,9 @@ async function handleToolCall(name: string, args: any): Promise<any> {
       for (const channelId of channelIds) {
         try {
           const info = await slackWebClient!.conversations.info({ channel: channelId });
-          const conv = info.channel as any;
+          const conv = (info.channel ?? {}) as SlackConversation;
           const channelName = conv.is_im
-            ? `DM:${conv.user}`
+            ? `DM:${conv.user ?? channelId}`
             : (conv.name ?? channelId);
 
           // Get latest message ts as the read cursor
@@ -2173,8 +2199,8 @@ async function handleToolCall(name: string, args: any): Promise<any> {
       const channelId = args.channel_id;
 
       const info = await slackWebClient!.conversations.info({ channel: channelId });
-      const conv = info.channel as any;
-      const channelName = conv.is_im ? `DM:${conv.user}` : (conv.name ?? channelId);
+      const conv = (info.channel ?? {}) as SlackConversation;
+      const channelName = conv.is_im ? `DM:${conv.user ?? channelId}` : (conv.name ?? channelId);
 
       // Parse dates
       const today = new Date();
@@ -2185,16 +2211,15 @@ async function handleToolCall(name: string, args: any): Promise<any> {
       const endDate = parseDate(args.end_date, now);
 
       const maxMessages = Math.min(args.max_messages || 100, 200);
-      const result = await slackWebClient!.conversations.history({
+      // Cursor-drained and oldest-first; `truncated` means the range holds
+      // more than maxMessages and the OLDEST messages were dropped.
+      const { messages: rawMessages, truncated } = await fetchSlackHistory(slackWebClient!, {
         channel: channelId,
         oldest: String(startDate.getTime() / 1000),
         latest: String(endDate.getTime() / 1000),
         inclusive: true,
-        limit: maxMessages,
+        maxMessages,
       });
-
-      // Newest-first from the API; oldest-first for reading.
-      const rawMessages = ((result.messages ?? []) as any[]).slice().reverse();
 
       // Auto-monitor
       const autoMonitor = args.auto_monitor !== false;
@@ -2229,6 +2254,10 @@ async function handleToolCall(name: string, args: any): Promise<any> {
         start_date: startDate.toISOString(),
         end_date: endDate.toISOString(),
         message_count: rawMessages.length,
+        has_more: truncated,
+        ...(truncated ? {
+          note: `The range contains more than ${maxMessages} messages; the oldest were omitted. Narrow the date range to see them.`,
+        } : {}),
         monitoring_status: monitoringStatus,
         formatted_history: formattedOutput,
       };
@@ -2245,8 +2274,12 @@ async function handleToolCall(name: string, args: any): Promise<any> {
         };
       }
 
-      const allUnreadMessages: any[] = [];
+      // Backstop, not a page size — the cursor is drained up to this many.
+      const MAX_UNREAD_PER_CHANNEL = 1000;
+
+      const allUnreadMessages: ShapedSlackMessage[] = [];
       const channelResults: any[] = [];
+      let stateDirty = false;
 
       for (const channelId of channelIdsToCheck) {
         const state = monitoredSlackChannels.get(channelId);
@@ -2262,19 +2295,22 @@ async function handleToolCall(name: string, args: any): Promise<any> {
 
         try {
           // oldest is exclusive by default — returns strictly newer messages.
-          const result = await slackWebClient!.conversations.history({
+          // Cursor-drained and oldest-first.
+          const { messages: unread, truncated } = await fetchSlackHistory(slackWebClient!, {
             channel: channelId,
             oldest: state.lastReadTs,
-            limit: 100,
+            maxMessages: MAX_UNREAD_PER_CHANNEL,
           });
-          const unread = ((result.messages ?? []) as any[]).slice().reverse();
 
           const shaped = await shapeSlackMessages(unread, state.channelName);
           allUnreadMessages.push(...shaped);
 
-          if (args.mark_as_read !== false && unread.length > 0) {
+          if (args.mark_as_read !== false && unread.length > 0 && !truncated) {
+            // When truncated, the OLDEST unread were dropped — advancing the
+            // read cursor would skip them forever, so it stays put and the
+            // caller sees has_more instead.
             state.lastReadTs = String(unread[unread.length - 1].ts);
-            saveState();
+            stateDirty = true;
           }
 
           channelResults.push({
@@ -2282,6 +2318,10 @@ async function handleToolCall(name: string, args: any): Promise<any> {
             channel_name: state.channelName,
             status: "checked",
             unread_count: unread.length,
+            has_more: truncated,
+            ...(truncated ? {
+              note: `Unread backlog exceeds ${MAX_UNREAD_PER_CHANNEL}; read position NOT advanced. Use slack_get_channel_history with explicit dates to page through it.`,
+            } : {}),
           });
         } catch (error) {
           channelResults.push({
@@ -2292,11 +2332,14 @@ async function handleToolCall(name: string, args: any): Promise<any> {
         }
       }
 
+      if (stateDirty) saveState();
+
       const format = args.format || "detailed";
       const formattedOutput = formatSlackMessages(allUnreadMessages, format);
 
       return {
         total_unread: allUnreadMessages.length,
+        has_more: channelResults.some(r => r.has_more === true),
         channels_checked: channelResults,
         formatted_messages: formattedOutput,
       };
@@ -2463,7 +2506,7 @@ const mcplServerCaps = MCPL_ENABLED ? buildServerCapabilities(ENABLED_PLATFORMS)
 const server = new Server(
   {
     name: "zulip-mcp-server",
-    version: "2.0.0",
+    version: "2.2.0",
   },
   {
     capabilities: {
@@ -2851,20 +2894,21 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       }
 
       let totalUnread = 0;
+      let anyTruncated = false;
       const channelSummaries: string[] = [];
 
       for (const [channelId, state] of monitoredSlackChannels) {
         try {
-          const result = await slackWebClient.conversations.history({
+          const { messages: unread, truncated } = await fetchSlackHistory(slackWebClient!, {
             channel: channelId,
             oldest: state.lastReadTs,
-            limit: 50,
+            maxMessages: 200,
           });
-          const unread = result.messages ?? [];
           totalUnread += unread.length;
+          if (truncated) anyTruncated = true;
 
           if (unread.length > 0) {
-            channelSummaries.push(`📬 #${state.channelName}: ${unread.length} unread`);
+            channelSummaries.push(`📬 #${state.channelName}: ${unread.length}${truncated ? '+' : ''} unread`);
           }
         } catch (error) {
           // Skip the channel but leave a trace — a silently swallowed 403
@@ -2874,7 +2918,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       }
 
       const summary = totalUnread > 0
-        ? `🔔 ${totalUnread} unread Slack message${totalUnread !== 1 ? 's' : ''}\n\n${channelSummaries.join('\n')}`
+        ? `🔔 ${totalUnread}${anyTruncated ? '+' : ''} unread Slack message${totalUnread !== 1 ? 's' : ''}\n\n${channelSummaries.join('\n')}`
         : "✅ No unread Slack messages";
 
       return {
@@ -2922,15 +2966,15 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       }
 
       try {
-        const result = await slackWebClient.conversations.history({
+        const { messages, truncated } = await fetchSlackHistory(slackWebClient!, {
           channel: channelId,
           oldest: state.lastReadTs,
-          limit: 50,
+          maxMessages: 200,
         });
-        const count = (result.messages ?? []).length;
+        const count = messages.length;
 
         const text = count > 0
-          ? `📬 ${count} unread message${count !== 1 ? 's' : ''} in #${state.channelName}`
+          ? `📬 ${count}${truncated ? '+' : ''} unread message${count !== 1 ? 's' : ''} in #${state.channelName}`
           : `✅ No unread messages in #${state.channelName}`;
 
         return {

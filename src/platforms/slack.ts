@@ -51,9 +51,10 @@ interface SlackMessageEvent {
   files?: Array<{ url_private?: string; name?: string; mimetype?: string }>;
 }
 
-/** The fields of a conversations.list entry this adapter dereferences —
- * structurally satisfied by @slack/web-api's Channel type. */
-interface SlackConversation {
+/** The fields of a conversations.list/info entry this adapter (and the tool
+ * layer in index.ts) dereferences — structurally satisfied by
+ * @slack/web-api's Channel type. */
+export interface SlackConversation {
   id?: string;
   name?: string;
   user?: string;
@@ -300,7 +301,7 @@ export class SlackAdapter implements PlatformAdapter {
     return {
       id: `slack:${conv.id}`,
       type: 'slack',
-      label: `#${conv.name} (${this.teamName})`,
+      label: `#${conv.name ?? conv.id} (${this.teamName})`,
       direction: 'bidirectional',
       address: { channel_id: conv.id, channel_name: conv.name },
       metadata: {

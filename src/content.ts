@@ -174,6 +174,32 @@ export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): UR
   return url;
 }
 
+/** Hosts Discord serves attachment content from. Incoming AttachmentRef.path
+ * values are `attachment.url` from discord.js, which always point at the CDN;
+ * media.discordapp.net is the resizing proxy for the same content. */
+const DISCORD_ATTACHMENT_HOSTS = new Set([
+  "cdn.discordapp.com",
+  "media.discordapp.net",
+]);
+
+/**
+ * Validate a Discord attachment URL before fetching. No credentials are
+ * attached, but the URL is influenced by message content from untrusted
+ * senders — without an allowlist this tool is an open SSRF proxy (cloud
+ * metadata endpoints, internal services) that hands the bytes to the model.
+ */
+export function parseDiscordAttachmentUrl(rawUrl: string): URL {
+  if (!rawUrl) throw new Error("url is required");
+  if (!rawUrl.startsWith("https://")) {
+    throw new Error("url must be a full https:// link");
+  }
+  const url = new URL(rawUrl);
+  if (!DISCORD_ATTACHMENT_HOSTS.has(url.host)) {
+    throw new Error(`refusing to fetch from host ${url.host}; Discord attachments are served from cdn.discordapp.com or media.discordapp.net only`);
+  }
+  return url;
+}
+
 export interface AttachmentRef {
   path: string;       // e.g. "/user_uploads/2/Ab/cd/screenshot.png"
   name: string;       // basename for human display
@@ -357,14 +383,90 @@ export async function resolveSlackUserNames(
   userIds: string[],
 ): Promise<void> {
   const unresolved = Array.from(new Set(userIds)).filter(id => id && !cache.has(id));
-  await Promise.all(unresolved.map(async (id) => {
-    try {
-      const { user } = await client.users.info({ user: id });
-      cache.set(id, user?.profile?.display_name || user?.real_name || user?.name || id);
-    } catch {
-      cache.set(id, id);
+  // Chunked, not one big Promise.all — a busy channel can reference dozens of
+  // distinct users, and an unbounded users.info fan-out just queues up 429
+  // retries inside the SDK.
+  const CONCURRENCY = 8;
+  for (let i = 0; i < unresolved.length; i += CONCURRENCY) {
+    await Promise.all(unresolved.slice(i, i + CONCURRENCY).map(async (id) => {
+      try {
+        const { user } = await client.users.info({ user: id });
+        cache.set(id, user?.profile?.display_name || user?.real_name || user?.name || id);
+      } catch {
+        cache.set(id, id);
+      }
+    }));
+  }
+}
+
+/** The fields of a conversations.history message the tool layer reads —
+ * structurally satisfied by @slack/web-api's MessageElement. */
+export interface SlackHistoryMessage {
+  ts?: string;
+  user?: string;
+  username?: string;
+  text?: string;
+  thread_ts?: string;
+  files?: Array<{ name?: string; mimetype?: string; url_private?: string }>;
+}
+
+/** The minimal conversations.history surface fetchSlackHistory needs —
+ * structurally satisfied by @slack/web-api's WebClient. */
+export interface SlackHistoryClient {
+  conversations: {
+    history(args: {
+      channel: string;
+      oldest?: string;
+      latest?: string;
+      inclusive?: boolean;
+      limit?: number;
+      cursor?: string;
+    }): Promise<{
+      messages?: unknown[];
+      response_metadata?: { next_cursor?: string };
+    }>;
+  };
+}
+
+/**
+ * Fetch conversations.history with cursor pagination. The API returns
+ * newest-first pages and next_cursor walks toward older messages, so draining
+ * the cursor collects everything in [oldest, latest]; `maxMessages` is a
+ * backstop against unbounded backlogs. Returns messages oldest-first plus a
+ * `truncated` flag — when truncated, the dropped messages are the OLDEST in
+ * range (callers that keep a read cursor must NOT advance it then, or the
+ * dropped messages are skipped forever).
+ */
+export async function fetchSlackHistory(
+  client: SlackHistoryClient,
+  params: {
+    channel: string;
+    oldest?: string;
+    latest?: string;
+    inclusive?: boolean;
+    maxMessages: number;
+  },
+): Promise<{ messages: SlackHistoryMessage[]; truncated: boolean }> {
+  const collected: SlackHistoryMessage[] = [];
+  let cursor: string | undefined;
+  let truncated = false;
+  do {
+    const result = await client.conversations.history({
+      channel: params.channel,
+      ...(params.oldest !== undefined ? { oldest: params.oldest } : {}),
+      ...(params.latest !== undefined ? { latest: params.latest } : {}),
+      ...(params.inclusive ? { inclusive: true } : {}),
+      limit: Math.min(200, params.maxMessages - collected.length),
+      cursor,
+    });
+    collected.push(...((result.messages ?? []) as SlackHistoryMessage[]));
+    cursor = result.response_metadata?.next_cursor || undefined;
+    if (cursor && collected.length >= params.maxMessages) {
+      truncated = true;
+      cursor = undefined;
     }
-  }));
+  } while (cursor);
+  return { messages: collected.reverse(), truncated };
 }
 
 // Helper to format Discord mentions
