@@ -1,33 +1,31 @@
 /**
  * Feature Set Declarations
  *
- * Declares MCPL capabilities based on which services are enabled.
+ * Declares MCPL capabilities based on which platforms are enabled.
  * Builds the McplServerCapabilities object for the MCP Server constructor.
+ *
+ * Each platform contributes two feature sets:
+ *   {type}.messaging — real-time delivery + channel management
+ *   {type}.context   — history injection before inference
  */
 
 import type { FeatureSetDeclaration, McplServerCapabilities } from './types.js';
 
-export function buildFeatureSets(enableZulip: boolean, enableDiscord: boolean): Record<string, FeatureSetDeclaration> {
+function displayName(type: string): string {
+  return type.charAt(0).toUpperCase() + type.slice(1);
+}
+
+export function buildFeatureSets(platforms: string[]): Record<string, FeatureSetDeclaration> {
   const featureSets: Record<string, FeatureSetDeclaration> = {};
 
-  if (enableZulip) {
-    featureSets['zulip.messaging'] = {
-      description: 'Real-time Zulip message delivery and channel management',
+  for (const type of platforms) {
+    const name = displayName(type);
+    featureSets[`${type}.messaging`] = {
+      description: `Real-time ${name} message delivery and channel management`,
       uses: ['channels.publish', 'channels.observe', 'pushEvents', 'tools'],
     };
-    featureSets['zulip.context'] = {
-      description: 'Zulip message history injection before inference',
-      uses: ['contextHooks.beforeInference'],
-    };
-  }
-
-  if (enableDiscord) {
-    featureSets['discord.messaging'] = {
-      description: 'Real-time Discord message delivery and channel management',
-      uses: ['channels.publish', 'channels.observe', 'pushEvents', 'tools'],
-    };
-    featureSets['discord.context'] = {
-      description: 'Discord message history injection before inference',
+    featureSets[`${type}.context`] = {
+      description: `${name} message history injection before inference`,
       uses: ['contextHooks.beforeInference'],
     };
   }
@@ -35,8 +33,8 @@ export function buildFeatureSets(enableZulip: boolean, enableDiscord: boolean): 
   return featureSets;
 }
 
-export function buildServerCapabilities(enableZulip: boolean, enableDiscord: boolean): McplServerCapabilities {
-  const featureSets = buildFeatureSets(enableZulip, enableDiscord);
+export function buildServerCapabilities(platforms: string[]): McplServerCapabilities {
+  const featureSets = buildFeatureSets(platforms);
   const hasAny = Object.keys(featureSets).length > 0;
 
   return {
