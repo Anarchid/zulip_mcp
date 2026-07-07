@@ -103,6 +103,70 @@ test('publish has no hints before any incoming message', async () => {
   manager.destroy();
 });
 
+test('broadcastSystemEvent reaches open channels of the platform without clobbering thread hints', async () => {
+  const sent: any[][] = [];
+  const client = {
+    registerChannels: async () => {},
+    sendIncoming: async (messages: any[]) => { sent.push(messages); },
+  } as any;
+
+  const desc: ChannelDescriptor = {
+    id: 'zulip:general',
+    type: 'zulip',
+    label: '#general',
+    direction: 'bidirectional',
+  };
+  const { adapter, calls } = fakeAdapter('zulip', [desc]);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), 10);
+  await manager.registerChannels();
+  manager.openChannel({ type: 'zulip' });
+
+  // Real conversation establishes thread routing.
+  manager.onIncomingMessage('zulip:general', {
+    channelId: 'zulip:general',
+    messageId: '7',
+    threadId: 'deploys',
+    author: { id: 'U1', name: 'alice' },
+    timestamp: new Date(0).toISOString(),
+    content: [{ type: 'text', text: 'hello' }],
+    metadata: { topic: 'deploys' },
+  });
+
+  manager.broadcastSystemEvent('zulip', {
+    kind: 'gap',
+    text: 'queue expired; messages may have been missed',
+    metadata: { expiredQueueId: 'q1', lastEventId: 42 },
+  });
+
+  await new Promise(resolve => setTimeout(resolve, 30)); // let the 10ms batch flush
+
+  const flushed = sent.flat();
+  const marker = flushed.find(m => m.metadata?.system === true);
+  assert.ok(marker, 'gap marker delivered to host');
+  assert.equal(marker.channelId, 'zulip:general');
+  assert.equal(marker.author.id, 'system');
+  assert.equal(marker.metadata.kind, 'gap');
+  assert.equal(marker.metadata.lastEventId, 42);
+  assert.match(marker.content[0].text, /missed/);
+
+  // The system marker must not steal publish thread routing.
+  await manager.publish({
+    conversationId: '',
+    channelId: 'zulip:general',
+    content: [{ type: 'text', text: 'reply' }],
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].hints?.threadId, 'deploys');
+  manager.destroy();
+});
+
+test('broadcastSystemEvent with no open channels does not throw', () => {
+  const { manager } = makeManager();
+  manager.broadcastSystemEvent('slack', { kind: 'degraded', text: 'polling failing' });
+  manager.destroy();
+  assert.ok(true);
+});
+
 test('incoming messages on unopened channels are ignored', () => {
   const { manager } = makeManager();
   // Channel never opened by host — should not record hints or buffer.

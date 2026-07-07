@@ -3114,9 +3114,16 @@ async function main() {
 
       // Start real-time event delivery for every adapter
       for (const adapter of adapters.values()) {
-        adapter.startEvents((message) => {
-          channelManager.onIncomingMessage(message.channelId, message);
-        });
+        adapter.startEvents(
+          (message) => {
+            channelManager.onIncomingMessage(message.channelId, message);
+          },
+          (event) => {
+            // Delivery gaps / degraded polling: surface to the agent as a
+            // synthetic system message on the platform's open channels.
+            channelManager.broadcastSystemEvent(adapter.type, event);
+          },
+        );
       }
 
       console.error(`MCPL server running with: ${enabledServices.join(", ")}`);

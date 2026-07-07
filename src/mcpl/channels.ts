@@ -20,7 +20,7 @@ import type {
   ChannelsListResult,
 } from './types.js';
 import type { McplClient } from './client.js';
-import type { PlatformAdapter, RoutingHints } from '../platforms/adapter.js';
+import type { PlatformAdapter, PlatformSystemEvent, RoutingHints } from '../platforms/adapter.js';
 
 const DEFAULT_BATCH_WINDOW_MS = 500;
 
@@ -116,14 +116,38 @@ export class ChannelManager {
       metadata: message.metadata,
     });
 
-    let buffer = this.batchBuffer.get(channelId);
-    if (!buffer) {
-      buffer = [];
-      this.batchBuffer.set(channelId, buffer);
-    }
-    buffer.push(message);
+    this.enqueue(channelId, message);
+  }
 
-    this.scheduleBatchFlush();
+  /**
+   * Broadcast a platform system event (delivery gap, degraded polling) to
+   * every open channel of that platform as a synthetic incoming message, so
+   * the host/agent learns about it instead of it dying in stderr.
+   *
+   * Deliberately does NOT update lastIncoming: a system marker must not
+   * clobber the thread/topic routing hints of the real conversation.
+   */
+  broadcastSystemEvent(platformType: string, event: PlatformSystemEvent): void {
+    const prefix = `${platformType}:`;
+    const targets = Array.from(this.openChannels).filter(id => id.startsWith(prefix));
+
+    if (targets.length === 0) {
+      // No open channel to carry the marker — at least leave a trace.
+      console.error(`[system:${platformType}] ${event.kind}: ${event.text} (no open channels to notify)`);
+      return;
+    }
+
+    const timestamp = new Date().toISOString();
+    for (const channelId of targets) {
+      this.enqueue(channelId, {
+        channelId,
+        messageId: `system:${platformType}:${event.kind}:${Date.now()}`,
+        author: { id: 'system', name: `${platformType} connection` },
+        timestamp,
+        content: [{ type: 'text', text: event.text }],
+        metadata: { system: true, kind: event.kind, ...event.metadata },
+      });
+    }
   }
 
   /**
@@ -200,6 +224,17 @@ export class ChannelManager {
   }
 
   // -- Private --
+
+  private enqueue(channelId: string, message: ChannelIncomingMessage): void {
+    let buffer = this.batchBuffer.get(channelId);
+    if (!buffer) {
+      buffer = [];
+      this.batchBuffer.set(channelId, buffer);
+    }
+    buffer.push(message);
+
+    this.scheduleBatchFlush();
+  }
 
   private scheduleBatchFlush(): void {
     if (this.batchTimer) return; // already scheduled
