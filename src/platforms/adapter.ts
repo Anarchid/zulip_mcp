@@ -51,9 +51,12 @@ export type OnIncomingMessage = (message: ChannelIncomingMessage) => void;
  *     missed and the agent should consult channel history if it matters.
  *   - 'degraded': the event source is failing repeatedly; delivery is
  *     unreliable until it recovers.
+ *   - 'recovered': the event source resumed after a 'degraded' condition;
+ *     real-time delivery is healthy again. Pairs with 'degraded' so the agent
+ *     isn't left believing delivery is broken forever.
  */
 export interface PlatformSystemEvent {
-  kind: 'gap' | 'degraded';
+  kind: 'gap' | 'degraded' | 'recovered';
   /** Human-readable description, addressed to the agent. */
   text: string;
   metadata?: Record<string, unknown>;

@@ -145,7 +145,9 @@ export class ChannelManager {
         author: { id: 'system', name: `${platformType} connection` },
         timestamp,
         content: [{ type: 'text', text: event.text }],
-        metadata: { system: true, kind: event.kind, ...event.metadata },
+        // Spread adapter metadata FIRST so it can never clobber the
+        // discriminators consumers filter on (system / kind).
+        metadata: { ...event.metadata, system: true, kind: event.kind },
       });
     }
   }
