@@ -14,7 +14,7 @@ import type {
   McplContextInjection,
   McplTextContent,
 } from '../mcpl/types.js';
-import type { PlatformAdapter, PublishResult, RoutingHints, OnIncomingMessage } from './adapter.js';
+import type { PlatformAdapter, PublishResult, RoutingHints, OnIncomingMessage, OnSystemEvent } from './adapter.js';
 import { ZulipEventLoop } from './zulip-events.js';
 import { cleanContent, extractZulipAttachments } from '../content.js';
 
@@ -168,7 +168,7 @@ export class ZulipAdapter implements PlatformAdapter {
     };
   }
 
-  startEvents(onMessage: OnIncomingMessage): void {
+  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent): void {
     this.eventLoop = new ZulipEventLoop();
     this.eventLoop.start(this.zulipClient, (streamName, msg, flags) => {
       if (this.selfUserId !== null && msg.sender_id === this.selfUserId) return;
@@ -205,7 +205,7 @@ export class ZulipAdapter implements PlatformAdapter {
         },
       };
       onMessage(incoming);
-    }).catch(error => {
+    }, onSystemEvent).catch(error => {
       console.error('Zulip event loop failed:', error);
     });
   }

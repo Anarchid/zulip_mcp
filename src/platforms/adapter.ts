@@ -42,6 +42,28 @@ export interface RoutingHints {
 
 export type OnIncomingMessage = (message: ChannelIncomingMessage) => void;
 
+/**
+ * Out-of-band condition on a platform connection that the host/agent should
+ * know about, surfaced as a synthetic system message on the platform's open
+ * channels:
+ *   - 'gap': real-time delivery lost coverage (e.g. a Zulip event queue
+ *     expired and was re-registered from "now") — messages may have been
+ *     missed and the agent should consult channel history if it matters.
+ *   - 'degraded': the event source is failing repeatedly; delivery is
+ *     unreliable until it recovers.
+ *   - 'recovered': the event source resumed after a 'degraded' condition;
+ *     real-time delivery is healthy again. Pairs with 'degraded' so the agent
+ *     isn't left believing delivery is broken forever.
+ */
+export interface PlatformSystemEvent {
+  kind: 'gap' | 'degraded' | 'recovered';
+  /** Human-readable description, addressed to the agent. */
+  text: string;
+  metadata?: Record<string, unknown>;
+}
+
+export type OnSystemEvent = (event: PlatformSystemEvent) => void;
+
 export interface PlatformAdapter {
   /** Channel ID prefix and ChannelDescriptor.type, e.g. 'zulip'. */
   readonly type: string;
@@ -84,8 +106,12 @@ export interface PlatformAdapter {
   /**
    * Start delivering real-time messages. Adapters filter the bot's own
    * messages before invoking the callback.
+   *
+   * `onSystemEvent` (optional, and optional for adapters to use) receives
+   * out-of-band conditions — delivery gaps, degraded polling — so the host
+   * can surface them to the agent instead of losing them in stderr.
    */
-  startEvents(onMessage: OnIncomingMessage): void;
+  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent): void;
 
   /** Stop event delivery and release platform resources. */
   stopEvents(): void;
