@@ -11,7 +11,10 @@ import type {
   ChannelDescriptor,
   ChannelIncomingMessage,
   ChannelsRegisterParams,
+  ChannelsRegisterResult,
+  ChannelsChangedParams,
   ChannelsIncomingParams,
+  ManifestChangedParams,
 } from './types.js';
 import { McplMethod } from './types.js';
 
@@ -66,9 +69,13 @@ export class McplClient {
   // -- Convenience methods --
 
   /**
-   * Register channels with the host.
+   * Register channels with the host (§14.3).
+   *
+   * The host authorizes each descriptor independently (§14.5) and the Request
+   * form answers with one entry per submitted descriptor, so the result is
+   * itemized rather than whole-request.
    */
-  registerChannels(channels: ChannelDescriptor[]): Promise<{ registered: string[] }> {
+  registerChannels(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult> {
     const params: ChannelsRegisterParams = { channels };
     return this.request(McplMethod.ChannelsRegister, params as unknown as Record<string, unknown>);
   }
@@ -82,13 +89,26 @@ export class McplClient {
   }
 
   /**
-   * Notify host that available channels have changed.
+   * Tell the host that the set of available channels changed (§14.3).
+   *
+   * Sent as a **Request**, not a Notification. §14.5 makes `channels/changed`
+   * dual-mode: a Notification cannot carry a result, so a host whose policy
+   * rejects some descriptors has no way to say which. The Request form gets an
+   * itemized answer, and a rejected descriptor stays unregistered here.
    */
-  sendChannelsChanged(added?: ChannelDescriptor[], removed?: string[]): void {
-    this.notify(McplMethod.ChannelsChanged, {
-      ...(added && { added }),
-      ...(removed && { removed }),
-    });
+  sendChannelsChanged(params: ChannelsChangedParams): Promise<ChannelsRegisterResult> {
+    return this.request(McplMethod.ChannelsChanged, params as unknown as Record<string, unknown>);
+  }
+
+  /**
+   * Announce that this server's manifest changed (§17.3).
+   *
+   * A Notification carrying only an opaque revision and the changed domains.
+   * No diff, no payload, no conclusion — the host re-fetches `mcpl/manifest`
+   * and derives everything itself. No capability path gates this (§17.3).
+   */
+  sendManifestChanged(params: ManifestChangedParams): void {
+    this.notify(McplMethod.ManifestChanged, params as unknown as Record<string, unknown>);
   }
 
   // -- Internal --

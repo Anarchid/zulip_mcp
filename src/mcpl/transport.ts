@@ -18,19 +18,29 @@ import type { McplClient } from './client.js';
 import type { JsonRpcResponse } from './types.js';
 import { MCPL_METHODS } from './types.js';
 
+/**
+ * The host's advertised MCPL support (§5.2), mirroring the server shape.
+ *
+ * This is advertisement, not authorization: what the server may actually do is
+ * the effective grant delivered by `featureSets/update` (§5.3, §5.4). Nothing
+ * in this object widens anything.
+ */
 export interface McplHostCapabilities {
   version: string;
   pushEvents?: boolean;
   contextHooks?: {
-    beforeInference?: boolean;
-    afterInference?: boolean;
+    beforeInference?: boolean | Record<string, unknown>;
   };
+  inferenceLifecycle?: boolean;
   featureSets?: boolean;
   channels?: {
     register?: boolean;
-    publish?: boolean;
-    observe?: boolean;
     lifecycle?: boolean;
+    publish?: boolean;
+    incoming?: boolean;
+    streaming?: boolean;
+    acknowledge?: boolean;
+    typing?: boolean;
   };
 }
 
