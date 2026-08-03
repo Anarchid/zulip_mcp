@@ -18,8 +18,11 @@ import type {
   ChannelsOpenParams,
   ChannelsCloseParams,
   ChannelsListResult,
+  ChannelsRegisterResult,
 } from './types.js';
 import type { McplClient } from './client.js';
+import type { CapabilityGrant } from './grant.js';
+import { McplRpcError, capabilityDenied } from './errors.js';
 import type { PlatformAdapter, PlatformSystemEvent, RoutingHints } from '../platforms/adapter.js';
 
 const DEFAULT_BATCH_WINDOW_MS = 500;
@@ -34,46 +37,98 @@ export class ChannelManager {
    *  so publishes can land in the active thread/topic. */
   private lastIncoming = new Map<string, RoutingHints>();
 
+  /**
+   * @param grant the effective capability grant for this connection (§5.4).
+   *   Required: there is no ungated construction, because a default would be a
+   *   default-allow and absence of a capability is denial.
+   */
   constructor(
     private mcplClient: McplClient,
     private adapters: Map<string, PlatformAdapter>,
+    private grant: CapabilityGrant,
     batchWindowMs?: number,
   ) {
     this.batchWindowMs = batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS;
   }
 
   /**
-   * Discover all available channels across adapters and register them with the host.
+   * Discover all available channels across adapters and register them with the
+   * host (`channels/register`, §14.3).
+   *
+   * Descriptors are recorded locally only once the host has accepted them.
+   * §14.5 authorizes each descriptor independently and the Request form
+   * answers itemwise, so a rejected descriptor must not sit in `allChannels`
+   * pretending to exist.
    */
   async registerChannels(): Promise<void> {
+    if (!this.grant.has('channels.register')) {
+      console.error('channels.register not granted; skipping channel registration');
+      return;
+    }
+
     const channels: ChannelDescriptor[] = [];
+    const discovered = new Map<string, ChannelDescriptor>();
 
     for (const adapter of this.adapters.values()) {
       try {
-        const discovered = await adapter.discoverChannels();
-        for (const descriptor of discovered) {
+        for (const descriptor of await adapter.discoverChannels()) {
           channels.push(descriptor);
-          this.allChannels.set(descriptor.id, descriptor);
+          discovered.set(descriptor.id, descriptor);
         }
       } catch (error) {
         console.error(`Failed to discover ${adapter.type} channels:`, error);
       }
     }
 
-    if (channels.length > 0) {
-      try {
-        await this.mcplClient.registerChannels(channels);
-        console.error(`Registered ${channels.length} channels with host`);
-      } catch (error) {
-        console.error('Failed to register channels:', error);
+    if (channels.length === 0) return;
+
+    try {
+      const result = await this.mcplClient.registerChannels(channels);
+      const accepted = this.acceptedIds(result, channels);
+      for (const id of accepted) {
+        const descriptor = discovered.get(id);
+        if (descriptor) this.allChannels.set(id, descriptor);
       }
+      const rejected = channels.length - accepted.size;
+      console.error(
+        `Registered ${accepted.size} channels with host` +
+          (rejected > 0 ? ` (${rejected} rejected)` : ''),
+      );
+    } catch (error) {
+      // The registration never landed, so no descriptor is registered.
+      console.error('Failed to register channels:', error);
     }
   }
 
   /**
-   * Handle channels/open from the host.
+   * Read an itemized `channels/register` / `channels/changed` result (§14.5).
+   *
+   * A host that answers with neither `results` nor `registered` has not
+   * itemized anything; the submitted set stands. That is the pre-0.5 shape,
+   * not a policy statement, and it is not read as approval of anything the
+   * host explicitly rejected.
+   */
+  private acceptedIds(
+    result: ChannelsRegisterResult | undefined,
+    submitted: ChannelDescriptor[],
+  ): Set<string> {
+    if (result && Array.isArray(result.results)) {
+      return new Set(result.results.filter((r) => r?.accepted).map((r) => r.id));
+    }
+    if (result && Array.isArray(result.registered)) {
+      return new Set(result.registered);
+    }
+    return new Set(submitted.map((d) => d.id));
+  }
+
+  /**
+   * Handle channels/open from the host. Requires `channels.lifecycle` (§14.1);
+   * a denied capability behaves as if never advertised (§5.4), so this
+   * answers with an error rather than acting.
    */
   openChannel(params: ChannelsOpenParams): { channel: ChannelDescriptor } {
+    if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
+
     // Find channel by type and address
     for (const [id, descriptor] of this.allChannels) {
       if (descriptor.type === params.type) {
@@ -89,17 +144,20 @@ export class ChannelManager {
   }
 
   /**
-   * Handle channels/close from the host.
+   * Handle channels/close from the host. Requires `channels.lifecycle` (§14.1).
    */
   closeChannel(params: ChannelsCloseParams): { closed: boolean } {
+    if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
     const existed = this.openChannels.delete(params.channelId);
     return { closed: existed };
   }
 
   /**
-   * Handle channels/list from the host.
+   * Handle channels/list from the host. §14.1 keys `channels/list` in either
+   * direction on `channels.register`.
    */
   listChannels(): ChannelsListResult {
+    if (!this.grant.has('channels.register')) throw capabilityDenied('channels.register');
     return { channels: Array.from(this.allChannels.values()) };
   }
 
@@ -156,10 +214,12 @@ export class ChannelManager {
    * Handle channels/publish from the host — route to the owning adapter.
    */
   async publish(params: ChannelsPublishParams): Promise<{ delivered: boolean; messageId?: string }> {
+    if (!this.grant.has('channels.publish')) throw capabilityDenied('channels.publish');
+
     const channelId = params.channelId;
     const adapter = this.adapterFor(channelId);
     if (!adapter) {
-      throw new Error(`Unknown channel format: ${channelId}`);
+      throw new McplRpcError(-32023, `Unknown channel format: ${channelId}`, { channelId });
     }
 
     return adapter.publish(
@@ -179,6 +239,7 @@ export class ChannelManager {
     metadata?: Record<string, unknown>,
     op: 'start' | 'stop' = 'start',
   ): Promise<void> {
+    if (!this.grant.has('channels.typing')) throw capabilityDenied('channels.typing');
     const adapter = this.adapterFor(channelId);
     if (!adapter?.sendTyping) return;
     await adapter.sendTyping(channelId, this.allChannels.get(channelId), metadata, op);
@@ -255,6 +316,17 @@ export class ChannelManager {
     this.batchBuffer.clear();
 
     if (allMessages.length === 0) return;
+
+    // §14.1: `channels/incoming` is server→host content injection plus wake
+    // authority — a write. Without the grant the batch is dropped, not queued:
+    // a reduction must be respected immediately (§6.7), and holding messages
+    // for a grant that may never arrive would deliver them out of time.
+    if (!this.grant.has('channels.incoming')) {
+      console.error(
+        `channels.incoming not granted; dropping ${allMessages.length} inbound message(s)`,
+      );
+      return;
+    }
 
     try {
       await this.mcplClient.sendIncoming(allMessages);

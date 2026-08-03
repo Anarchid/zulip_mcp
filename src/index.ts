@@ -19,6 +19,9 @@ import { McplTransport } from './mcpl/transport.js';
 import { ChannelManager } from './mcpl/channels.js';
 import { ContextProvider } from './mcpl/context.js';
 import { buildServerCapabilities } from './mcpl/feature-sets.js';
+import { CapabilityGrant } from './mcpl/grant.js';
+import { McplRpcError } from './mcpl/errors.js';
+import { ManifestTracker } from './mcpl/manifest.js';
 import { McplMethod } from './mcpl/types.js';
 import type { ChannelsPublishParams, ChannelsOpenParams, ChannelsCloseParams, BeforeInferenceParams, FeatureSetsUpdateParams } from './mcpl/types.js';
 
@@ -2500,7 +2503,30 @@ const ENABLED_PLATFORMS = [
   ...(ENABLE_DISCORD ? ['discord'] : []),
   ...(ENABLE_SLACK ? ['slack'] : []),
 ];
-const mcplServerCaps = MCPL_ENABLED ? buildServerCapabilities(ENABLED_PLATFORMS) : null;
+
+// Which platform types can actually send a typing indicator. Derived from the
+// adapter classes rather than restated, so `channels.typing` cannot be
+// advertised for a platform whose adapter does not implement it (§6.4).
+const TYPING_CAPABLE_PLATFORMS = new Set<string>(
+  ([
+    ['zulip', ZulipAdapter],
+    ['discord', DiscordAdapter],
+    ['slack', SlackAdapter],
+  ] as [string, { prototype: PlatformAdapter }][])
+    .filter(([, cls]) => typeof cls.prototype.sendTyping === 'function')
+    .map(([type]) => type),
+);
+
+const mcplServerCaps = MCPL_ENABLED
+  ? buildServerCapabilities(ENABLED_PLATFORMS, { typingCapable: TYPING_CAPABLE_PLATFORMS })
+  : null;
+
+// The manifest is what `initialize` presents (§5.1) and what `mcpl/manifest`
+// returns (§17.4). Building it through the tracker stamps the canonical
+// content digest (§17.2) onto the same object both paths serve, and seeds this
+// connection's last-announced revision from the handshake so a fresh
+// connection does not fire a redundant `mcpl/manifestChanged` (§17.10).
+const manifestTracker = mcplServerCaps ? new ManifestTracker(mcplServerCaps) : null;
 
 // Create and configure the server
 const server = new Server(
@@ -2512,7 +2538,7 @@ const server = new Server(
     capabilities: {
       tools: {},
       resources: {},
-      ...(mcplServerCaps ? { experimental: { mcpl: mcplServerCaps } } : {}),
+      ...(manifestTracker ? { experimental: { mcpl: manifestTracker.manifest } } : {}),
     },
   }
 );
@@ -3064,17 +3090,35 @@ async function main() {
         adapters.set('slack', new SlackAdapter(slackWebClient, slackSocketClient, slackSelfUserId, slackTeamName));
       }
 
-      const channelManager = new ChannelManager(client, adapters, MCPL_BATCH_WINDOW_MS);
-      const contextProvider = new ContextProvider(channelManager, MCPL_CONTEXT_HISTORY_SIZE);
+      // The effective capability grant for this connection (§5.4). It starts
+      // empty: until the initial policy exchange completes, every
+      // capability-dependent behavior is unavailable (§5.3).
+      const grant = new CapabilityGrant(mcplServerCaps?.featureSets ?? {});
+
+      const channelManager = new ChannelManager(client, adapters, grant, MCPL_BATCH_WINDOW_MS);
+      const contextProvider = new ContextProvider(channelManager, grant, MCPL_CONTEXT_HISTORY_SIZE);
 
       // Register dispatcher handlers
       dispatcher.register(McplMethod.BeforeInference, (params) =>
         contextProvider.handleBeforeInference(params as unknown as BeforeInferenceParams),
       );
-      dispatcher.register(McplMethod.AfterInference, () => ({}));
-      dispatcher.register(McplMethod.FeatureSetsUpdate, (_params) => {
-        // Acknowledge feature set updates from the host
-        return {};
+      // §6.7: featureSets/update is a Request carrying the effective grant, and
+      // its response is a degradation receipt — what this server WILL DO under
+      // the grant it was given. It is testimony about consequences, never a
+      // claim of entitlement, and it asks for nothing. The dual-mode form
+      // matters here: a Notification cannot establish a ready state, so it is
+      // never allowed to widen.
+      dispatcher.register(McplMethod.FeatureSetsUpdate, (params, ctx) =>
+        grant.apply(
+          params as unknown as FeatureSetsUpdateParams,
+          ctx.isRequest ? 'request' : 'notification',
+        ),
+      );
+      // §17.4: the complete current manifest, never a delta, in the same shape
+      // initialize carries. Not gated on any capability path.
+      dispatcher.register(McplMethod.Manifest, () => {
+        if (!manifestTracker) throw new McplRpcError(-32601, 'MCPL manifest unavailable');
+        return manifestTracker.handleManifestRequest();
       });
       dispatcher.register(McplMethod.ChannelsOpen, (params) =>
         channelManager.openChannel(params as unknown as ChannelsOpenParams),
@@ -3102,15 +3146,44 @@ async function main() {
       const transport = new McplTransport(dispatcher, client);
       await server.connect(transport);
 
-      // After handshake completes, register channels and start event loops
-      // Use a small delay to ensure the initialize handshake is complete
-      setTimeout(async () => {
+      // §5.3: registration waits for the initial policy exchange, not for a
+      // timer. Until `featureSets/update` arrives the grant is empty and
+      // `channels.register` is denied, so registering earlier would be acting
+      // on a capability nobody has granted yet. A host that never sends it
+      // leaves this server inert by design — absence is denial.
+      void grant.whenReady().then(async () => {
+        // §17.3: the manifest presented at `initialize` was built from the
+        // ENABLE_* environment, before any platform client had been contacted.
+        // A platform that failed to initialize leaves feature sets advertised
+        // that nothing can serve, and §6.4 makes an inaccurate declaration
+        // consequential. Reinstall the manifest describing the adapters that
+        // actually came up; the digest moves on its own, so the correction
+        // cannot be installed without being announced, and when every platform
+        // came up the digest is unchanged and nothing is sent.
+        if (manifestTracker) {
+          const actual = buildServerCapabilities(Array.from(adapters.keys()), {
+            typingCapable: TYPING_CAPABLE_PLATFORMS,
+          });
+          const domains = manifestTracker.setManifest(actual, (params) =>
+            client.sendManifestChanged(params),
+          );
+          if (domains.length > 0) {
+            // Declarations feed degradation derivation (§6.4), not authority.
+            // The grant itself is untouched — only the host widens a grant.
+            grant.setDeclarations(manifestTracker.manifest.featureSets ?? {});
+            console.error(
+              `Announced mcpl/manifestChanged (${domains.join(', ')}): advertised ` +
+                `[${ENABLED_PLATFORMS.join(', ')}], initialized [${Array.from(adapters.keys()).join(', ')}]`,
+            );
+          }
+        }
+
         try {
           await channelManager.registerChannels();
         } catch (error) {
-          console.error('Failed to register channels after connect:', error);
+          console.error('Failed to register channels after initial policy:', error);
         }
-      }, 1000);
+      });
 
       // Start real-time event delivery for every adapter
       for (const adapter of adapters.values()) {
