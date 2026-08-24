@@ -18,8 +18,12 @@
  *                                                 catch-up sweep and gap recovery (3000)
  *   ZULIP_BACKSCROLL_DEFAULT                    - history cap per channel on channels/open (500)
  *   ZULIP_BACKSCROLL_CHANNELS                   - per-stream caps, "general:50,dev:200"
- *   ZULIP_DM_USERS                              - comma-separated user ids/emails allowed to
- *                                                 DM the bot; unset/empty = anyone
+ *   ZULIP_FILTERS_FILE                          - the filters plane file (default
+ *                                                 <state dir>/<session>.filters.json); hot-reloaded
+ *   ZULIP_STREAMS / ZULIP_DM_USERS /            - env seed for the filters file on first
+ *   ZULIP_MUTED_STREAMS                           materialization (then the file is authoritative)
+ *   ZULIP_SUPPRESSED_REACTIONS_BASELINE         - host-injected reaction-suppression seed
+ *   AGENT_TIMEZONE / AGENT_TIMESTAMP_STYLE      - agent-visible timestamps (IANA zone; full|compact|time|none)
  *   MCPL_ENABLED                                - "false" forces plain-MCP mode
  *   MCPL_BATCH_WINDOW_MS                        - channels/incoming batching window (500)
  *   MCPL_CONTEXT_HISTORY_SIZE                   - messages injected per open channel (20)
@@ -30,6 +34,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { isMainModule } from './content.js';
+import { FiltersPlane } from './filters.js';
 import { DEFAULT_BACKSCROLL, ZulipAdapter } from './platforms/zulip.js';
 import { DEFAULT_CATCHUP_LIMIT, ZulipMcplServer } from './server.js';
 import { ZulipToolRuntime } from './tool-runtime.js';
@@ -70,17 +75,6 @@ export function parseBackscrollLimits(raw: string | undefined): Map<string, numb
   return out;
 }
 
-/** "12, ann@example.com" → { "12", "ann@example.com" }; emails lower-cased. */
-export function parseUserList(raw: string | undefined): Set<string> {
-  return new Set(
-    (raw ?? '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .map((s) => (s.includes('@') ? s.toLowerCase() : s)),
-  );
-}
-
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const tcpIdx = args.indexOf('--tcp');
@@ -92,10 +86,12 @@ async function main(): Promise<void> {
 
   const session = await initializeZulipClient();
   const stateDir = process.env.ZULIP_STATE_DIR || join(homedir(), '.zulip_mcp_state');
+  const filters = new FiltersPlane(process.env.ZULIP_FILTERS_FILE || join(stateDir, `${session.sessionId}.filters.json`));
+  filters.start();
   const adapter = new ZulipAdapter(session.client, session.selfUserId, session.sessionId, {
     backscrollDefault: intEnv('ZULIP_BACKSCROLL_DEFAULT', DEFAULT_BACKSCROLL),
     backscrollLimits: parseBackscrollLimits(process.env.ZULIP_BACKSCROLL_CHANNELS),
-    dmUsers: parseUserList(process.env.ZULIP_DM_USERS),
+    filters,
   });
   const tools = new ZulipToolRuntime(session, stateDir);
   const server = new ZulipMcplServer(adapter, tools, {
@@ -106,6 +102,7 @@ async function main(): Promise<void> {
     stateDir,
     sessionId: session.sessionId,
     catchupLimit: intEnv('ZULIP_CATCHUP_LIMIT', DEFAULT_CATCHUP_LIMIT),
+    filters,
   });
 
   if (tcpPort) {
@@ -127,6 +124,7 @@ async function main(): Promise<void> {
   const conn = McplConnection.fromStreams(process.stdin, process.stdout);
   await server.serve(conn);
   server.shutdown();
+  filters.stop();
   process.exit(0);
 }
 

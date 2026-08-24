@@ -149,6 +149,8 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'start_monitoring':
     case 'stop_monitoring':
     case 'channel_missed':
+    case 'mute_channel':
+    case 'unmute_channel':
       return MESSAGING_FEATURE_SET;
     case 'fetch_history':
     case 'fetch_around':

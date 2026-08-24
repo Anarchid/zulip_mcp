@@ -29,6 +29,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChannelHistoryQuery, OnIncomingMessage, OnSystemEvent, PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
 import { ZulipMcplServer } from '../src/server.ts';
+import { FiltersPlane } from '../src/filters.ts';
 import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
 
 const DESCRIPTOR: ChannelDescriptor = {
@@ -117,7 +118,7 @@ interface Harness {
   close(): Promise<void>;
 }
 
-function harness(opts: { mcpl?: boolean; typing?: boolean; stateDir?: string; sessionId?: string; history?: IncomingChannelMessage[] } = {}): Harness {
+function harness(opts: { mcpl?: boolean; typing?: boolean; stateDir?: string; sessionId?: string; history?: IncomingChannelMessage[]; filters?: FiltersPlane } = {}): Harness {
   const toServer = new PassThrough();
   const toHost = new PassThrough();
   const serverConn = McplConnection.fromStreams(toServer, toHost);
@@ -134,6 +135,7 @@ function harness(opts: { mcpl?: boolean; typing?: boolean; stateDir?: string; se
     sessionId: opts.sessionId ?? 'test',
     catchupLimit: 100,
     formatTime: () => 'T',
+    filters: opts.filters,
   });
 
   const hostSaw: JsonRpcRequest[] = [];
@@ -713,4 +715,80 @@ test('a DM from a new conversation registers its channel, is pushed with a reply
   });
   assert.equal(h.adapter.published[0].channelId, 'zulip:dm:42');
   await h.close();
+});
+
+test('a muted stream delivers nothing, and the filters tools read and write the plane', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-filters-wire-'));
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), {}, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+
+    const call = async (name: string, args: Record<string, unknown>) =>
+      (await h.host.sendRequest('tools/call', { name, arguments: args })) as { isError?: boolean; content: { text: string }[] };
+    const json = (r: { content: { text: string }[] }) => JSON.parse(r.content[0].text);
+
+    const mute = json(await call('mute_channel', { channel: '#general' }));
+    assert.equal(mute.muted, true);
+    assert.deepEqual(plane.current().mutedStreams, ['general']);
+
+    h.adapter.emit!(streamMsg(1, { mentioned: true, text: '@bot?' }));
+    h.adapter.emit!(streamMsg(2));
+    await new Promise((r) => setTimeout(r, 25));
+    assert.equal(h.incoming.length, 0, 'muted: not even a mention on an open channel gets through');
+    assert.equal(h.pushed.length, 0);
+
+    json(await call('unmute_channel', { channel: 'zulip:general' }));
+    h.adapter.emit!(streamMsg(3));
+    await until(() => h.incoming.length === 1, 'delivery after unmute');
+
+    const got = json(await call('filters_get', {}));
+    assert.equal(got.streams, null);
+    assert.equal(got.dmUsers, null);
+    assert.deepEqual(got.mutedStreams, []);
+    assert.equal(got.plane.status, 'live');
+    assert.equal(got.reactionSuppression.status, 'not-configured');
+
+    // Removing the only allowed stream would empty the list — and an empty
+    // allowlist is unrestricted, so the edit is refused rather than
+    // silently re-opening everything.
+    const emptied = await call('filters_update', { removeStreams: ['general'] });
+    assert.equal(emptied.isError, true);
+    assert.match(emptied.content[0].text, /last allowed stream/);
+    assert.equal(plane.current().streams, undefined, 'nothing was written');
+
+    // Removing from an unrestricted allowlist materializes it first; adding
+    // a stream re-discovers and announces channels the host lacks.
+    h.adapter.discoverChannels = async () => [DESCRIPTOR, { ...DESCRIPTOR, id: 'zulip:dev', label: '#dev', address: { stream_name: 'dev', stream_id: 8 } }];
+    const upd = json(await call('filters_update', { addStreams: ['dev'], removeStreams: ['general'], setDmUsers: ['42'] }));
+    assert.deepEqual(upd.streams, ['dev']);
+    assert.deepEqual(upd.dmUsers, ['42']);
+    assert.match(upd.note, /materialized/);
+    assert.deepEqual(upd.registered, ['zulip:dev']);
+    assert.ok(h.hostSaw.some((r) => r.method === method.CHANNELS_CHANGED));
+    assert.equal(plane.streamAllowed('general'), false);
+    assert.equal(plane.streamAllowed('dev'), true);
+    assert.equal(plane.dmAllowed({ id: 42, email: 'x' }), true);
+    assert.equal(plane.dmAllowed({ id: 7, email: 'x' }), false);
+
+    // Clearing the DM allowlist is allowed, and says what it means.
+    const anyone = json(await call('filters_update', { setDmUsers: [] }));
+    assert.equal(anyone.dmUsers, null);
+    assert.match(anyone.note, /UNRESTRICTED/);
+
+    // A DM cannot be muted; the error names the right lever.
+    const bad = await call('mute_channel', { channel: 'zulip:dm:42' });
+    assert.equal(bad.isError, true);
+    assert.match(bad.content[0].text, /dmUsers/);
+    plane.stop();
+    await h.close();
+  } finally {
+    console.error = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

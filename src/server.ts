@@ -49,6 +49,8 @@ import { DeliveryState, renderMissedBlock, selectMissed, viewOf } from './delive
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
 import { isDmChannelId } from './history.js';
+import type { FiltersPlane } from './filters.js';
+import { formatAgentDateTime, resolveAgentTimeZone, resolveTimestampStyle } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
 import type { PlatformAdapter, PlatformSystemEvent } from './platforms/adapter.js';
 import { toolDefinitions } from './tools.js';
@@ -81,8 +83,10 @@ export interface ZulipMcplServerOptions {
   sessionId?: string;
   /** Per-channel ceiling for the reconnect sweep and gap recovery. */
   catchupLimit?: number;
-  /** Renders timestamps in agent-visible catch-up lines. */
+  /** Renders timestamps in agent-visible catch-up lines. Default: AGENT_TIMEZONE / AGENT_TIMESTAMP_STYLE. */
   formatTime?: (d: Date) => string;
+  /** The filters plane (stream/DM allowlists, mutes, reaction policy). Optional: without it nothing is filtered. */
+  filters?: FiltersPlane;
 }
 
 export class ZulipMcplServer {
@@ -101,6 +105,7 @@ export class ZulipMcplServer {
   private sweepDone = false;
   private readonly catchupLimit: number;
   private readonly formatTime: (d: Date) => string;
+  private readonly filters: FiltersPlane | null;
 
   constructor(
     private readonly adapter: PlatformAdapter,
@@ -109,8 +114,17 @@ export class ZulipMcplServer {
   ) {
     this.adapters = new Map([[adapter.type, adapter]]);
     this.catchupLimit = Math.min(CATCHUP_HARD_CAP, Math.max(0, options.catchupLimit ?? DEFAULT_CATCHUP_LIMIT));
-    this.formatTime = options.formatTime ?? ((d) => d.toISOString().replace(/\.\d{3}Z$/, 'Z'));
+    this.formatTime = options.formatTime ?? defaultTimeFormatter();
+    this.filters = options.filters ?? null;
     this.delivery = new DeliveryState(options.stateDir ?? null, options.sessionId ?? 'default');
+    // A widened stream allowlist means channels the host has never seen:
+    // make them known. A narrowed one is enforced at delivery; the host
+    // keeps its descriptors (a reopen would re-announce nothing).
+    this.filters?.onChange((next, prev) => {
+      const before = new Set(prev.streams ?? []);
+      const widened = !next.streams || (next.streams ?? []).some((name) => prev.streams && !before.has(name));
+      if (widened) void this.applyFilterChange();
+    });
 
     // Derived from the adapter rather than restated, so `channels.typing`
     // cannot be advertised when the adapter does not implement it (§6.4).
@@ -471,6 +485,10 @@ export class ZulipMcplServer {
     const meta = (typeof message.metadata === 'object' && message.metadata !== null ? message.metadata : {}) as Record<string, unknown>;
     const addressed = meta.mentioned === true || meta.isDM === true;
 
+    // Muted stream: nothing reaches the agent — ambient AND mentions — and
+    // nothing is tallied, before any other routing.
+    if (this.filters && !isDmChannelId(channelId) && this.filters.streamMuted(channelId.slice('zulip:'.length))) return;
+
     // A conversation the host has never seen (a DM from someone new): make
     // it a registered channel first, so the host can open it and route a
     // reply back to it.
@@ -733,9 +751,129 @@ export class ZulipMcplServer {
     }
   }
 
+  /**
+   * Re-enumerate what the adapter can see and announce anything the host
+   * does not know yet — after a filters change widened the allowlist, or on
+   * request (refresh_channels).
+   */
+  async applyFilterChange(): Promise<{ visible: number; added: string[] }> {
+    if (!this.conn || !this.mcplActive) return { visible: 0, added: [] };
+    const descriptors = await this.adapter.discoverChannels();
+    const added = await this.channelManager.registerAdditional(descriptors);
+    if (added.length > 0) console.error(`[zulip-mcp] registered ${added.length} newly visible channel(s): ${added.join(', ')}`);
+    return { visible: descriptors.length, added };
+  }
+
+  private requireFilters(): FiltersPlane {
+    if (!this.filters) throw new Error('No filters plane is configured on this server.');
+    return this.filters;
+  }
+
+  private streamArg(value: unknown): string {
+    const raw = String(value ?? '').trim().replace(/^#/, '');
+    if (!raw) throw new Error('channel is required');
+    const name = raw.startsWith('zulip:') ? raw.slice('zulip:'.length) : raw;
+    if (isDmChannelId(`zulip:${name}`) || name.startsWith('dm:')) throw new Error('DM conversations cannot be muted or filtered by stream; use the dmUsers allowlist.');
+    return name;
+  }
+
   /** Tools that read the server's own delivery state. undefined = not ours. */
   private async serverTool(name: string, args: Record<string, unknown>): Promise<unknown> {
     switch (name) {
+      case 'filters_get': {
+        const plane = this.requireFilters();
+        const f = plane.current();
+        return {
+          streams: f.streams ?? null,
+          dmUsers: f.dmUsers ?? null,
+          mutedStreams: f.mutedStreams ?? [],
+          reactionChannels: f.reactionChannels ?? [],
+          plane: plane.planeStatus(),
+          reactionSuppression: plane.suppressionStatus(),
+          note: 'null = unrestricted. Filters gate delivery only; the bot must also be able to see a stream. ' +
+            'suppressedReactionEmojis is operator-owned and reported as a count/digest, never the entries.',
+        };
+      }
+      case 'filters_update': {
+        const plane = this.requireFilters();
+        const addStreams = Array.isArray(args.addStreams) ? args.addStreams.map((s) => this.streamArg(s)) : [];
+        const removeStreams = Array.isArray(args.removeStreams) ? args.removeStreams.map((s) => this.streamArg(s)) : [];
+        const setDmUsers = Array.isArray(args.setDmUsers) ? args.setDmUsers.map(String) : undefined;
+        if (addStreams.length === 0 && removeStreams.length === 0 && setDmUsers === undefined) {
+          throw new Error('Nothing to change: pass addStreams, removeStreams, and/or setDmUsers.');
+        }
+        let materialized = false;
+        const result = plane.update((f) => {
+          let streams = f.streams ? [...f.streams] : null;
+          if (removeStreams.length > 0 && streams === null) {
+            // Removing from "everything" first materializes the list as every
+            // stream currently registered, so nothing silently drops.
+            streams = this.channelManager.listChannels().channels
+              .filter((c) => !isDmChannelId(c.id))
+              .map((c) => c.id.slice('zulip:'.length));
+            materialized = true;
+          }
+          if (streams !== null) {
+            for (const name of addStreams) if (!streams.includes(name)) streams.push(name);
+            streams = streams.filter((name) => !removeStreams.includes(name));
+            // An empty allowlist means UNRESTRICTED. Removing the last
+            // allowed stream would therefore re-open every stream — the
+            // opposite of what was asked. Refuse; "nothing" is what mutes are for.
+            if (streams.length === 0) {
+              throw new Error(
+                'Refusing to remove the last allowed stream: an empty allowlist means unrestricted, which would ' +
+                  'deliver EVERY stream. Add another stream first, or mute streams to hear nothing from them.',
+              );
+            }
+          }
+          return {
+            ...f,
+            ...(streams !== null ? { streams } : {}),
+            ...(setDmUsers !== undefined ? { dmUsers: setDmUsers } : {}),
+          };
+        });
+        if (!result.ok) throw new Error(`filters_update refused: ${result.reason}`);
+        const { added } = await this.applyFilterChange();
+        return {
+          streams: result.filters.streams ?? null,
+          dmUsers: result.filters.dmUsers ?? null,
+          registered: added,
+          note: [
+            materialized ? 'The stream allowlist was unrestricted; it was materialized as the full current list before removing.' : null,
+            setDmUsers !== undefined && (result.filters.dmUsers ?? null) === null ? 'dmUsers is now UNRESTRICTED (anyone may DM the bot).' : null,
+            'Applied immediately and persisted.',
+          ].filter(Boolean).join(' '),
+        };
+      }
+      case 'mute_channel':
+      case 'unmute_channel': {
+        const plane = this.requireFilters();
+        const stream = this.streamArg(args.channel);
+        const mute = name === 'mute_channel';
+        const result = plane.update((f) => {
+          const muted = new Set(f.mutedStreams ?? []);
+          if (mute) muted.add(stream);
+          else muted.delete(stream);
+          return { ...f, mutedStreams: [...muted] };
+        });
+        if (!result.ok) throw new Error(`${name} refused: ${result.reason}`);
+        return {
+          channelId: `zulip:${stream}`,
+          muted: mute,
+          mutedStreams: result.filters.mutedStreams ?? [],
+          note: mute
+            ? 'Nothing from this stream reaches you now — not even mentions — and nothing is tallied. Persisted; reverse with unmute_channel.'
+            : 'Messages from this stream reach you again by the usual rules (mentions always; ambient when the channel is open).',
+        };
+      }
+      case 'refresh_channels': {
+        const { visible, added } = await this.applyFilterChange();
+        return {
+          visible,
+          added,
+          note: added.length > 0 ? `Registered ${added.length} newly visible channel(s).` : 'No new channels — the host already knows about every visible channel.',
+        };
+      }
       case 'channel_missed': {
         const channelId = this.channelIdArg(args.channel);
         const tally = this.delivery.tally(channelId);
@@ -806,6 +944,12 @@ export class ZulipMcplServer {
     if (!conn) throw new Error('not connected');
     return (await conn.sendRequest(method.CHANNELS_INCOMING, { messages })) as ChannelsIncomingResult | undefined;
   }
+}
+
+function defaultTimeFormatter(): (d: Date) => string {
+  const zone = resolveAgentTimeZone();
+  const style = resolveTimestampStyle();
+  return (d) => formatAgentDateTime(d, zone, style);
 }
 
 function historyCapOf(descriptor: ChannelDescriptor): number {

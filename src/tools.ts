@@ -384,6 +384,63 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: "filters_get",
+    description:
+      "Show the active event filters: which streams may deliver events to you (null = every stream the bot can " +
+      "see), which users may DM you (null = anyone), and which streams are muted. Reports the filters plane's " +
+      "desired-vs-effective state (live / stale / unavailable) and the reaction-suppression state as a count and " +
+      "digest — the suppressed entries themselves are operator-owned and never shown here.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "filters_update",
+    description:
+      "Hot-adjust the event filters — takes effect immediately and persists, no restart. If the stream allowlist is " +
+      "unrestricted, the first removal materializes it as the list of all current streams first, so nothing silently " +
+      "drops. Newly allowed streams are registered right away. Reaction-suppression entries are operator-owned and " +
+      "cannot be carried by this tool. Refused (without writing) while the filters file is unreadable on disk.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        addStreams: { type: "array", items: { type: "string" }, description: "Stream names to allow" },
+        removeStreams: { type: "array", items: { type: "string" }, description: "Stream names to stop delivering" },
+        setDmUsers: {
+          type: "array",
+          items: { type: "string" },
+          description: "Replace the DM allowlist with these user ids/emails. CAREFUL: an empty array means UNRESTRICTED (anyone may DM). Omit to leave DMs unchanged.",
+        },
+      },
+    },
+  },
+  {
+    name: "mute_channel",
+    description:
+      "Mute a stream entirely: no ambient messages, no wake on mentions, nothing tallied. Use this to stay out of a " +
+      "stream that keeps pulling you in. Persisted across restarts. Reverse with unmute_channel.",
+    inputSchema: {
+      type: "object",
+      properties: { channel: { type: "string", description: "Stream name or channel id ('zulip:general')" } },
+      required: ["channel"],
+    },
+  },
+  {
+    name: "unmute_channel",
+    description:
+      "Un-mute a stream: mentions reach you again, and ambient traffic once the host opens the channel. Persisted.",
+    inputSchema: {
+      type: "object",
+      properties: { channel: { type: "string", description: "Stream name or channel id ('zulip:general')" } },
+      required: ["channel"],
+    },
+  },
+  {
+    name: "refresh_channels",
+    description:
+      "Re-scan every stream and DM conversation the bot can currently see and register any the host does not yet " +
+      "know about — use it if you were added to a stream after startup and it is not in your channel list.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
     name: "fetch_attachment",
     description:
       "Fetch a Zulip user-upload attachment by path and return its bytes inline. " +

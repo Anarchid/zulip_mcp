@@ -63,17 +63,21 @@ function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChan
   return typeof address === 'object' && address !== null ? (address as Partial<ZulipChannelAddress>) : {};
 }
 
+/** The live filters the adapter consults — the plane, or a stand-in. */
+export interface FilterView {
+  streamAllowed(streamName: string): boolean;
+  dmAllowed(sender: { id: number; email: string }): boolean;
+}
+
+const ALLOW_ALL: FilterView = { streamAllowed: () => true, dmAllowed: () => true };
+
 export interface ZulipAdapterOptions {
   /** Backscroll cap advertised per channel and enforced on channels/open. */
   backscrollDefault?: number;
   /** Per-stream overrides of the backscroll cap. */
   backscrollLimits?: ReadonlyMap<string, number>;
-  /**
-   * Users allowed to reach the bot by DM, as user ids or emails. Unset or
-   * empty means unrestricted — an empty allowlist is not "nobody", because
-   * an operator who unsets the variable must not silently lose every DM.
-   */
-  dmUsers?: ReadonlySet<string>;
+  /** Stream allowlist + DM allowlist, read live on every event. */
+  filters?: FilterView;
   /** How many recent DMs to scan for conversations at startup. */
   dmDiscoveryLimit?: number;
 }
@@ -88,7 +92,7 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly identity: ZulipIdentity;
   private readonly backscrollDefault: number;
   private readonly backscrollLimits: ReadonlyMap<string, number>;
-  private readonly dmUsers: ReadonlySet<string> | null;
+  private readonly filters: FilterView;
   private readonly dmDiscoveryLimit: number;
   /** Streams this process has confirmed a subscription for. */
   private subscribed = new Set<string>();
@@ -104,7 +108,7 @@ export class ZulipAdapter implements PlatformAdapter {
     this.identity = { selfUserId, sessionId };
     this.backscrollDefault = options.backscrollDefault ?? DEFAULT_BACKSCROLL;
     this.backscrollLimits = options.backscrollLimits ?? new Map();
-    this.dmUsers = options.dmUsers && options.dmUsers.size > 0 ? options.dmUsers : null;
+    this.filters = options.filters ?? ALLOW_ALL;
     this.dmDiscoveryLimit = options.dmDiscoveryLimit ?? DEFAULT_DM_DISCOVERY_LIMIT;
   }
 
@@ -126,6 +130,7 @@ export class ZulipAdapter implements PlatformAdapter {
       });
       const streams = result.streams || [];
       for (const stream of streams) {
+        if (!this.filters.streamAllowed(stream.name)) continue;
         const address: ZulipChannelAddress = { stream_name: stream.name, stream_id: stream.stream_id };
         channels.push({
           id: zulipChannelId(stream.name),
@@ -172,6 +177,7 @@ export class ZulipAdapter implements PlatformAdapter {
       for (const raw of (result?.messages ?? []) as ZulipRawMessage[]) {
         const m = normalizeMessage(raw);
         if (!m.isDm) continue;
+        if (!this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail }) && m.authorId !== this.identity.selfUserId) continue;
         this.describeDm(m);
       }
     } catch (error) {
@@ -187,11 +193,6 @@ export class ZulipAdapter implements PlatformAdapter {
     const isNew = !this.knownDms.has(descriptor.id);
     this.knownDms.set(descriptor.id, descriptor);
     return { descriptor, isNew };
-  }
-
-  private dmAllowed(m: ZulipMessage): boolean {
-    if (!this.dmUsers) return true;
-    return this.dmUsers.has(String(m.authorId)) || this.dmUsers.has(m.authorEmail.toLowerCase());
   }
 
   async publish(
@@ -357,14 +358,15 @@ export class ZulipAdapter implements PlatformAdapter {
       if (this.identity.selfUserId !== null && msg.sender_id === this.identity.selfUserId) return;
       const m = normalizeMessage({ ...(msg as ZulipRawMessage), flags });
       if (m.isDm) {
-        if (!this.dmAllowed(m)) {
-          console.error(`[zulip-mcp] dropping DM from ${m.authorEmail} (${m.authorId}): not in ZULIP_DM_USERS`);
+        if (!this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail })) {
+          console.error(`[zulip-mcp] dropping DM from ${m.authorEmail} (${m.authorId}): not in the dmUsers allowlist`);
           return;
         }
         const { descriptor, isNew } = this.describeDm(m);
         onMessage(toIncoming(descriptor.id, m, this.identity), isNew ? descriptor : undefined);
         return;
       }
+      if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
       onMessage(toIncoming(channelIdOf(m, this.identity.selfUserId), m, this.identity));
     }, onSystemEvent).catch(error => {
       console.error('Zulip event loop failed:', error);
