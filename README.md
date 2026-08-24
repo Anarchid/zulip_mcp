@@ -39,6 +39,7 @@ The agent can passively see unread message notifications when activated for any 
 - `get_channel_history` - Get history with natural dates (mentions formatted as `@username (uid:123)`)
 - `get_unread_messages` - Get unread from monitored channels
 - `send_message` - Send to streams or DMs (use `@**username**` for mentions)
+- `edit_message` - Edit the content of an existing message by ID (own messages; subject to the realm's edit time limit)
 - `delete_message` - Delete any message by ID (with permissions)
 - `add_reaction` - Add emoji reactions
 - `find_user` - Search users to get mention format

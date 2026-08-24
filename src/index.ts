@@ -659,6 +659,24 @@ function getTools(): Tool[] {
     },
   },
   {
+    name: "edit_message",
+    description: "Edit the content of an existing Zulip message by ID. You can edit your own messages (subject to the realm's message-edit time limit; an expired window returns an error). Useful for maintaining a live status message: post once with send_message, then update it in place instead of flooding the topic.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_id: {
+          type: "number",
+          description: "ID of the message to edit",
+        },
+        content: {
+          type: "string",
+          description: "The new message content (supports Markdown, replaces the old content entirely)",
+        },
+      },
+      required: ["message_id", "content"],
+    },
+  },
+  {
     name: "delete_message",
     description: "Delete a Zulip message by ID. You can delete your own messages, and if you have permissions, others' messages too.",
     inputSchema: {
@@ -1520,6 +1538,12 @@ async function handleToolCall(name: string, args: any): Promise<any> {
         type: args.type,
         to: args.to,
         topic: args.topic,
+        content: args.content,
+      });
+
+    case "edit_message":
+      return await zulipClient.messages.update({
+        message_id: args.message_id,
         content: args.content,
       });
 
