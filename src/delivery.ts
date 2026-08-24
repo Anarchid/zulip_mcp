@@ -20,7 +20,7 @@
  * monitoring state. Best-effort: a failed save is logged, never fatal.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { IncomingChannelMessage, TextContent } from '@animalabs/mcpl-core';
 
@@ -87,7 +87,11 @@ export class DeliveryState {
         missed: Object.fromEntries([...this.missed].sort((a, b) => a[0].localeCompare(b[0]))),
         lastOpen: [...this.lastOpen].sort(),
       };
-      writeFileSync(path, JSON.stringify(out, null, 2) + '\n');
+      // tmp + rename: a crash mid-write must not leave a truncated file that
+      // the next start reads as "no watermarks" and sweeps from nowhere.
+      const tmp = `${path}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
+      renameSync(tmp, path);
     } catch (err) {
       console.error('[zulip-mcp] Failed to save delivery state:', (err as Error).message);
     }
@@ -214,6 +218,9 @@ export function selectMissed<T extends { mentioned: boolean }>(
   return [...keep].sort((a, b) => a - b).map((i) => msgs[i]);
 }
 
+/** Default size cap on one `<missed>` block, in characters (~10k tokens). */
+export const DEFAULT_MISSED_BLOCK_MAX_CHARS = 40_000;
+
 export interface MissedBlockOptions {
   streamName: string;
   channelId: string;
@@ -221,12 +228,20 @@ export interface MissedBlockOptions {
   /** Number of actual mentions (for the mention reason); total lines otherwise. */
   count: number;
   formatTime: (d: Date) => string;
+  /** Character budget for the block; the OLDEST lines are elided first. */
+  maxChars?: number;
+  /** The fetch hit its ceiling: there is more beyond the newest line shown. */
+  moreBeyond?: boolean;
+  /** Newest id the fetch scanned (may be past the newest line kept). */
+  newestScannedId?: number;
 }
 
 /**
  * The `<missed>` transcript block delivered after downtime. Each line leads
  * with the message id so the agent can fetch_around(id) for more context,
- * and mention lines are flagged so they stand out from vicinity.
+ * and mention lines are flagged so they stand out from vicinity. Over the
+ * character budget the oldest lines go first, replaced by one line naming
+ * the elided id range so fetch_history can page into it.
  */
 export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions): string {
   const attrs = [
@@ -236,11 +251,35 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
   ];
   if (opts.reason === 'mention') attrs.push(`lines="${msgs.length}"`);
   attrs.push(`reason="${opts.reason}"`);
-  const lines = msgs.map((m) => {
+  const render = (m: MissedView): string => {
     const ts = opts.formatTime(m.timestamp);
     const att = m.attachmentNames.length > 0 ? ` [attachments: ${m.attachmentNames.join(', ')}]` : '';
     const mark = m.mentioned ? ' (mention)' : '';
     return `[${ts ? `${ts} ` : ''}id=${m.id}] [${m.topic}] ${m.authorName}${mark}: ${m.text}${att}`;
-  });
-  return [`<missed ${attrs.join(' ')}>`, ...lines, '</missed>'].join('\n');
+  };
+  const lines = msgs.map(render);
+
+  const budget = opts.maxChars ?? Infinity;
+  let total = lines.reduce((n, l) => n + l.length + 1, 0);
+  let elided = 0;
+  while (elided < lines.length - 1 && total > budget) {
+    total -= lines[elided].length + 1;
+    elided++;
+  }
+  const kept = lines.slice(elided);
+  const notes: string[] = [];
+  if (elided > 0) {
+    const firstKept = msgs[elided].id;
+    notes.push(
+      `[${elided} earlier line(s) elided (ids ${msgs[0].id}–${msgs[elided - 1].id}) to fit the catch-up budget — ` +
+        `fetch_history(channel, before=${firstKept}) pages into them]`,
+    );
+    attrs.push(`elided="${elided}"`);
+  }
+  if (opts.moreBeyond) {
+    const last = opts.newestScannedId ?? msgs[msgs.length - 1]?.id;
+    notes.push(`[the catch-up ceiling was reached; newer messages exist — fetch_history(channel, after=${last}) continues]`);
+    attrs.push('truncated="true"');
+  }
+  return [`<missed ${attrs.join(' ')}>`, ...(elided > 0 ? [notes.shift()!] : []), ...kept, ...notes, '</missed>'].join('\n');
 }

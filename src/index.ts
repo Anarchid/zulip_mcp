@@ -43,6 +43,7 @@ import { parseZulipAttachmentUrl } from './content.js';
 import { FiltersPlane } from './filters.js';
 import { DEFAULT_BACKSCROLL, ZulipAdapter } from './platforms/zulip.js';
 import { DEFAULT_CATCHUP_LIMIT, ZulipMcplServer } from './server.js';
+import { DEFAULT_MISSED_BLOCK_MAX_CHARS } from './delivery.js';
 import { ZulipToolRuntime } from './tool-runtime.js';
 import { initializeZulipClient } from './zulip-client.js';
 
@@ -113,6 +114,7 @@ async function main(): Promise<void> {
     stateDir,
     sessionId: session.sessionId,
     catchupLimit: intEnv('ZULIP_CATCHUP_LIMIT', DEFAULT_CATCHUP_LIMIT),
+    missedBlockMaxChars: intEnv('ZULIP_MISSED_BLOCK_MAX_CHARS', DEFAULT_MISSED_BLOCK_MAX_CHARS),
     filters,
     attachments: {
       // Same validation as fetch_attachment: only /user_uploads/ on the realm
@@ -145,10 +147,23 @@ async function main(): Promise<void> {
 
   // Stdio: stdout is the protocol channel, so everything else logs to stderr.
   const conn = McplConnection.fromStreams(process.stdin, process.stdout);
+
+  // A host that stops us with a signal rather than EOF still gets the last
+  // batch and a persisted watermark file.
+  let stopping = false;
+  const stop = async (why: string) => {
+    if (stopping) return;
+    stopping = true;
+    console.error(`[zulip-mcp] ${why}; shutting down`);
+    await server.shutdown();
+    filters.stop();
+    process.exit(0);
+  };
+  process.once('SIGTERM', () => void stop('SIGTERM'));
+  process.once('SIGINT', () => void stop('SIGINT'));
+
   await server.serve(conn);
-  server.shutdown();
-  filters.stop();
-  process.exit(0);
+  await stop('stdin closed');
 }
 
 // Only auto-start when run as a CLI. Importing this module (e.g. from tests)

@@ -171,3 +171,27 @@ test('renderMissedBlock leads with ids, flags mentions, and reports counts by re
   assert.match(backscroll, /^<missed stream="#general" channelId="zulip:general" count="3" reason="backscroll">/);
   assert.match(backscroll, /\n\[id=1\] /, 'an empty timestamp leaves the id alone');
 });
+
+test('renderMissedBlock elides the oldest lines over budget and points at what lies beyond', () => {
+  const views = Array.from({ length: 50 }, (_, i) => viewOf(msg(i + 1, false, 'x'.repeat(100))));
+  const block = renderMissedBlock(views, {
+    streamName: 'general', channelId: 'zulip:general', reason: 'backscroll', count: 50, formatTime: () => '',
+    maxChars: 1500, moreBeyond: true,
+  });
+  assert.ok(block.length < 1500 + 400, `block is ${block.length} chars`);
+  const lines = block.split('\n');
+  assert.match(lines[0], /elided="\d+"/);
+  assert.match(lines[0], /truncated="true"/);
+  assert.match(lines[1], /^\[\d+ earlier line\(s\) elided \(ids 1–\d+\).*fetch_history\(channel, before=\d+\)/);
+  assert.match(lines[2], /^\[id=\d+\] /);
+  assert.match(lines[lines.length - 1], /^<\/missed>$/);
+  assert.match(lines[lines.length - 2], /catch-up ceiling was reached.*after=50/);
+  assert.ok(block.includes('[id=50]'), 'the newest line survives');
+  assert.ok(!block.includes('[id=1]'), 'the oldest is gone');
+
+  // Under budget: untouched, no annotations.
+  const small = renderMissedBlock(views.slice(0, 2), {
+    streamName: 'general', channelId: 'zulip:general', reason: 'backscroll', count: 2, formatTime: () => '', maxChars: 40_000,
+  });
+  assert.doesNotMatch(small, /elided|truncated/);
+});

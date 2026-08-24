@@ -397,25 +397,27 @@ export class ZulipAdapter implements PlatformAdapter {
    * `all_public_streams` on the queue — so opening a channel must also
    * subscribe the bot, or the host would be listening to silence.
    * Idempotent; subscription persists server-side. DMs need nothing.
+   *
+   * Throws when the subscription did not happen: an API error, a transport
+   * failure, or — Zulip's way of refusing a private stream — a `success`
+   * result that lists the stream under `unauthorized`. The caller (the open
+   * lifecycle) turns that into a failed open rather than a silent one.
    */
   async ensureSubscribed(channelId: string): Promise<void> {
     if (parseDmChannelId(channelId)) return;
     const streamName = streamNameOf(channelId);
     if (this.subscribed.has(streamName)) return;
-    try {
-      const result = await this.zulipClient.users.me.subscriptions.add({
-        subscriptions: [{ name: streamName }],
-      });
-      if (result?.result === 'success') {
-        this.subscribed.add(streamName);
-        const fresh = result.subscribed && Object.keys(result.subscribed).length > 0;
-        if (fresh) console.error(`[zulip-mcp] subscribed to #${streamName} for channel ${channelId}`);
-      } else {
-        console.error(`[zulip-mcp] could not subscribe to #${streamName}: ${result?.msg ?? 'unknown error'}`);
-      }
-    } catch (err) {
-      console.error(`[zulip-mcp] subscribe to #${streamName} failed:`, (err as Error).message);
+    const result = await this.zulipClient.users.me.subscriptions.add({
+      subscriptions: [{ name: streamName }],
+    });
+    assertApiSuccess(result, `subscribing to #${streamName}`);
+    const unauthorized: string[] = Array.isArray(result?.unauthorized) ? result.unauthorized : [];
+    if (unauthorized.includes(streamName)) {
+      throw new Error(`not authorized to subscribe to #${streamName} (private stream; the bot must be invited)`);
     }
+    this.subscribed.add(streamName);
+    const fresh = result.subscribed && Object.keys(result.subscribed).length > 0;
+    if (fresh) console.error(`[zulip-mcp] subscribed to #${streamName} for channel ${channelId}`);
   }
 
   startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent, onReaction?: OnReaction): void {

@@ -23,15 +23,23 @@ const POSITION_CAPABILITY: Record<ContextInjection['position'], string> = {
   afterUser: 'contextHooks.beforeInference.inject.afterUser',
 };
 
+export interface ContextProviderOptions {
+  /** Open channels for which nothing is injected (a muted stream). */
+  excludeChannel?: (channelId: string) => boolean;
+}
+
 export class ContextProvider {
   private historySize: number;
+  private readonly excludeChannel: (channelId: string) => boolean;
 
   constructor(
     private channelManager: ChannelManager,
     private grant: CapabilityGrant,
     historySize?: number,
+    options: ContextProviderOptions = {},
   ) {
     this.historySize = historySize ?? DEFAULT_HISTORY_SIZE;
+    this.excludeChannel = options.excludeChannel ?? (() => false);
   }
 
   /**
@@ -51,6 +59,7 @@ export class ContextProvider {
     const openChannels = this.channelManager.getOpenChannels();
 
     for (const channelId of openChannels) {
+      if (this.excludeChannel(channelId)) continue;
       const adapter = this.channelManager.adapterFor(channelId);
       if (!adapter) continue;
       // §6.7: a server must immediately respect a reduction. The response

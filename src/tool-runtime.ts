@@ -18,8 +18,15 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import { fetchAround, fetchHistory, renderReactions, type ReactionSummary, type ZulipMessage } from "./history.js";
+import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, renderReactions, type ReactionSummary, type ZulipMessage } from "./history.js";
 import { chunkMessage } from "./content.js";
+
+/** A message this server sent through a tool — recorded for rollback. */
+export interface SentRecord {
+  messageId: string;
+  channelId: string;
+  content: string;
+}
 
 /** What of a message's reactions the model may see. */
 export interface ReactionPolicy {
@@ -60,10 +67,11 @@ export interface ResourceContents {
   contents: { uri: string; mimeType: string; text: string }[];
 }
 
-/** MCP `tools/call` result shape. */
+/** MCP `tools/call` result shape, plus the MCPL §8 `state` checkpoint carrier. */
 export interface ToolCallResult {
   content: ContentBlock[];
   isError?: boolean;
+  state?: { featureSet: string; checkpoint: string; parent: string | null };
 }
 
 const STATE_DIR = join(homedir(), ".zulip_mcp_state");
@@ -169,6 +177,10 @@ export class ZulipToolRuntime {
   private readonly monitoredChannels = new Map<string, ChannelState>();
 
   private reactionPolicy: ReactionPolicy = SHOW_ALL;
+
+  /** Set by the MCPL server: every message sent by a tool is reported here
+   *  so a rollback checkpoint can undo it. */
+  onSent: ((sent: SentRecord) => void) | null = null;
 
   constructor(
     private readonly session: ZulipSession,
@@ -531,10 +543,14 @@ export class ZulipToolRuntime {
         if (typeof args.content !== "string" || !args.content.trim()) throw new Error("content is required");
         const ids: number[] = [];
         let last: any = null;
+        const channelId = args.type === "private" && Array.isArray(args.to) && args.to.every((t: unknown) => typeof t === "number")
+          ? dmChannelIdFor(args.to as number[])
+          : `zulip:${Array.isArray(args.to) ? args.to.join(",") : String(args.to ?? "")}`;
         for (const chunk of chunkMessage(args.content)) {
           last = await zulipClient.messages.send({ type: args.type, to: args.to, topic: args.topic, content: chunk });
           if (last?.result === "error") throw new Error(last.msg ?? "Zulip refused the message");
           ids.push(last.id);
+          this.onSent?.({ messageId: String(last.id), channelId, content: chunk });
         }
         return ids.length > 1 ? { ...last, ids, note: `Sent as ${ids.length} messages (content exceeded the realm's message length).` } : last;
       }
@@ -544,32 +560,41 @@ export class ZulipToolRuntime {
         if (wanted.length === 0 || wanted.some((w) => !w.trim())) throw new Error("to must name at least one recipient");
         if (typeof args.content !== "string" || !args.content.trim()) throw new Error("content is required");
         const ids = await Promise.all(wanted.map((w) => this.resolveUserId(w)));
+        const channelId = dmChannelIdFor(ids);
         const sent: number[] = [];
         let result: any = null;
         for (const chunk of chunkMessage(args.content)) {
           result = await zulipClient.messages.send({ type: "private", to: ids, content: chunk });
           if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused the message");
           sent.push(result.id);
+          this.onSent?.({ messageId: String(result.id), channelId, content: chunk });
         }
         return { ...result, to_user_ids: ids, ...(sent.length > 1 ? { ids: sent, note: `Sent as ${sent.length} messages.` } : {}) };
       }
 
-      case "edit_message":
-        return await zulipClient.messages.update({
+      case "edit_message": {
+        const result = await zulipClient.messages.update({
           message_id: args.message_id,
           content: args.content,
         });
+        assertApiSuccess(result, `editing message ${args.message_id}`);
+        return result;
+      }
 
-      case "delete_message":
-        return await zulipClient.messages.deleteById({
+      case "delete_message": {
+        const result = await zulipClient.messages.deleteById({
           message_id: args.message_id,
         });
+        assertApiSuccess(result, `deleting message ${args.message_id}`);
+        return result;
+      }
 
       case "list_streams": {
         const result = await zulipClient.streams.retrieve({
           include_public: args.include_public ?? true,
           include_subscribed: args.include_subscribed ?? true,
         });
+        assertApiSuccess(result, "listing streams");
 
         // Format streams nicely
         const streams = result.streams || [];
@@ -595,6 +620,7 @@ export class ZulipToolRuntime {
         const result = await zulipClient.streams.topics.retrieve({
           stream_id: args.stream_id,
         });
+        assertApiSuccess(result, `topics of stream ${args.stream_id}`);
 
         const topics = result.topics || [];
         const formatted = topics
@@ -612,6 +638,7 @@ export class ZulipToolRuntime {
         const result = await zulipClient.users.retrieve({
           client_gravatar: args.client_gravatar || false,
         });
+        assertApiSuccess(result, "listing users");
 
         const users = result.members || [];
         const formatted = users
@@ -631,8 +658,11 @@ export class ZulipToolRuntime {
         };
       }
 
-      case "get_user_profile":
-        return await zulipClient.users.me.getProfile();
+      case "get_user_profile": {
+        const result = await zulipClient.users.me.getProfile();
+        assertApiSuccess(result, "fetching the bot profile");
+        return result;
+      }
 
       case "add_reaction": {
         const emoji = await this.resolveEmoji(String(args.emoji_name ?? ""));

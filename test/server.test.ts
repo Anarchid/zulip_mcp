@@ -52,6 +52,10 @@ interface FakeAdapter extends PlatformAdapter {
   subscribed: string[];
   acked: string[];
   deleted: string[];
+  /** Streams whose subscription fails, with the reason. */
+  subscribeError: Map<string, string>;
+  /** The platform's page ceiling (Zulip: 5000); smaller than the ask forces paging. */
+  pageCap: number;
 }
 
 function fakeAdapter(withTyping = true): FakeAdapter {
@@ -67,16 +71,23 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     subscribed: [],
     acked: [],
     deleted: [],
+    subscribeError: new Map(),
+    pageCap: Infinity,
     async discoverChannels() { return [DESCRIPTOR]; },
     async fetchHistory(channelId, query) {
       adapter.historyCalls.push({ channelId, query });
       let rows = adapter.history.filter((m) => m.channelId === channelId);
       if (query.afterMessageId !== undefined) rows = rows.filter((m) => Number(m.messageId) > Number(query.afterMessageId));
       if (query.beforeMessageId !== undefined) rows = rows.filter((m) => Number(m.messageId) < Number(query.beforeMessageId));
-      rows = query.afterMessageId !== undefined ? rows.slice(0, query.limit) : rows.slice(-query.limit);
+      const limit = Math.min(query.limit, adapter.pageCap);
+      rows = query.afterMessageId !== undefined ? rows.slice(0, limit) : rows.slice(-limit);
       return rows.map((m) => ({ ...m, metadata: { ...(m.metadata as object), backscroll: true } }));
     },
-    async ensureSubscribed(channelId) { adapter.subscribed.push(channelId); },
+    async ensureSubscribed(channelId) {
+      const reason = adapter.subscribeError.get(channelId);
+      if (reason) throw new Error(reason);
+      adapter.subscribed.push(channelId);
+    },
     async acknowledge(_channelId, messageId, value) { adapter.acked.push(`${messageId}:${value ?? ''}`); return `:${value ?? 'eyes'}:`; },
     async deleteMessage(_channelId, messageId) { adapter.deleted.push(messageId); },
     async publish(channelId, _descriptor, content, hints) {
@@ -102,9 +113,12 @@ function fakeAdapter(withTyping = true): FakeAdapter {
 
 const fakeTools = {
   calls: [] as { name: string; args: Record<string, unknown> }[],
+  /** Set by the server; the real runtime reports every message a tool sends. */
+  onSent: null as null | ((sent: { messageId: string; channelId: string; content: string }) => void),
   async handleToolCall(name: string, args: Record<string, unknown>) {
     fakeTools.calls.push({ name, args });
     if (name === 'explode') throw new Error('boom');
+    if (name === 'send_message') fakeTools.onSent?.({ messageId: '99', channelId: 'zulip:general', content: String(args.content ?? '') });
     return { ok: true, name };
   },
   listResources() {
@@ -125,6 +139,9 @@ interface Harness {
   incoming: IncomingChannelMessage[];
   pushed: PushEventParams[];
   served: Promise<void>;
+  /** How the host answers channels/incoming: per-message rejections, and
+   *  whole batches that error out (counted down per batch). */
+  policy: { rejectIds: Set<string>; failIncomingBatches: number };
   close(): Promise<void>;
 }
 
@@ -152,6 +169,7 @@ function harness(opts: { mcpl?: boolean; typing?: boolean; stateDir?: string; se
   const hostSaw: JsonRpcRequest[] = [];
   const incoming: IncomingChannelMessage[] = [];
   const pushed: PushEventParams[] = [];
+  const policy = { rejectIds: new Set<string>(), failIncomingBatches: 0 };
   // The host reactor: answer every server→host Request the way conhost does.
   host.on('request', (req) => {
     hostSaw.push(req);
@@ -160,8 +178,13 @@ function harness(opts: { mcpl?: boolean; typing?: boolean; stateDir?: string; se
       host.sendResponse(req.id, { results: p.channels.map((c) => ({ id: c.id, accepted: true })) });
     } else if (req.method === method.CHANNELS_INCOMING) {
       const p = req.params as ChannelsIncomingParams;
-      incoming.push(...p.messages);
-      host.sendResponse(req.id, { results: p.messages.map((m) => ({ messageId: m.messageId, accepted: true })) });
+      if (policy.failIncomingBatches > 0) {
+        policy.failIncomingBatches--;
+        host.sendError(req.id, -32603, 'host hiccup');
+        return;
+      }
+      incoming.push(...p.messages.filter((m) => !policy.rejectIds.has(m.messageId)));
+      host.sendResponse(req.id, { results: p.messages.map((m) => ({ messageId: m.messageId, accepted: !policy.rejectIds.has(m.messageId) })) });
     } else if (req.method === method.PUSH_EVENT) {
       pushed.push(req.params as PushEventParams);
       host.sendResponse(req.id, { accepted: true });
@@ -182,12 +205,13 @@ function harness(opts: { mcpl?: boolean; typing?: boolean; stateDir?: string; se
     incoming,
     pushed,
     served,
+    policy,
     async close() {
       // EOF on the server's stdin analog: readline closes on 'end', not on
       // destroy, so ending the stream is what actually returns serve().
       toServer.end();
       await served;
-      server.shutdown();
+      await server.shutdown();
       host.close();
     },
   };
@@ -226,16 +250,18 @@ async function until(predicate: () => boolean, what: string, ms = 2000): Promise
 }
 
 /** Registration completes only once the host's answer reaches the server;
- *  channels/list is the observable that it did. */
-async function awaitRegistered(h: Harness): Promise<void> {
+ *  channels/list is the observable that it did. Live delivery follows the
+ *  catch-up sweep, which is what most cases go on to exercise. */
+async function awaitRegistered(h: Harness, andLive = true): Promise<void> {
   await until(() => h.adapter.emit !== null, 'event delivery to start');
   const deadline = Date.now() + 2000;
   while (true) {
     const listed = (await h.host.sendRequest(method.CHANNELS_LIST)) as { channels: ChannelDescriptor[] };
-    if (listed.channels.length > 0) return;
+    if (listed.channels.length > 0) break;
     if (Date.now() > deadline) throw new Error('timed out waiting for registration');
     await new Promise((r) => setTimeout(r, 5));
   }
+  if (andLive) await until(() => h.server.isLive, 'live delivery');
 }
 
 // --- plain MCP ---------------------------------------------------------------
@@ -911,15 +937,28 @@ test('reactions surface only on channels opted in, never wake, and honour suppre
   }
 });
 
-test('rollback deletes what was published after the checkpoint; acknowledge reacts; streaming terminators are inert', async () => {
+test('messaging tools mint checkpoints the host can roll back to; publishes and tool sends after it are deleted; acknowledge reacts; streaming terminators are inert', async () => {
   const h = harness();
   await initialize(h, true);
   await settled(h);
   await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
 
   const publish = (text: string) => h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c', channelId: 'zulip:general', content: [{ type: 'text', text }] });
+  const call = async (name: string, args: Record<string, unknown>) =>
+    (await h.host.sendRequest('tools/call', { name, arguments: args })) as { isError?: boolean; state?: { featureSet: string; checkpoint: string; parent: string | null } };
+
   await publish('one');
-  const afterOne = h.server.stateTracker.current!;
+  // The only way a host learns a checkpoint is a tool result's `state` (§8):
+  // a messaging tool mints one after its own send is on the record.
+  const sent = await call('send_message', { content: 'via tool' });
+  assert.equal(sent.state?.featureSet, 'zulip.messaging');
+  assert.match(sent.state!.checkpoint, /^chk_/);
+  assert.equal(sent.state!.parent, null);
+  const afterOne = sent.state!.checkpoint;
+  // A read-only tool carries no checkpoint; a later messaging tool chains.
+  assert.equal((await call('list_streams', {})).state, undefined);
+  const next = await call('add_reaction', { message_id: 1, emoji_name: 'eyes' });
+  assert.equal(next.state!.parent, afterOne);
   await publish('two');
   await publish('three');
 
@@ -932,7 +971,12 @@ test('rollback deletes what was published after the checkpoint; acknowledge reac
   const rolled = (await h.host.sendRequest(method.STATE_ROLLBACK, { featureSet: 'zulip.messaging', checkpoint: afterOne })) as { success: boolean; reason?: string };
   assert.equal(rolled.success, true);
   assert.equal(rolled.reason, undefined);
-  assert.deepEqual(h.adapter.deleted, ['42', '43'], 'everything sent after the checkpoint, nothing before');
+  assert.deepEqual(h.adapter.deleted, ['42', '43'], 'everything sent after the checkpoint (publish 41 and tool send 99 came before)');
+
+  // Rolling back to the later checkpoint now undoes the tool's own send.
+  const rolledFurther = (await h.host.sendRequest(method.STATE_ROLLBACK, { featureSet: 'zulip.messaging', checkpoint: afterOne })) as { success: boolean };
+  assert.equal(rolledFurther.success, true);
+  assert.deepEqual(h.adapter.deleted, ['42', '43'], 'nothing left to undo after the checkpoint');
 
   const ack = (await h.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'zulip:general', messageId: '7', intent: 'seen-not-opening', value: 'eyes' })) as { acknowledged: boolean; representation?: string };
   assert.deepEqual(ack, { acknowledged: true, representation: ':eyes:' });
@@ -943,5 +987,224 @@ test('rollback deletes what was published after the checkpoint; acknowledge reac
   h.host.sendNotification(method.CHANNELS_OUTGOING_COMPLETE, { inferenceId: 'i', conversationId: 'c', channelId: 'zulip:general', content: [{ type: 'text', text: 'never sent' }] });
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(h.adapter.published.length, 3);
+  await h.close();
+});
+
+// --- review fix round ---------------------------------------------------------
+
+test('an open channel\'s watermark moves only on the host\'s acceptance; rejections hold it, failed batches retry once, shutdown flushes', async () => {
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const h = harness();
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+
+    // The host itemizes: 2 is refused. The watermark stops short of it so
+    // the next sweep can still offer it; 3 is delivered but not "forwarded".
+    h.policy.rejectIds.add('2');
+    h.adapter.emit!(streamMsg(1));
+    h.adapter.emit!(streamMsg(2));
+    h.adapter.emit!(streamMsg(3));
+    await until(() => h.incoming.length === 2, 'the accepted pair');
+    assert.deepEqual(h.incoming.map((m) => m.messageId), ['1', '3']);
+    assert.equal(h.server.delivery.watermark('zulip:general'), 1, 'held below the rejected id');
+    h.policy.rejectIds.clear();
+
+    // A batch the host errors on is retried once and then delivered.
+    h.policy.failIncomingBatches = 1;
+    h.adapter.emit!(streamMsg(4));
+    await until(() => h.incoming.length === 3, 'delivery after one retry');
+    assert.equal(h.server.delivery.watermark('zulip:general'), 4);
+    assert.equal(h.hostSaw.filter((r) => r.method === method.CHANNELS_INCOMING).length, 3, 'two batches for the first pair, two attempts for the retry');
+
+    // Persistent failure: given up, watermark untouched, nothing pretends.
+    h.policy.failIncomingBatches = 5;
+    h.adapter.emit!(streamMsg(5));
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(h.incoming.length, 3);
+    assert.equal(h.server.delivery.watermark('zulip:general'), 4, 'a message the host never accepted is not forwarded');
+    assert.equal(h.server.channelManager.pendingCount(), 0, 'and not queued forever');
+    h.policy.failIncomingBatches = 0;
+
+    // Shutdown on a live connection pushes the last window out instead of
+    // cancelling it.
+    h.adapter.emit!(streamMsg(6));
+    assert.equal(h.server.channelManager.pendingCount(), 1);
+    await h.server.shutdown();
+    assert.equal(h.incoming[h.incoming.length - 1].messageId, '6');
+    assert.equal(h.server.delivery.watermark('zulip:general'), 6);
+    await h.close();
+  } finally {
+    console.error = original;
+  }
+});
+
+test('a muted stream is silent on every surface: open-history, context injection, reactions, gap recovery, and the reconnect sweep', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-mute-everywhere-'));
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), { ZULIP_MUTED_STREAMS: 'general' }, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane, history: [streamMsg(1), streamMsg(2, { mentioned: true }), streamMsg(3)] });
+    await initialize(h, true);
+    await settled(h);
+
+    const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, {
+      channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 10 },
+    })) as { history?: unknown[] };
+    assert.deepEqual(opened.history, [], 'no backscroll from a muted stream');
+    assert.equal(h.adapter.historyCalls.length, 0);
+
+    const ctx = (await h.host.sendRequest(method.CONTEXT_BEFORE_INFERENCE, {
+      inferenceId: 'i', conversationId: 'c', turnIndex: 0, userMessage: null,
+      model: { id: 'm', vendor: 'v', contextWindow: 1, capabilities: [] },
+    })) as { contextInjections: unknown[] };
+    assert.deepEqual(ctx.contextInjections, [], 'no context injection for a muted open channel');
+
+    await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } });
+    h.adapter.react!({ action: 'add', channelId: 'zulip:general', messageId: '1', emoji: 'eyes', reactorId: '9', reactorName: 'Ann', onOwnMessage: true, messageSnippet: null, timestamp: new Date() });
+    h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+    await until(() => h.incoming.length === 1, 'the gap marker itself');
+    const marker = h.incoming[0];
+    assert.equal((marker.metadata as { kind: string }).kind, 'gap');
+    assert.equal((marker.metadata as { recoveredMessages: number }).recoveredMessages, 0, 'nothing recovered from the muted stream');
+    assert.equal(h.adapter.historyCalls.length, 0);
+    await h.close();
+
+    // The reconnect sweep: a watermarked muted stream with new mentions pushes nothing.
+    const first = harness({ stateDir: dir, sessionId: 'mute' });
+    await initialize(first, true);
+    await settled(first);
+    first.server.delivery.advance('zulip:general', 1);
+    first.server.delivery.save();
+    await first.close();
+    const second = harness({ stateDir: dir, sessionId: 'mute', filters: plane, history: [streamMsg(2, { mentioned: true }), streamMsg(3)] });
+    await initialize(second, true);
+    await settled(second);
+    assert.equal(second.pushed.length, 0);
+    assert.equal(second.adapter.historyCalls.length, 0, 'not even fetched');
+    plane.stop();
+    await second.close();
+  } finally {
+    console.error = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('channels/open fails — and commits nothing — when the bot cannot subscribe to the stream', async () => {
+  const h = harness({ history: [streamMsg(1)] });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.subscribeError.set('zulip:general', 'not authorized to subscribe to #general (private stream; the bot must be invited)');
+
+  await assert.rejects(
+    h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {}, history: { limit: 5 } }),
+    (err: Error & { code?: number; data?: unknown }) => {
+      assert.equal(err.code, -32024, 'ERR_CHANNEL_OPEN_FAILED');
+      assert.match(err.message, /not authorized to subscribe to #general/);
+      assert.deepEqual(err.data, { channelId: 'zulip:general' });
+      return true;
+    },
+  );
+  assert.equal(h.adapter.historyCalls.length, 0, 'history is not fetched for an open that failed');
+  assert.equal(h.server.channelManager.isOpen('zulip:general'), false);
+  assert.equal(h.server.delivery.wasOpen('zulip:general'), false);
+  // Still closed: ambient goes nowhere, and a mention is pushed as usual.
+  h.adapter.emit!(streamMsg(2));
+  h.adapter.emit!(streamMsg(3, { mentioned: true }));
+  await until(() => h.pushed.length === 1, 'mention on the still-closed channel');
+  assert.equal(h.incoming.length, 0);
+
+  // Once the subscription can succeed, the open goes through.
+  h.adapter.subscribeError.clear();
+  const opened = (await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} })) as { channel: ChannelDescriptor };
+  assert.equal(opened.channel.id, 'zulip:general');
+  assert.deepEqual(h.adapter.subscribed, ['zulip:general']);
+  await h.close();
+});
+
+test('live events received before the catch-up sweep are held, so a live delivery cannot jump the watermark over the offline gap', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-prelive-'));
+  try {
+    const first = harness({ stateDir: dir, sessionId: 'pl' });
+    await initialize(first, true);
+    await settled(first);
+    await first.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+    first.adapter.emit!(streamMsg(3));
+    await until(() => first.incoming.length === 1, 'delivery');
+    await first.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    await first.close();
+
+    // Session 2: the sweep's history fetch is slow; a live mention (6) and a
+    // duplicate of something the sweep will deliver (5) arrive meanwhile.
+    const second = harness({ stateDir: dir, sessionId: 'pl', history: [streamMsg(4), streamMsg(5, { mentioned: true })] });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const realFetch = second.adapter.fetchHistory!.bind(second.adapter);
+    second.adapter.fetchHistory = async (channelId, query) => { await gate; return realFetch(channelId, query); };
+    await initialize(second, true);
+    await second.host.sendRequest(method.FEATURE_SETS_UPDATE, { effectiveCapabilities: FULL_GRANT });
+    await awaitRegistered(second, false);
+    assert.equal(second.server.isLive, false);
+    second.adapter.emit!(streamMsg(6, { mentioned: true, text: 'live @bot' }));
+    second.adapter.emit!(streamMsg(5, { mentioned: true }));
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(second.pushed.length, 0, 'held until the sweep has run');
+    release();
+    await until(() => second.pushed.length === 2, 'the sweep block, then the live mention');
+    const block = (second.pushed[0].payload.content[0] as { text: string }).text;
+    assert.match(block, /^<missed /);
+    assert.match(block, /id=4\]/);
+    assert.match(block, /id=5\]/);
+    assert.equal(second.pushed[1].eventId, 'zulip_msg_6');
+    assert.equal(second.server.delivery.watermark('zulip:general'), 6);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(second.pushed.length, 2, 'the duplicate of 5 was dropped, not pushed twice');
+    await second.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('gap recovery also catches up closed channels, paging through history up to the ceiling', async () => {
+  const h = harness({ history: Array.from({ length: 250 }, (_, i) => streamMsg(i + 2, { mentioned: i + 2 === 50 })) });
+  await initialize(h, true);
+  await settled(h);
+  h.adapter.pageCap = 30;
+  h.server.delivery.advance('zulip:general', 1);
+
+  h.adapter.systemEvent!({ kind: 'gap', text: 'Queue expired.', metadata: { platform: 'zulip' } });
+  await until(() => h.pushed.length === 1, 'catch-up push for the closed channel');
+  const calls = h.adapter.historyCalls.filter((c) => c.channelId === 'zulip:general');
+  assert.deepEqual(calls.map((c) => c.query.afterMessageId), ['1', '31', '61', '91'], 'paged from the watermark, page by page');
+  assert.deepEqual(calls.map((c) => c.query.limit), [100, 70, 40, 10], 'never over the ceiling in total');
+  const block = (h.pushed[0].payload.content[0] as { text: string }).text;
+  assert.match(block, /count="1" lines="15" reason="mention" truncated="true"/);
+  assert.match(block, /catch-up ceiling was reached.*after=101/);
+  assert.equal(h.server.delivery.watermark('zulip:general'), 101, 'advanced through everything scanned');
+  assert.equal((h.pushed[0].origin as { truncated?: boolean }).truncated, true);
+  await h.close();
+});
+
+test('disabling zulip.messaging stops incoming delivery and its tools until re-enabled', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+
+  h.host.sendNotification(method.FEATURE_SETS_UPDATE, { disabled: ['zulip.messaging'] });
+  await new Promise((r) => setTimeout(r, 10));
+  h.adapter.emit!(streamMsg(1));
+  h.adapter.emit!(streamMsg(2, { mentioned: true }));
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(h.incoming.length, 0, 'no channels/incoming under a disabled feature set');
+  assert.equal(h.pushed.length, 0);
+  assert.equal(h.server.delivery.watermark('zulip:general'), undefined, 'and nothing is pretended forwarded');
+  const refresh = (await h.host.sendRequest('tools/call', { name: 'refresh_channels', arguments: {} })) as { isError?: boolean; content: { text: string }[] };
+  assert.equal(refresh.isError, true);
+  assert.match(refresh.content[0].text, /not enabled/);
   await h.close();
 });

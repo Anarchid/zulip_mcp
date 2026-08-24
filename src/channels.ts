@@ -43,12 +43,33 @@ export interface HostClient {
 /** Pre-0.5 hosts answered `channels/register` with a flat list of accepted ids. */
 type RegisterResultCompat = Partial<ChannelsRegisterResult> & { registered?: string[] };
 
+/** A batch that failed as a whole is retried this many times before it is
+ *  given up on (the watermark then stays put and the next catch-up sweep
+ *  re-fetches what was lost). */
+const MAX_BATCH_ATTEMPTS = 2;
+
+interface Queued {
+  message: IncomingChannelMessage;
+  attempts: number;
+}
+
+export interface ChannelManagerHooks {
+  /**
+   * Called per channel after one `channels/incoming` round trip with what
+   * the host ACCEPTED and what it REJECTED. A batch that never got an answer
+   * reports nothing — this is the only signal on which a delivery watermark
+   * may advance.
+   */
+  onDelivered?: (channelId: string, accepted: IncomingChannelMessage[], rejected: IncomingChannelMessage[]) => void;
+}
+
 export class ChannelManager {
   private allChannels = new Map<string, ChannelDescriptor>();
   private openChannels = new Set<string>();
-  private batchBuffer = new Map<string, IncomingChannelMessage[]>();
+  private batchBuffer = new Map<string, Queued[]>();
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private batchWindowMs: number;
+  private flushing: Promise<void> | null = null;
   /** Per-channel routing hints from the most recent incoming message,
    *  so publishes can land in the active thread/topic. */
   private lastIncoming = new Map<string, RoutingHints>();
@@ -63,6 +84,7 @@ export class ChannelManager {
     private adapters: Map<string, PlatformAdapter>,
     private grant: CapabilityGrant,
     batchWindowMs?: number,
+    private hooks: ChannelManagerHooks = {},
   ) {
     this.batchWindowMs = batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS;
   }
@@ -354,7 +376,31 @@ export class ChannelManager {
   }
 
   /**
-   * Cleanup timers.
+   * Send whatever is buffered now, without waiting for the batch window.
+   * Awaits an in-flight flush first so batches never interleave. Used at
+   * shutdown so a message received in the last window is not stranded with
+   * its watermark unadvanced — and, if the connection is already gone, the
+   * failure leaves the watermark alone for the next sweep.
+   */
+  async flush(): Promise<void> {
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer);
+      this.batchTimer = null;
+    }
+    if (this.flushing) await this.flushing;
+    await this.flushBatch();
+  }
+
+  /** Buffered messages not yet delivered (for tests and diagnostics). */
+  pendingCount(): number {
+    let n = 0;
+    for (const q of this.batchBuffer.values()) n += q.length;
+    return n;
+  }
+
+  /**
+   * Cleanup timers. Does not flush — call `flush()` first when the
+   * connection is still usable.
    */
   destroy(): void {
     if (this.batchTimer) {
@@ -365,13 +411,13 @@ export class ChannelManager {
 
   // -- Private --
 
-  private enqueue(channelId: string, message: IncomingChannelMessage): void {
+  private enqueue(channelId: string, message: IncomingChannelMessage, attempts = 0): void {
     let buffer = this.batchBuffer.get(channelId);
     if (!buffer) {
       buffer = [];
       this.batchBuffer.set(channelId, buffer);
     }
-    buffer.push(message);
+    buffer.push({ message, attempts });
 
     this.scheduleBatchFlush();
   }
@@ -380,19 +426,33 @@ export class ChannelManager {
     if (this.batchTimer) return; // already scheduled
     this.batchTimer = setTimeout(() => {
       this.batchTimer = null;
-      this.flushBatch();
+      if (this.flushing) {
+        // A flush is still on the wire; run after it rather than alongside.
+        this.scheduleBatchFlush();
+        return;
+      }
+      this.flushing = this.flushBatch().finally(() => {
+        this.flushing = null;
+      });
     }, this.batchWindowMs);
   }
 
+  /**
+   * One `channels/incoming` round trip for everything buffered.
+   *
+   * The buffer is taken, not cleared: on a failed request the batch goes
+   * back (front of the queue, attempts + 1) for one more try, and only
+   * messages the host itemizes as accepted reach `onDelivered`. A host that
+   * rejects a message has refused it (§14.5) — it is logged and dropped, and
+   * its watermark does not move, so the reconnect sweep can offer it again.
+   */
   private async flushBatch(): Promise<void> {
-    const allMessages: IncomingChannelMessage[] = [];
-
-    for (const [, messages] of this.batchBuffer) {
-      allMessages.push(...messages);
-    }
+    const taken = new Map(this.batchBuffer);
     this.batchBuffer.clear();
-
-    if (allMessages.length === 0) return;
+    const queued: Queued[] = [];
+    for (const items of taken.values()) queued.push(...items);
+    if (queued.length === 0) return;
+    const allMessages = queued.map((q) => q.message);
 
     // §14.1: `channels/incoming` is server→host content injection plus wake
     // authority — a write. Without the grant the batch is dropped, not queued:
@@ -405,11 +465,70 @@ export class ChannelManager {
       return;
     }
 
+    let result: ChannelsIncomingResult | undefined;
     try {
-      await this.host.sendIncoming(allMessages);
+      result = await this.host.sendIncoming(allMessages);
     } catch (error) {
-      console.error('Failed to send incoming messages to host:', error);
+      const retry = queued.filter((q) => q.attempts + 1 < MAX_BATCH_ATTEMPTS);
+      const dropped = queued.length - retry.length;
+      console.error(
+        `Failed to send ${allMessages.length} incoming message(s) to host` +
+          (retry.length > 0 ? `; retrying ${retry.length}` : '') +
+          (dropped > 0 ? `; giving up on ${dropped} (left for the next catch-up sweep)` : '') +
+          ':',
+        (error as Error).message ?? error,
+      );
+      // Put the retry set back ahead of anything buffered meanwhile.
+      const requeued = new Map<string, Queued[]>();
+      for (const q of retry) {
+        const list = requeued.get(q.message.channelId) ?? [];
+        list.push({ message: q.message, attempts: q.attempts + 1 });
+        requeued.set(q.message.channelId, list);
+      }
+      for (const [channelId, later] of this.batchBuffer) {
+        const list = requeued.get(channelId) ?? [];
+        list.push(...later);
+        requeued.set(channelId, list);
+      }
+      this.batchBuffer = requeued;
+      if (retry.length > 0) this.scheduleBatchFlush();
+      return;
     }
+
+    const accepted = this.acceptedMessageIds(result, allMessages);
+    const byChannel = new Map<string, { accepted: IncomingChannelMessage[]; rejected: IncomingChannelMessage[] }>();
+    let rejected = 0;
+    for (const m of allMessages) {
+      const entry = byChannel.get(m.channelId) ?? { accepted: [], rejected: [] };
+      if (accepted.has(m.messageId)) entry.accepted.push(m);
+      else {
+        entry.rejected.push(m);
+        rejected++;
+      }
+      byChannel.set(m.channelId, entry);
+    }
+    if (rejected > 0) {
+      console.error(`Host rejected ${rejected} of ${allMessages.length} incoming message(s); they are not delivered`);
+    }
+    for (const [channelId, entry] of byChannel) {
+      try {
+        this.hooks.onDelivered?.(channelId, entry.accepted, entry.rejected);
+      } catch (error) {
+        console.error('onDelivered hook failed:', (error as Error).message ?? error);
+      }
+    }
+  }
+
+  /** Itemized `channels/incoming` result (§14.5); a host that does not
+   *  itemize has accepted the batch as a whole. */
+  private acceptedMessageIds(
+    result: ChannelsIncomingResult | undefined,
+    sent: IncomingChannelMessage[],
+  ): Set<string> {
+    if (result && Array.isArray(result.results)) {
+      return new Set(result.results.filter((r) => r?.accepted).map((r) => r.messageId));
+    }
+    return new Set(sent.map((m) => m.messageId));
   }
 }
 
