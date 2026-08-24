@@ -24,6 +24,9 @@
  *   ZULIP_MUTED_STREAMS                           materialization (then the file is authoritative)
  *   ZULIP_SUPPRESSED_REACTIONS_BASELINE         - host-injected reaction-suppression seed
  *   AGENT_TIMEZONE / AGENT_TIMESTAMP_STYLE      - agent-visible timestamps (IANA zone; full|compact|time|none)
+ *   ZULIP_INLINE_IMAGES                         - "false" to stop inlining images on live delivery
+ *   ZULIP_INLINE_IMAGES_MAX                     - images inlined per message (4)
+ *   ZULIP_ATTACHMENT_INLINE_MAX_BYTES           - text attachments inlined at or under this size (5120; max 256KiB)
  *   MCPL_ENABLED                                - "false" forces plain-MCP mode
  *   MCPL_BATCH_WINDOW_MS                        - channels/incoming batching window (500)
  *   MCPL_CONTEXT_HISTORY_SIZE                   - messages injected per open channel (20)
@@ -34,6 +37,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { isMainModule } from './content.js';
+import { fetchCapped, resolveInlineOptions } from './attachments.js';
+import { parseZulipAttachmentUrl } from './content.js';
 import { FiltersPlane } from './filters.js';
 import { DEFAULT_BACKSCROLL, ZulipAdapter } from './platforms/zulip.js';
 import { DEFAULT_CATCHUP_LIMIT, ZulipMcplServer } from './server.js';
@@ -103,6 +108,18 @@ async function main(): Promise<void> {
     sessionId: session.sessionId,
     catchupLimit: intEnv('ZULIP_CATCHUP_LIMIT', DEFAULT_CATCHUP_LIMIT),
     filters,
+    attachments: {
+      // Same validation as fetch_attachment: only /user_uploads/ on the realm
+      // host may ever see the bot's credentials.
+      source: {
+        fetch: (path, maxBytes) => {
+          const url = parseZulipAttachmentUrl(path, session.realm);
+          const headers: Record<string, string> = session.authHeader ? { Authorization: session.authHeader } : {};
+          return fetchCapped(url.toString(), headers, maxBytes);
+        },
+      },
+      inline: resolveInlineOptions(),
+    },
   });
 
   if (tcpPort) {

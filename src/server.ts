@@ -50,6 +50,8 @@ import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
 import { isDmChannelId } from './history.js';
 import type { FiltersPlane } from './filters.js';
+import { buildAttachmentBlocks, type AttachmentSource, type InlineOptions } from './attachments.js';
+import type { AttachmentRef } from './content.js';
 import { formatAgentDateTime, resolveAgentTimeZone, resolveTimestampStyle } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
 import type { PlatformAdapter, PlatformSystemEvent } from './platforms/adapter.js';
@@ -87,6 +89,8 @@ export interface ZulipMcplServerOptions {
   formatTime?: (d: Date) => string;
   /** The filters plane (stream/DM allowlists, mutes, reaction policy). Optional: without it nothing is filtered. */
   filters?: FiltersPlane;
+  /** Where attachment bytes come from, and how much of them to inline on live delivery. */
+  attachments?: { source: AttachmentSource; inline: InlineOptions };
 }
 
 export class ZulipMcplServer {
@@ -494,6 +498,15 @@ export class ZulipMcplServer {
     // reply back to it.
     if (newChannel && !this.channelManager.getChannel(channelId)) {
       await this.channelManager.registerAdditional([newChannel]);
+    }
+
+    // Live delivery shows what was shared: images downsampled to model-max,
+    // small text files inline. The reference note stays so anything not
+    // inlined can still be fetched.
+    const refs = Array.isArray(meta.attachments) ? (meta.attachments as AttachmentRef[]) : [];
+    if (refs.length > 0 && this.options.attachments) {
+      const blocks = await buildAttachmentBlocks(refs, this.options.attachments.source, this.options.attachments.inline);
+      if (blocks.length > 0) message = { ...message, content: [...message.content, ...blocks] };
     }
 
     // The first message of a DM conversation carries an explicit reply

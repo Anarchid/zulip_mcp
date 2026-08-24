@@ -28,7 +28,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChannelHistoryQuery, OnIncomingMessage, OnSystemEvent, PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
-import { ZulipMcplServer } from '../src/server.ts';
+import { ZulipMcplServer, type ZulipMcplServerOptions } from '../src/server.ts';
 import { FiltersPlane } from '../src/filters.ts';
 import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
 
@@ -118,7 +118,7 @@ interface Harness {
   close(): Promise<void>;
 }
 
-function harness(opts: { mcpl?: boolean; typing?: boolean; stateDir?: string; sessionId?: string; history?: IncomingChannelMessage[]; filters?: FiltersPlane } = {}): Harness {
+function harness(opts: { mcpl?: boolean; typing?: boolean; stateDir?: string; sessionId?: string; history?: IncomingChannelMessage[]; filters?: FiltersPlane; attachments?: ZulipMcplServerOptions['attachments'] } = {}): Harness {
   const toServer = new PassThrough();
   const toHost = new PassThrough();
   const serverConn = McplConnection.fromStreams(toServer, toHost);
@@ -136,6 +136,7 @@ function harness(opts: { mcpl?: boolean; typing?: boolean; stateDir?: string; se
     catchupLimit: 100,
     formatTime: () => 'T',
     filters: opts.filters,
+    attachments: opts.attachments,
   });
 
   const hostSaw: JsonRpcRequest[] = [];
@@ -791,4 +792,49 @@ test('a muted stream delivers nothing, and the filters tools read and write the 
     console.error = original;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('attachments on live delivery are inlined from the configured source', async () => {
+  const fetched: string[] = [];
+  const h = harness({
+    attachments: {
+      source: {
+        async fetch(path) {
+          fetched.push(path);
+          if (path.endsWith('.png')) {
+            // A 1x1 PNG.
+            const buf = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+            return { buf, mimeType: 'image/png', overflow: false };
+          }
+          return { buf: Buffer.from('log line'), mimeType: 'text/plain', overflow: false };
+        },
+      },
+      inline: { inlineImages: true, inlineTextMaxBytes: 5120, maxImages: 4 },
+    },
+  });
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+
+  h.adapter.emit!({
+    ...streamMsg(1, { text: 'see attached' }),
+    content: [{ type: 'text', text: 'see attached' }, { type: 'text', text: '[attachments: 2]\n- shot.png\n- run.log' }],
+    metadata: {
+      topic: 'deploys', mentioned: false, isDM: false,
+      attachments: [
+        { path: '/user_uploads/1/a/shot.png', name: 'shot.png', mimeType: 'image/png', isImage: true },
+        { path: '/user_uploads/1/a/run.log', name: 'run.log', mimeType: 'text/plain', isImage: false },
+      ],
+    },
+  });
+  await until(() => h.incoming.length === 1, 'delivery');
+  const content = h.incoming[0].content;
+  assert.deepEqual(fetched, ['/user_uploads/1/a/shot.png', '/user_uploads/1/a/run.log']);
+  assert.equal(content[0].type, 'text');
+  assert.match((content[1] as { text: string }).text, /^\[attachments: 2\]/, 'the reference note stays');
+  assert.equal(content[2].type, 'image');
+  assert.equal((content[2] as { mimeType: string }).mimeType, 'image/png');
+  assert.equal((content[3] as { text: string }).text, '[image attachment: shot.png]');
+  assert.equal((content[4] as { text: string }).text, '[attachment: run.log (8B)]\nlog line');
+  await h.close();
 });
