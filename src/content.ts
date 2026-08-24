@@ -1,8 +1,8 @@
 /**
- * Content helpers — platform message formatting and attachment handling.
+ * Content helpers — Zulip message formatting and attachment handling.
  *
- * Pure functions shared by the MCP tool layer (index.ts) and the platform
- * adapters (src/platforms/*). Kept free of client/SDK dependencies so both
+ * Pure functions shared by the MCP tool layer (index.ts) and the Zulip
+ * adapter (src/platforms/zulip.ts). Kept free of client/SDK dependencies so both
  * sides can import without cycles.
  */
 
@@ -125,25 +125,6 @@ export function toFetchResult({ buf, mimeType, name }: FetchedAttachment): Recor
 }
 
 /**
- * Validate a Slack attachment URL before the bot token is attached to the
- * request. The host must be exactly files.slack.com — `url_private` is always
- * served from there. A `*.slack.com` wildcard would be a token leak: every
- * workspace lives at `<name>.slack.com` and serves `/api/*`, and the tool's
- * input is influenced by message content from untrusted senders.
- */
-export function parseSlackAttachmentUrl(rawUrl: string): URL {
-  if (!rawUrl) throw new Error("url is required");
-  if (!rawUrl.startsWith("https://")) {
-    throw new Error("url must be a full https:// link");
-  }
-  const url = new URL(rawUrl);
-  if (url.host !== "files.slack.com") {
-    throw new Error(`refusing to fetch from host ${url.host}; Slack attachments are served from files.slack.com only`);
-  }
-  return url;
-}
-
-/**
  * Validate a Zulip attachment path or URL against the configured realm before
  * the bot's credentials are attached. Tool input is influenced by message
  * content from untrusted senders, so only `/user_uploads/` on the realm host
@@ -172,32 +153,6 @@ export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): UR
   }
   if (!url.pathname.startsWith("/user_uploads/")) {
     throw new Error(`fetch_attachment only serves /user_uploads/ paths (got ${url.pathname})`);
-  }
-  return url;
-}
-
-/** Hosts Discord serves attachment content from. Incoming AttachmentRef.path
- * values are `attachment.url` from discord.js, which always point at the CDN;
- * media.discordapp.net is the resizing proxy for the same content. */
-const DISCORD_ATTACHMENT_HOSTS = new Set([
-  "cdn.discordapp.com",
-  "media.discordapp.net",
-]);
-
-/**
- * Validate a Discord attachment URL before fetching. No credentials are
- * attached, but the URL is influenced by message content from untrusted
- * senders — without an allowlist this tool is an open SSRF proxy (cloud
- * metadata endpoints, internal services) that hands the bytes to the model.
- */
-export function parseDiscordAttachmentUrl(rawUrl: string): URL {
-  if (!rawUrl) throw new Error("url is required");
-  if (!rawUrl.startsWith("https://")) {
-    throw new Error("url must be a full https:// link");
-  }
-  const url = new URL(rawUrl);
-  if (!DISCORD_ATTACHMENT_HOSTS.has(url.host)) {
-    throw new Error(`refusing to fetch from host ${url.host}; Discord attachments are served from cdn.discordapp.com or media.discordapp.net only`);
   }
   return url;
 }
@@ -310,204 +265,4 @@ export function cleanContent(html: string): string {
     .trim();
 
   return content;
-}
-
-// Slack user/channel IDs are documented as uppercase alphanumerics. Single
-// source of truth for every mention regex below — if Slack ever widens the
-// ID alphabet, this is the only line to change. Fresh RegExp per use: 'g'
-// regexes carry lastIndex state and must not be shared between callers.
-const SLACK_ID = "[A-Z0-9]+";
-const slackUserMentionRe = () => new RegExp(`<@(${SLACK_ID})(?:\\|([^>]*))?>`, "g");
-const slackChannelMentionRe = () => new RegExp(`<#(${SLACK_ID})(?:\\|([^>]*))?>`, "g");
-
-// Slack message text uses mrkdwn escapes: <@U123> user mentions,
-// <#C123|name> channel mentions, <!here>/<!channel> broadcasts, and
-// <url|label> links. Rewrite them into the same readable shape the other
-// platforms use (`@name (uid:U123)`), resolving user IDs via the provided
-// map (best-effort: unresolved IDs keep the raw ID as the name).
-export function formatSlackText(text: string, userNames: Map<string, string>): string {
-  let formatted = text;
-
-  // User mentions: <@U123> or <@U123|fallback>
-  formatted = formatted.replace(slackUserMentionRe(), (_m, id: string, fallback?: string) => {
-    const name = userNames.get(id) || fallback || id;
-    return `@${name} (uid:${id})`;
-  });
-
-  // Channel mentions: <#C123|name> or <#C123>
-  formatted = formatted.replace(slackChannelMentionRe(), (_m, id: string, name?: string) => {
-    return name ? `#${name}` : `#${id}`;
-  });
-
-  // Broadcasts: <!here>, <!channel>, <!everyone>
-  formatted = formatted.replace(/<!(here|channel|everyone)(?:\|[^>]*)?>/g, '@$1');
-
-  // Links: <url|label> → label (url), <url> → url
-  formatted = formatted.replace(/<(https?:\/\/[^|>]+)\|([^>]*)>/g, '$2 ($1)');
-  formatted = formatted.replace(/<(https?:\/\/[^>]+)>/g, '$1');
-
-  // Unescape Slack's HTML entities
-  formatted = formatted
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&');
-
-  return formatted;
-}
-
-/** Extract user IDs referenced as <@U123> in Slack mrkdwn, for pre-resolution. */
-export function extractSlackUserIds(text: string): string[] {
-  const ids = new Set<string>();
-  const re = slackUserMentionRe();
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) ids.add(m[1]);
-  return Array.from(ids);
-}
-
-/** The minimal users.info surface resolveSlackUserNames needs — structurally
- * satisfied by @slack/web-api's WebClient without importing the SDK here. */
-export interface SlackUserInfoClient {
-  users: {
-    info(args: { user: string }): Promise<{
-      user?: { profile?: { display_name?: string }; real_name?: string; name?: string };
-    }>;
-  };
-}
-
-/**
- * Resolve Slack user IDs to display names into the caller's cache, memoized
- * for the cache's lifetime. Failures leave the raw ID in place (best-effort).
- * Shared by the MCPL adapter and the tool layer, each with its own cache.
- */
-export async function resolveSlackUserNames(
-  client: SlackUserInfoClient,
-  cache: Map<string, string>,
-  userIds: string[],
-): Promise<void> {
-  const unresolved = Array.from(new Set(userIds)).filter(id => id && !cache.has(id));
-  // Chunked, not one big Promise.all — a busy channel can reference dozens of
-  // distinct users, and an unbounded users.info fan-out just queues up 429
-  // retries inside the SDK.
-  const CONCURRENCY = 8;
-  for (let i = 0; i < unresolved.length; i += CONCURRENCY) {
-    await Promise.all(unresolved.slice(i, i + CONCURRENCY).map(async (id) => {
-      try {
-        const { user } = await client.users.info({ user: id });
-        cache.set(id, user?.profile?.display_name || user?.real_name || user?.name || id);
-      } catch {
-        cache.set(id, id);
-      }
-    }));
-  }
-}
-
-/** The fields of a conversations.history message the tool layer reads —
- * structurally satisfied by @slack/web-api's MessageElement. */
-export interface SlackHistoryMessage {
-  ts?: string;
-  user?: string;
-  username?: string;
-  text?: string;
-  thread_ts?: string;
-  files?: Array<{ name?: string; mimetype?: string; url_private?: string }>;
-}
-
-/** The minimal conversations.history surface fetchSlackHistory needs —
- * structurally satisfied by @slack/web-api's WebClient. */
-export interface SlackHistoryClient {
-  conversations: {
-    history(args: {
-      channel: string;
-      oldest?: string;
-      latest?: string;
-      inclusive?: boolean;
-      limit?: number;
-      cursor?: string;
-    }): Promise<{
-      messages?: unknown[];
-      response_metadata?: { next_cursor?: string };
-    }>;
-  };
-}
-
-/**
- * Fetch conversations.history with cursor pagination. The API returns
- * newest-first pages and next_cursor walks toward older messages, so draining
- * the cursor collects everything in [oldest, latest]; `maxMessages` is a
- * backstop against unbounded backlogs. Returns messages oldest-first plus a
- * `truncated` flag — when truncated, the dropped messages are the OLDEST in
- * range (callers that keep a read cursor must NOT advance it then, or the
- * dropped messages are skipped forever).
- */
-export async function fetchSlackHistory(
-  client: SlackHistoryClient,
-  params: {
-    channel: string;
-    oldest?: string;
-    latest?: string;
-    inclusive?: boolean;
-    maxMessages: number;
-  },
-): Promise<{ messages: SlackHistoryMessage[]; truncated: boolean }> {
-  const collected: SlackHistoryMessage[] = [];
-  let cursor: string | undefined;
-  let truncated = false;
-  do {
-    const result = await client.conversations.history({
-      channel: params.channel,
-      ...(params.oldest !== undefined ? { oldest: params.oldest } : {}),
-      ...(params.latest !== undefined ? { latest: params.latest } : {}),
-      ...(params.inclusive ? { inclusive: true } : {}),
-      limit: Math.min(200, params.maxMessages - collected.length),
-      cursor,
-    });
-    collected.push(...((result.messages ?? []) as SlackHistoryMessage[]));
-    cursor = result.response_metadata?.next_cursor || undefined;
-    if (cursor && collected.length >= params.maxMessages) {
-      truncated = true;
-      cursor = undefined;
-    }
-  } while (cursor);
-  return { messages: collected.reverse(), truncated };
-}
-
-// Helper to format Discord mentions
-export function formatDiscordContent(content: string, mentions: any): string {
-  let formatted = content;
-
-  // Replace user mentions with readable format
-  if (mentions && mentions.users) {
-    for (const [userId, user] of mentions.users) {
-      formatted = formatted.replace(
-        new RegExp(`<@${userId}>`, 'g'),
-        `@${user.username} (uid:${userId})`
-      );
-      formatted = formatted.replace(
-        new RegExp(`<@!${userId}>`, 'g'),
-        `@${user.username} (uid:${userId})`
-      );
-    }
-  }
-
-  // Replace channel mentions
-  if (mentions && mentions.channels) {
-    for (const [channelId, channel] of mentions.channels) {
-      formatted = formatted.replace(
-        new RegExp(`<#${channelId}>`, 'g'),
-        `#${channel.name}`
-      );
-    }
-  }
-
-  // Replace role mentions
-  if (mentions && mentions.roles) {
-    for (const [roleId, role] of mentions.roles) {
-      formatted = formatted.replace(
-        new RegExp(`<@&${roleId}>`, 'g'),
-        `@${role.name} (role)`
-      );
-    }
-  }
-
-  return formatted;
 }

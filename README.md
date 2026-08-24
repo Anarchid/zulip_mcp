@@ -1,13 +1,13 @@
-# Zulip, Discord & Slack MCP Server
+# Zulip MCP Server
 
 [![npm version](https://img.shields.io/npm/v/zulip-mcp-server.svg)](https://www.npmjs.com/package/zulip-mcp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A Model Context Protocol (MCP) server that provides **stateful, ergonomic** integration with **Zulip and Discord**. This server allows AI assistants and other MCP clients to monitor channels, track read/unread messages, and retrieve history with natural date-based queries.
+A Model Context Protocol (MCP) server that provides **stateful, ergonomic** integration with **Zulip**. This server allows AI assistants and other MCP clients to monitor channels, track read/unread messages, and retrieve history with natural date-based queries.
 
 **Install:** `npm install -g zulip-mcp-server`
 
-**Features:** Zulip ✅ | Discord ✅ | Stateful ✅ | Persistent ✅ | Ambient Awareness ✅
+**Features:** Zulip ✅ | Stateful ✅ | Persistent ✅ | Ambient Awareness ✅
 
 ## 🎯 Design Philosophy
 
@@ -29,11 +29,6 @@ The agent can passively see unread message notifications when activated for any 
 - `zulip://monitoring/status` - Current monitoring state
 - `zulip://channel/{name}/unread` - Per-channel unread count
 
-**Discord:**
-- `discord://unread/summary` - Total unread count across monitored channels  
-- `discord://monitoring/status` - Current monitoring state
-- `discord://channel/{id}/unread` - Per-channel unread count
-
 ### 📺 **Zulip Tools**
 - `start_monitoring` - Monitor Zulip channels
 - `get_channel_history` - Get history with natural dates (mentions formatted as `@username (uid:123)`)
@@ -49,32 +44,6 @@ The agent can passively see unread message notifications when activated for any 
 - `get_user_profile` - Get your info
 - `get_monitored_channels` - View monitoring state
 - `stop_monitoring` - Stop tracking
-
-### 💬 **Discord Tools**
-- `discord_start_monitoring` - Monitor Discord channels
-- `discord_get_channel_history` - Get history with natural dates (mentions formatted as `@username (uid:123...)`, shows replies)
-- `discord_get_unread_messages` - Get unread from monitored channels
-- `discord_send_message` - Send to Discord channels (supports `reply_to` parameter, use `<@user_id>` for mentions)
-- `discord_delete_message` - Delete any message by ID (with permissions)
-- `discord_find_user` - Search users to get user ID for mentions
-- `discord_list_channels` - Browse Discord channels
-- `discord_get_monitored_channels` - View monitoring state
-- `discord_stop_monitoring` - Stop tracking
-
-### 💼 **Slack Tools**
-- `slack_list_channels` - Browse Slack conversations (channels, private channels, **DMs, group DMs**)
-- `slack_start_monitoring` - Monitor Slack conversations
-- `slack_get_channel_history` - Get history with natural dates (mentions formatted as `@username (uid:U123...)`, shows threads)
-- `slack_get_unread_messages` - Get unread from monitored conversations
-- `slack_send_message` - Send to channels or DMs (supports `thread_ts` for in-thread replies, use `<@user_id>` for mentions)
-- `slack_delete_message` - Delete a message by ts (with permissions)
-- `slack_add_reaction` - Add emoji reactions
-- `slack_find_user` - Search users to get user ID for mentions
-- `slack_fetch_attachment` - Fetch file bytes inline (auth-locked to `files.slack.com`)
-- `slack_get_monitored_channels` - View monitoring state
-- `slack_stop_monitoring` - Stop tracking
-
-Slack resources for ambient awareness: `slack://unread/summary`, `slack://monitoring/status`, `slack://channel/{id}/unread`.
 
 ## Installation
 
@@ -93,29 +62,6 @@ npm install -g zulip-mcp-server
 ```
 
 ## Configuration
-
-### Service Selection
-
-Enable the services you need via environment variables:
-
-```bash
-# Enable Zulip (enabled by default)
-export ENABLE_ZULIP=true
-
-# Enable Discord (disabled by default)  
-export ENABLE_DISCORD=true
-
-# Enable Slack (disabled by default)
-export ENABLE_SLACK=true
-```
-
-You can enable any combination:
-- **Just Zulip** (default): Don't set `ENABLE_DISCORD`/`ENABLE_SLACK` - Only Zulip tools will be available
-- **Just Discord**: Set `ENABLE_DISCORD=true` and `ENABLE_ZULIP=false`
-- **Just Slack**: Set `ENABLE_SLACK=true` and `ENABLE_ZULIP=false`
-- **Any mix**: Enable multiple platforms - each contributes its own tool set, channels, and feature sets
-
-**Note:** Tools are dynamically loaded based on enabled services. If a service isn't configured, its tools won't appear in the tool list.
 
 ### Authentication
 
@@ -166,22 +112,6 @@ export ZULIP_RC_PATH="/path/to/zuliprc"
 
 **Important:** Add `zuliprc` to your `.gitignore` to avoid committing credentials!
 
-#### Discord Authentication
-
-```bash
-export DISCORD_TOKEN="your-bot-token"
-```
-
-#### Slack Authentication
-
-Slack uses two tokens — a bot token for Web API calls and an app-level token for Socket Mode (real-time events without a public webhook URL):
-
-```bash
-export SLACK_BOT_TOKEN="xoxb-..."   # Bot User OAuth Token
-export SLACK_APP_TOKEN="xapp-..."   # App-level token with connections:write
-export SLACK_SESSION_ID="agent_name"  # Optional: persistent state (defaults to workspace name)
-```
-
 ## Getting Your API Keys
 
 ### Zulip API Key
@@ -195,61 +125,6 @@ For bots:
 1. Go to Settings → Your bots
 2. Add a new bot
 3. Copy the bot's email and API key
-
-### Discord Bot Token
-
-1. Go to https://discord.com/developers/applications
-2. Create a New Application
-3. Go to "Bot" section and click "Add Bot"
-4. Under "Token", click "Reset Token" and copy it
-5. **Enable Required Privileged Gateway Intents:**
-   - ✅ **Message Content Intent** (required for reading messages)
-   - ✅ **Server Members Intent** (required for user search)
-6. Invite bot to your server with these permissions:
-   - Read Messages/View Channels
-   - Send Messages
-   - Read Message History
-
-### Slack App Tokens
-
-1. Go to https://api.slack.com/apps → **Create New App** → *From a manifest*, and paste:
-
-```yaml
-display_information:
-  name: Connectome Agent
-features:
-  bot_user:
-    display_name: connectome-agent
-    always_online: true
-oauth_config:
-  scopes:
-    bot:
-      - channels:history
-      - channels:read
-      - groups:history
-      - groups:read
-      - im:history
-      - im:read
-      - im:write
-      - mpim:history
-      - mpim:read
-      - chat:write
-      - users:read
-      - reactions:write
-      - files:read
-settings:
-  event_subscriptions:
-    bot_events:
-      - message.channels
-      - message.groups
-      - message.im
-      - message.mpim
-  socket_mode_enabled: true
-```
-
-2. **Install to Workspace** → copy the **Bot User OAuth Token** (`xoxb-...`) → `SLACK_BOT_TOKEN`
-3. Under **Basic Information → App-Level Tokens**, generate a token with the `connections:write` scope (`xapp-...`) → `SLACK_APP_TOKEN`
-4. Invite the bot to channels you want it to see: `/invite @connectome-agent` (DMs work without invites — users can message the bot directly)
 
 ## Usage with Cursor
 
@@ -273,95 +148,6 @@ Add this to your Cursor MCP configuration (`~/.cursor/mcp.json`):
   }
 }
 ```
-
-### Discord Only
-
-```json
-{
-  "mcpServers": {
-    "discord": {
-      "command": "npx",
-      "args": ["-y", "zulip-mcp-server"],
-      "env": {
-        "ENABLE_ZULIP": "false",
-        "ENABLE_DISCORD": "true",
-        "DISCORD_TOKEN": "your-bot-token",
-        "ZULIP_SESSION_ID": "my_agent"
-      }
-    }
-  }
-}
-```
-
-### Both Zulip and Discord
-
-```json
-{
-  "mcpServers": {
-    "chat": {
-      "command": "npx",
-      "args": ["-y", "zulip-mcp-server"],
-      "env": {
-        "ENABLE_DISCORD": "true",
-        "ZULIP_REALM": "https://your-org.zulipchat.com",
-        "ZULIP_EMAIL": "your-bot@example.com",
-        "ZULIP_API_KEY": "your-api-key",
-        "DISCORD_TOKEN": "your-bot-token",
-        "ZULIP_SESSION_ID": "my_agent"
-      }
-    }
-  }
-}
-```
-
-**Alternative (if installed globally):**
-
-```json
-{
-  "mcpServers": {
-    "zulip": {
-      "command": "zulip-mcp-server",
-      "env": {
-        "ZULIP_REALM": "https://your-org.zulipchat.com",
-        "ZULIP_EMAIL": "your-bot@example.com",
-        "ZULIP_API_KEY": "your-api-key",
-        "ZULIP_SESSION_ID": "my_agent"
-      }
-    }
-  }
-}
-```
-
-**Multiple Agents:** To run multiple agents with separate state, use different session IDs:
-
-```json
-{
-  "mcpServers": {
-    "zulip-agent1": {
-      "command": "node",
-      "args": ["/path/to/zulip_mcp/build/index.js"],
-      "env": {
-        "ZULIP_REALM": "https://your-org.zulipchat.com",
-        "ZULIP_EMAIL": "bot1@example.com",
-        "ZULIP_API_KEY": "key1",
-        "ZULIP_SESSION_ID": "agent1"
-      }
-    },
-    "zulip-agent2": {
-      "command": "node",
-      "args": ["/path/to/zulip_mcp/build/index.js"],
-      "env": {
-        "ZULIP_REALM": "https://your-org.zulipchat.com",
-        "ZULIP_EMAIL": "bot2@example.com",
-        "ZULIP_API_KEY": "key2",
-        "ZULIP_SESSION_ID": "agent2"
-      }
-    }
-  }
-}
-```
-
-After updating the configuration, **restart Cursor**.
 
 ## 📖 Usage Examples
 
@@ -407,12 +193,6 @@ Once configured in Cursor, you can simply ask:
 - **"Show me unread Zulip messages"**
 - **"Get yesterday's history from #general"**
 - **"Send a message to #team-updates about the deployment"**
-
-**Discord:**
-- **"Get today's Discord messages from channel 123456789"**
-- **"Show me unread Discord messages"**
-- **"List all Discord channels"**
-- **"Send a message to Discord channel 123456789"**
 
 **Both:**
 - **"Check all my unread messages"** (if both enabled, check both!)
@@ -471,26 +251,6 @@ Use the Zulip mention syntax in your messages:
 ```typescript
 find_user({ query: "daria" })
 // Returns: mention_syntax: "@**Daria Kroshka**"
-```
-
-#### Discord Mentions
-
-**Inbound (Reading):**
-Mentions in retrieved messages are automatically formatted as:
-```
-@username#1234 (uid:123456789012345678)
-```
-
-**Outbound (Sending):**
-Use Discord's mention format:
-```
-<@123456789012345678>
-```
-
-**Finding Users:**
-```typescript
-discord_find_user({ username: "daria" })
-// Returns: mention_syntax: "<@123456789012345678>"
 ```
 
 ## API Reference
@@ -625,7 +385,7 @@ Here's a typical workflow with the stateful server:
 ❌ Separate tools for each service with no consistency
 
 ### Our Approach
-✅ Unified ergonomic design across Zulip & Discord  
+✅ Unified ergonomic design across Zulip  
 ✅ Automatic state management  
 ✅ **Persistent state** across restarts  
 ✅ **Auto-monitoring** on history retrieval  
