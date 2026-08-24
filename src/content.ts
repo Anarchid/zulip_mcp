@@ -7,18 +7,20 @@
  */
 
 import { realpathSync } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 /**
  * Run-as-main detection that survives npm bin symlinks. Node resolves the
  * entry module to its realpath while process.argv[1] keeps the symlink path,
  * so a naive `import.meta.url === pathToFileURL(argv[1]).href` is false when
- * launched via `npx`/a bin shim — realpath argv[1] before comparing.
+ * launched via `npx`/a bin shim. Both sides are canonicalised: argv[1] for
+ * the bin shim, and the entry path because it can itself sit behind a
+ * symlinked directory (macOS's /var → /private/var, --preserve-symlinks).
  */
 export function isMainModule(importMetaUrl: string, argv1: string | undefined): boolean {
   if (!argv1) return false;
   try {
-    return importMetaUrl === pathToFileURL(realpathSync(argv1)).href;
+    return realpathSync(fileURLToPath(importMetaUrl)) === realpathSync(argv1);
   } catch {
     return false;
   }
