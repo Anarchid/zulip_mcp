@@ -93,39 +93,47 @@ function splitList(raw: string | undefined): string[] {
   return (raw ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-/** The environment seed: ZULIP_STREAMS, ZULIP_DM_USERS, ZULIP_MUTED_STREAMS,
- *  ZULIP_SUPPRESSED_REACTIONS_BASELINE (host-injected; written durably on
- *  first materialization so the file becomes the operator-ownable record). */
+/** The environment seed for the file: ZULIP_STREAMS, ZULIP_DM_USERS,
+ *  ZULIP_MUTED_STREAMS. The reaction-suppression baseline is NOT part of it —
+ *  see `parseBaselineFromEnv`. */
 export function parseFiltersFromEnv(env: NodeJS.ProcessEnv = process.env): ZulipFilters {
-  const f: ZulipFilters = {
+  return normalizeFilters({
     streams: splitList(env.ZULIP_STREAMS),
     dmUsers: splitList(env.ZULIP_DM_USERS),
     mutedStreams: splitList(env.ZULIP_MUTED_STREAMS),
-  };
-  const baseline = splitList(env.ZULIP_SUPPRESSED_REACTIONS_BASELINE);
-  if (baseline.length) f.suppressedReactionEmojis = baseline;
-  return normalizeFilters(f);
+  });
+}
+
+/**
+ * The host-owned reaction-suppression baseline: the refusal-annotation
+ * markers the host's framework stamps, which the model must never see.
+ * `ZULIP_SUPPRESSED_REACTIONS_BASELINE` when set; else the name every host
+ * injects into every MCPL child regardless of platform,
+ * `DISCORD_SUPPRESSED_REACTIONS_BASELINE` (a naming wart of the host, not a
+ * Discord-only value). Re-read on every start and never written to the
+ * filters file: the host may change its markers between deployments, and a
+ * persisted copy would freeze the set the file was first seeded with.
+ */
+export function parseBaselineFromEnv(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env.ZULIP_SUPPRESSED_REACTIONS_BASELINE ?? env.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
+  return uniqueStrings(splitList(raw), normalizeReactionEmoji);
 }
 
 /** Load + validate the filters file. Returns null when the file is missing,
- *  unparseable, or carries a wrong-typed safety field — callers keep the
- *  previous filters (fail-safe, never fail-open). The allowlist keys
- *  tolerate loose shapes (a wrong-typed one fails toward "unrestricted",
- *  visible in filters_get); suppressedReactionEmojis does not, because a
- *  wrong-typed value degrading to "absent" would silently drop protection. */
+ *  unparseable, or carries a wrong-typed key — callers keep the previous
+ *  filters (fail-safe, never fail-open). Every key here is an authorization
+ *  list; a wrong-typed one must not degrade to "unrestricted" or "absent". */
 export function loadFiltersFile(path: string): ZulipFilters | null {
   try {
     const raw: unknown = JSON.parse(readFileSync(path, 'utf-8'));
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
     const r = raw as Record<string, unknown>;
     const out: ZulipFilters = {};
-    for (const key of ['streams', 'dmUsers', 'mutedStreams', 'reactionChannels'] as const) {
-      if (Array.isArray(r[key])) out[key] = (r[key] as unknown[]).map(String);
-    }
-    if ('suppressedReactionEmojis' in r) {
-      const v = r.suppressedReactionEmojis;
-      if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) return null;
-      out.suppressedReactionEmojis = v as string[];
+    for (const key of ['streams', 'dmUsers', 'mutedStreams', 'reactionChannels', 'suppressedReactionEmojis'] as const) {
+      if (!(key in r) || r[key] === null || r[key] === undefined) continue;
+      const v = r[key];
+      if (!Array.isArray(v) || v.some((x) => typeof x !== 'string' && typeof x !== 'number')) return null;
+      out[key] = (v as unknown[]).map(String);
     }
     return normalizeFilters(out);
   } catch {
@@ -133,10 +141,12 @@ export function loadFiltersFile(path: string): ZulipFilters | null {
   }
 }
 
-/** Atomic write (tmp + rename) so the poller never reads a half-written file. */
+/** Atomic write (tmp + rename) so the poller never reads a half-written
+ *  file; the tmp name is per-process so two sessions on one file cannot
+ *  clobber each other's staging. */
 export function saveFiltersFile(path: string, filters: ZulipFilters): void {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
+  const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(normalizeFilters(filters), null, 2) + '\n');
   renameSync(tmp, path);
 }
@@ -207,11 +217,14 @@ export interface FiltersPlaneStatus {
 export interface ReactionSuppressionStatus {
   status: 'not-configured' | 'configured-empty' | 'active' | 'stale' | 'unavailable';
   protectionActive: boolean;
+  /** File entries plus the host baseline, deduplicated. */
   effectiveCount: number;
   /** Redacted by construction — a digest, never the entries. */
   effectiveDigest: string | null;
+  /** How many of the effective entries come from the host-injected baseline. */
+  baselineCount: number;
   suppressingAllReactions?: true;
-  source: 'file' | 'none';
+  source: 'file' | 'baseline' | 'file+baseline' | 'none';
 }
 
 /**
@@ -229,6 +242,8 @@ export class FiltersPlane {
   private listeners: ((next: ZulipFilters, prev: ZulipFilters) => void)[] = [];
   private poll: ReturnType<typeof setInterval> | null = null;
   private tracker: FiltersFilePollTracker | null = null;
+  /** Host-owned, process-lifetime, never persisted. */
+  private readonly baseline: string[];
 
   constructor(
     readonly path: string,
@@ -236,9 +251,17 @@ export class FiltersPlane {
     private readonly options: { pollMs?: number } = {},
   ) {
     this.effective = parseFiltersFromEnv(env);
+    this.baseline = parseBaselineFromEnv(env);
   }
 
-  /** Seed or load the file, then start watching it. Idempotent. */
+  /**
+   * Seed or load the file, then start watching it. Idempotent.
+   *
+   * Throws when the file does not exist and cannot be created: "the file
+   * always exists" is the contract every hot-reload guarantee rests on, and
+   * a server that cannot keep it is misconfigured (unwritable state dir),
+   * not degraded.
+   */
   start(): void {
     if (this.poll) return;
     if (existsSync(this.path)) {
@@ -256,12 +279,14 @@ export class FiltersPlane {
     } else {
       try {
         saveFiltersFile(this.path, this.effective);
-        this.apply(this.effective, true);
-        console.error(`[zulip-mcp] filters file seeded from env -> ${this.path}`);
       } catch (err) {
-        this.broken = { since: new Date().toISOString(), desired: 'missing' };
-        console.error(`[zulip-mcp] could not seed filters file ${this.path}:`, (err as Error).message);
+        throw new Error(`cannot create the filters file ${this.path}: ${(err as Error).message}`);
       }
+      this.apply(this.effective, true);
+      console.error(`[zulip-mcp] filters file seeded from env -> ${this.path}`);
+    }
+    if (this.baseline.length > 0) {
+      console.error(`[zulip-mcp] reaction-suppression baseline from the host: ${this.baseline.length} marker(s)`);
     }
     this.tracker = new FiltersFilePollTracker(filtersFileMtime(this.path));
     this.poll = setInterval(() => this.tick(), this.options.pollMs ?? 3000);
@@ -359,9 +384,14 @@ export class FiltersPlane {
     return list !== undefined && list.length === 0;
   }
 
+  /** The file's entries plus the host baseline. */
+  private effectiveSuppressed(): string[] {
+    return [...new Set([...(this.effective.suppressedReactionEmojis ?? []), ...this.baseline])];
+  }
+
   reactionSuppressed(emojiName: string): boolean {
-    const list = this.effective.suppressedReactionEmojis;
-    if (!list || list.length === 0) return false;
+    const list = this.effectiveSuppressed();
+    if (list.length === 0) return false;
     return list.includes(normalizeReactionEmoji(emojiName));
   }
 
@@ -381,19 +411,26 @@ export class FiltersPlane {
   }
 
   suppressionStatus(): ReactionSuppressionStatus {
+    const baselineCount = this.baseline.length;
     if (this.suppressAllReactions()) {
-      return { status: 'unavailable', protectionActive: true, effectiveCount: 0, effectiveDigest: null, suppressingAllReactions: true, source: this.everParsed ? 'file' : 'none' };
+      return { status: 'unavailable', protectionActive: true, effectiveCount: 0, effectiveDigest: null, baselineCount, suppressingAllReactions: true, source: this.everParsed ? 'file' : 'none' };
     }
-    const list = this.effective.suppressedReactionEmojis;
-    if (list === undefined) {
-      return { status: 'not-configured', protectionActive: false, effectiveCount: 0, effectiveDigest: null, source: 'none' };
-    }
+    const fromFile = this.effective.suppressedReactionEmojis;
+    const list = this.effectiveSuppressed();
     const n = list.length;
     const digest = n > 0 ? sha256(JSON.stringify([...list].sort())) : null;
-    if (this.broken) {
-      return { status: 'stale', protectionActive: true, effectiveCount: n, effectiveDigest: digest, source: 'file' };
+    const source: ReactionSuppressionStatus['source'] =
+      fromFile !== undefined && baselineCount > 0 ? 'file+baseline'
+        : fromFile !== undefined ? 'file'
+          : baselineCount > 0 ? 'baseline'
+            : 'none';
+    if (fromFile === undefined && baselineCount === 0) {
+      return { status: 'not-configured', protectionActive: false, effectiveCount: 0, effectiveDigest: null, baselineCount, source };
     }
-    return { status: n > 0 ? 'active' : 'configured-empty', protectionActive: n > 0, effectiveCount: n, effectiveDigest: digest, source: 'file' };
+    if (this.broken) {
+      return { status: 'stale', protectionActive: true, effectiveCount: n, effectiveDigest: digest, baselineCount, source };
+    }
+    return { status: n > 0 ? 'active' : 'configured-empty', protectionActive: n > 0, effectiveCount: n, effectiveDigest: digest, baselineCount, source };
   }
 
   // ── internals ──

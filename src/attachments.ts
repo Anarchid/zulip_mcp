@@ -40,6 +40,29 @@ export const DEFAULT_MAX_INLINE_IMAGES = 4;
  *  through to the re-encode pipeline, which rasterizes them to PNG/JPEG. */
 const API_SAFE_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
 
+/** Decoded-bitmap ceiling handed to sharp (default is 268 Mpx, ~1 GiB RGBA).
+ *  Message attachments over 40 Mpx are not something a model will see at
+ *  1568 px anyway; refusing them bounds memory per decode. */
+const IMAGE_MAX_INPUT_PIXELS = 40_000_000;
+const sharpOpts = { limitInputPixels: IMAGE_MAX_INPUT_PIXELS };
+
+/** At most this many image decodes run at once across all messages. */
+const IMAGE_DECODE_CONCURRENCY = 2;
+let decodesInFlight = 0;
+const decodeWaiters: (() => void)[] = [];
+async function withDecodeSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (decodesInFlight >= IMAGE_DECODE_CONCURRENCY) {
+    await new Promise<void>((resolve) => decodeWaiters.push(resolve));
+  }
+  decodesInFlight++;
+  try {
+    return await fn();
+  } finally {
+    decodesInFlight--;
+    decodeWaiters.shift()?.();
+  }
+}
+
 export interface NormalizedImage {
   data: string; // base64
   mimeType: string;
@@ -52,9 +75,13 @@ export interface NormalizedImage {
  *  untouched. Animated GIFs are left as-is (frame resizing is out of scope) and
  *  inlined only when already under cap. Returns null when nothing inlinable can
  *  be produced, letting the caller degrade to a text note. */
-export async function normalizeImageForInference(buf: Buffer): Promise<NormalizedImage | null> {
+export function normalizeImageForInference(buf: Buffer): Promise<NormalizedImage | null> {
+  return withDecodeSlot(() => normalizeImageUnbounded(buf));
+}
+
+async function normalizeImageUnbounded(buf: Buffer): Promise<NormalizedImage | null> {
   try {
-    const meta = await sharp(buf, { animated: true }).metadata();
+    const meta = await sharp(buf, { ...sharpOpts, animated: true }).metadata();
     const longest = Math.max(meta.width ?? 0, meta.height ?? 0);
     const isAnimated = (meta.pages ?? 1) > 1;
     const apiSafe = API_SAFE_FORMATS.has(meta.format ?? '');
@@ -75,7 +102,7 @@ export async function normalizeImageForInference(buf: Buffer): Promise<Normalize
     // multiple toBuffer() calls). resize() with withoutEnlargement is a no-op
     // when the image is already within bounds but over the byte cap.
     const resizeOpts = { width: IMAGE_LONG_EDGE_MAX, height: IMAGE_LONG_EDGE_MAX, fit: 'inside' as const, withoutEnlargement: true };
-    const base = () => sharp(buf).resize(resizeOpts);
+    const base = () => sharp(buf, sharpOpts).resize(resizeOpts);
 
     let out: Buffer;
     let mimeType: string;
@@ -89,7 +116,7 @@ export async function normalizeImageForInference(buf: Buffer): Promise<Normalize
 
     // Still over cap (large PNG / high-detail photo) → flatten + shrink harder.
     if (out.length > IMAGE_OUTPUT_RAW_CAP) {
-      out = await sharp(buf)
+      out = await sharp(buf, sharpOpts)
         .resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
         .flatten({ background: '#ffffff' })
         .jpeg({ quality: 70 })

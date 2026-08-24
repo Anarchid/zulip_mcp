@@ -373,6 +373,9 @@ export function dmDescriptor(
     address: { dm: true, user_ids: ids, emails: counterparts.map((r) => r.email) },
     metadata: {
       channelType: 'dm',
+      // The host's conversation router classifies on the Slack-derived
+      // convention (is_im / is_mpim); carry both spellings.
+      ...(single ? { is_im: true } : { is_mpim: true }),
       recipientName: single ? single.full_name : names.join(', '),
       ...(single ? { recipientId: String(single.id), recipientEmail: single.email } : {}),
       participants: counterparts.map((r) => ({ id: r.id, name: r.full_name, email: r.email })),

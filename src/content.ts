@@ -143,9 +143,13 @@ export function parseZulipAttachmentUrl(rawPath: string, zulipRealm: string): UR
   let url: URL;
   if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
     url = new URL(rawPath);
-    const realmHost = new URL(zulipRealm).host;
-    if (url.host !== realmHost) {
-      throw new Error(`refusing to fetch from foreign host ${url.host}; expected ${realmHost}`);
+    const realm = new URL(zulipRealm);
+    if (url.host !== realm.host) {
+      throw new Error(`refusing to fetch from foreign host ${url.host}; expected ${realm.host}`);
+    }
+    // Same host over a weaker scheme would send the bot's credentials in clear.
+    if (url.protocol !== realm.protocol) {
+      throw new Error(`refusing to fetch over ${url.protocol.replace(/:$/, "")}; the realm is ${realm.protocol.replace(/:$/, "")}`);
     }
   } else {
     const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;

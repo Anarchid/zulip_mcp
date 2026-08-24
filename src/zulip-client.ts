@@ -81,7 +81,10 @@ export async function initializeZulipClient(env: NodeJS.ProcessEnv = process.env
     ? "Basic " + Buffer.from(`${email}:${apiKey}`).toString("base64")
     : "";
 
-  const sessionId = env.ZULIP_SESSION_ID || env.ZULIP_EMAIL || env.ZULIP_USERNAME || "default";
+  // Keys the persistent state files. The bot's identity is the natural
+  // default whichever way the credentials arrived (env or zuliprc); two
+  // sessions of one bot sharing a state dir must set ZULIP_SESSION_ID.
+  const sessionId = env.ZULIP_SESSION_ID || email || env.ZULIP_USERNAME || "default";
 
   // Fail-open: if profile fetch fails, leave selfUserId null (no self-filter).
   let selfUserId: number | null = null;

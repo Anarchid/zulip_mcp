@@ -16,6 +16,7 @@ import {
   loadFiltersFile,
   normalizeFilters,
   normalizeReactionEmoji,
+  parseBaselineFromEnv,
   parseFiltersFromEnv,
   saveFiltersFile,
 } from '../src/filters.ts';
@@ -46,20 +47,34 @@ test('normalizeFilters: empty means unset, duplicates collapse, names lose their
   assert.equal(normalizeReactionEmoji(':Thumbs_Up:'), 'thumbs_up');
 });
 
-test('parseFiltersFromEnv reads the seed variables', () => {
+test('parseFiltersFromEnv reads the seed variables; the baseline is host-owned and read separately', () => {
   assert.deepEqual(parseFiltersFromEnv({}), {});
   assert.deepEqual(
     parseFiltersFromEnv({ ZULIP_STREAMS: 'general, dev', ZULIP_DM_USERS: '42', ZULIP_MUTED_STREAMS: 'random', ZULIP_SUPPRESSED_REACTIONS_BASELINE: 'biohazard' }),
-    { streams: ['general', 'dev'], dmUsers: ['42'], mutedStreams: ['random'], suppressedReactionEmojis: ['biohazard'] },
+    { streams: ['general', 'dev'], dmUsers: ['42'], mutedStreams: ['random'] },
+    'the baseline never enters the file seed',
+  );
+  assert.deepEqual(parseBaselineFromEnv({}), []);
+  assert.deepEqual(parseBaselineFromEnv({ ZULIP_SUPPRESSED_REACTIONS_BASELINE: ':Biohazard:, radioactive' }), ['biohazard', 'radioactive']);
+  // The host injects one name into every MCPL child, whatever the platform.
+  assert.deepEqual(parseBaselineFromEnv({ DISCORD_SUPPRESSED_REACTIONS_BASELINE: 'biohazard' }), ['biohazard']);
+  assert.deepEqual(
+    parseBaselineFromEnv({ ZULIP_SUPPRESSED_REACTIONS_BASELINE: 'x', DISCORD_SUPPRESSED_REACTIONS_BASELINE: 'y' }),
+    ['x'],
+    'the Zulip-specific name wins when both are set',
   );
 });
 
-test('loadFiltersFile tolerates loose allowlists but refuses a wrong-typed suppression key', () => {
+test('loadFiltersFile refuses any wrong-typed key: every list is an authorization list', () => {
   const dir = tmp();
   try {
     const path = join(dir, 'f.json');
-    writeFileSync(path, JSON.stringify({ streams: 'not-a-list', dmUsers: [42], extra: true }));
-    assert.deepEqual(loadFiltersFile(path), { dmUsers: ['42'] });
+    writeFileSync(path, JSON.stringify({ dmUsers: [42], extra: true }));
+    assert.deepEqual(loadFiltersFile(path), { dmUsers: ['42'] }, 'numbers are accepted as ids; unknown keys are ignored');
+    writeFileSync(path, JSON.stringify({ streams: 'private', dmUsers: [42] }));
+    assert.equal(loadFiltersFile(path), null, 'a string where a list belongs is not "unrestricted"');
+    writeFileSync(path, JSON.stringify({ streams: [{ name: 'x' }] }));
+    assert.equal(loadFiltersFile(path), null);
     writeFileSync(path, JSON.stringify({ suppressedReactionEmojis: 'nope' }));
     assert.equal(loadFiltersFile(path), null);
     writeFileSync(path, '[1,2]');
@@ -145,6 +160,63 @@ test('the plane seeds from env, hot-reloads edits, and refuses updates while bro
     assert.equal(plane.streamAllowed('ops'), true);
     assert.equal(plane.update((f) => f).ok, true);
     plane.stop();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the host baseline is enforced every start, is never written to the file, and merges with file entries', () => {
+  const dir = tmp();
+  try {
+    const path = join(dir, 'filters.json');
+    const first = new FiltersPlane(path, { DISCORD_SUPPRESSED_REACTIONS_BASELINE: 'biohazard' }, { pollMs: 60_000 });
+    quiet(() => first.start());
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf-8')), {}, 'the seed carries no baseline');
+    assert.equal(first.reactionSuppressed('biohazard'), true);
+    assert.equal(first.reactionSuppressed('eyes'), false);
+    assert.deepEqual(
+      { ...first.suppressionStatus(), effectiveDigest: undefined },
+      { status: 'active', protectionActive: true, effectiveCount: 1, baselineCount: 1, source: 'baseline', effectiveDigest: undefined },
+    );
+    first.stop();
+
+    // A later deployment changes the host's markers: the new set applies,
+    // the old one is gone — nothing was frozen into the file.
+    const second = new FiltersPlane(path, { DISCORD_SUPPRESSED_REACTIONS_BASELINE: 'radioactive' }, { pollMs: 60_000 });
+    quiet(() => second.start());
+    assert.equal(second.reactionSuppressed('biohazard'), false);
+    assert.equal(second.reactionSuppressed('radioactive'), true);
+
+    // Operator entries in the file add to the baseline; neither removes the other.
+    writeFileSync(path, JSON.stringify({ suppressedReactionEmojis: ['skull'] }));
+    utimesSync(path, new Date(Date.now() + 5000), new Date(Date.now() + 5000));
+    quiet(() => second.tick());
+    assert.equal(second.reactionSuppressed('skull'), true);
+    assert.equal(second.reactionSuppressed('radioactive'), true);
+    assert.equal(second.suppressionStatus().effectiveCount, 2);
+    assert.equal(second.suppressionStatus().source, 'file+baseline');
+    // An agent-side update round-trips the file without the baseline leaking in.
+    second.update((f) => ({ ...f, mutedStreams: ['random'] }));
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf-8')).suppressedReactionEmojis, ['skull']);
+    second.stop();
+
+    // Without a baseline and without a file key: honestly unprotected.
+    const bare = new FiltersPlane(join(dir, 'bare.json'), {}, { pollMs: 60_000 });
+    quiet(() => bare.start());
+    assert.equal(bare.suppressionStatus().status, 'not-configured');
+    bare.stop();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a filters file that cannot be created fails the start, not silently', () => {
+  const dir = tmp();
+  try {
+    // A regular file where the parent directory should be.
+    writeFileSync(join(dir, 'blocker'), '');
+    const plane = new FiltersPlane(join(dir, 'blocker', 'filters.json'), {}, { pollMs: 60_000 });
+    assert.throws(() => quiet(() => plane.start()), /cannot create the filters file/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

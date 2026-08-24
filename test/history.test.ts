@@ -195,9 +195,13 @@ test('DM channel ids are the sorted counterpart ids, bot excluded, and round-tri
   assert.equal(single.label, 'DM: Bo');
   assert.deepEqual(single.address, { dm: true, user_ids: [42], emails: ['bo@example.com'] });
   assert.equal((single.metadata as { recipientId: string }).recipientId, '42');
+  // The host's conversation router keys on the Slack-derived spelling.
+  assert.equal((single.metadata as { is_im?: boolean }).is_im, true);
+  assert.equal((single.metadata as { is_mpim?: boolean }).is_mpim, undefined);
   const group = dmDescriptor(dmCounterparts(recipients, 790), 100);
   assert.equal(group.label, 'Group DM: Al, Bo');
   assert.equal((group.metadata as { recipientId?: string }).recipientId, undefined);
+  assert.equal((group.metadata as { is_mpim?: boolean }).is_mpim, true);
 });
 
 test('fetchHistory narrows on a DM conversation when asked', async () => {

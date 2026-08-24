@@ -41,6 +41,8 @@ test('parseZulipAttachmentUrl rejects dot-segment traversal out of /user_uploads
 
 test('parseZulipAttachmentUrl rejects foreign hosts and non-upload paths', () => {
   assert.throws(() => parseZulipAttachmentUrl('https://evil.example/user_uploads/x', REALM), /foreign host/);
+  // Same host over plain http would send the Basic credentials in clear.
+  assert.throws(() => parseZulipAttachmentUrl('http://example.zulipchat.com/user_uploads/x', REALM), /refusing to fetch over http/);
   assert.throws(() => parseZulipAttachmentUrl('/api/v1/users/me', REALM), /user_uploads/);
   assert.throws(() => parseZulipAttachmentUrl('', REALM), /required/);
   assert.throws(() => parseZulipAttachmentUrl('/user_uploads/x', ''), /realm/);

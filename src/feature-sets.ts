@@ -165,6 +165,8 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'channel_missed':
     case 'mute_channel':
     case 'unmute_channel':
+    case 'filters_update':
+    case 'refresh_channels':
       return MESSAGING_FEATURE_SET;
     case 'fetch_history':
     case 'fetch_around':
