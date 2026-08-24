@@ -4,33 +4,33 @@
  *
  * The theme of every case here is that absence is denial. Nothing the server
  * says — not its advertisement, not its degradation receipt — may widen what
- * the host granted.
+ * the host granted. The message-to-grant step itself is @animalabs/mcpl-core's;
+ * these cases pin how this server's wrapper composes it over a connection's
+ * lifetime.
  */
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CapabilityGrant } from '../src/mcpl/grant.ts';
-import { McplRpcError } from '../src/mcpl/errors.ts';
-import { buildFeatureSets, buildServerCapabilities } from '../src/mcpl/feature-sets.ts';
-import { CAPABILITY_PATH_SET } from '../src/mcpl/types.ts';
-
-const PLATFORMS = ['zulip', 'discord', 'slack'];
+import { isCapabilityPath } from '@animalabs/mcpl-core';
+import { CapabilityGrant } from '../src/grant.ts';
+import { McplRpcError } from '../src/errors.ts';
+import { buildFeatureSets, buildServerCapabilities } from '../src/feature-sets.ts';
 
 // --- §6.2: `uses` is a closed vocabulary ------------------------------------
 
 test('every declared `uses` value is in the SPEC §6.2 capability-path vocabulary', () => {
-  const sets = buildFeatureSets(PLATFORMS, { typingCapable: new Set(['zulip']) });
+  const sets = buildFeatureSets({ typing: true });
   assert.ok(Object.keys(sets).length > 0);
   for (const [name, decl] of Object.entries(sets)) {
     assert.ok(Array.isArray(decl.uses) && decl.uses.length > 0, `${name}: uses must be non-empty (§6.4)`);
     for (const use of decl.uses) {
-      assert.ok(CAPABILITY_PATH_SET.has(use), `${name}: '${use}' is not a §6.2 capability path`);
+      assert.ok(isCapabilityPath(use), `${name}: '${use}' is not a §6.2 capability path`);
     }
   }
 });
 
 test('struck and removed vocabulary is not declared anywhere', () => {
-  const serialized = JSON.stringify(buildServerCapabilities(PLATFORMS, { typingCapable: new Set(['zulip']) }));
+  const serialized = JSON.stringify(buildServerCapabilities({ typing: true }));
   // `channels.observe` was struck in 0.5.0 (inbound content is
   // `channels.incoming`); `afterInference` was removed with §10.5.
   assert.ok(!serialized.includes('channels.observe'), 'channels.observe was struck in 0.5.0');
@@ -39,20 +39,25 @@ test('struck and removed vocabulary is not declared anywhere', () => {
   assert.ok(!serialized.includes('"contextHooks.beforeInference"'));
 });
 
-test('channels.typing is advertised only for a platform whose adapter implements it', () => {
-  const withTyping = buildServerCapabilities(PLATFORMS, { typingCapable: new Set(['zulip']) });
-  assert.equal(withTyping.channels?.typing, true);
-  assert.ok(withTyping.featureSets!['zulip.messaging'].uses.includes('channels.typing'));
-  assert.ok(!withTyping.featureSets!['slack.messaging'].uses.includes('channels.typing'));
+test('channels.typing is advertised only when the adapter implements it', () => {
+  const withTyping = buildServerCapabilities({ typing: true });
+  assert.equal((withTyping.channels as { typing?: boolean }).typing, true);
+  assert.ok(
+    (withTyping.featureSets as Record<string, { uses: string[] }>)['zulip.messaging'].uses.includes('channels.typing'),
+  );
 
-  const withoutTyping = buildServerCapabilities(['slack'], { typingCapable: new Set() });
-  assert.equal(withoutTyping.channels?.typing, false);
+  const withoutTyping = buildServerCapabilities({ typing: false });
+  assert.equal((withoutTyping.channels as { typing?: boolean }).typing, false);
+  assert.ok(
+    !(withoutTyping.featureSets as Record<string, { uses: string[] }>)['zulip.messaging'].uses.includes('channels.typing'),
+  );
 });
 
 test('the manifest advertises injection without observation (§10.1 write-without-read)', () => {
-  const caps = buildServerCapabilities(['zulip'], { typingCapable: new Set(['zulip']) });
-  assert.equal(caps.contextHooks?.beforeInference?.observe, false);
-  assert.deepEqual(caps.contextHooks?.beforeInference?.inject, {
+  const caps = buildServerCapabilities({ typing: true });
+  const hooks = caps.contextHooks as { beforeInference: { observe: boolean; inject: unknown } };
+  assert.equal(hooks.beforeInference.observe, false);
+  assert.deepEqual(hooks.beforeInference.inject, {
     system: false,
     beforeUser: true,
     afterUser: false,
@@ -80,7 +85,7 @@ test('a path the host did not name is denied, and an interior node grants no lea
   assert.equal(grant.has('channels.register'), false);
 });
 
-test('a trailing wildcard covers the paths beneath it (§5.4 recursive walk)', () => {
+test('a `*` wildcard matches exactly one segment (§5.4, pinned 2026-08-02)', () => {
   const grant = new CapabilityGrant();
   grant.apply({ effectiveCapabilities: ['channels.*', 'contextHooks.beforeInference.inject.*'] });
   assert.equal(grant.has('channels.publish'), true);
@@ -88,6 +93,13 @@ test('a trailing wildcard covers the paths beneath it (§5.4 recursive walk)', (
   assert.equal(grant.has('contextHooks.beforeInference.inject.system'), true);
   assert.equal(grant.has('contextHooks.beforeInference.observe'), false);
   assert.equal(grant.has('pushEvents'), false);
+
+  // A trailing `*` is NOT a subtree match: `contextHooks.*` reaches none of
+  // the depth-4 injection leaves. A mistaken narrow pattern can only
+  // under-grant, which the host observes and corrects.
+  const shallow = new CapabilityGrant();
+  shallow.apply({ effectiveCapabilities: ['contextHooks.*'] });
+  assert.equal(shallow.has('contextHooks.beforeInference.inject.beforeUser'), false);
 });
 
 test('an update with no effectiveCapabilities empties the grant rather than leaving it standing', () => {
@@ -100,7 +112,7 @@ test('an update with no effectiveCapabilities empties the grant rather than leav
   assert.ok(receipt.notes.some((n) => n.includes('empty')));
 });
 
-test('a path in both effectiveCapabilities and deniedCapabilities is rejected as malformed (§5.4)', () => {
+test('a path in both effectiveCapabilities and deniedCapabilities is rejected as malformed and fails closed (§5.4)', () => {
   const grant = new CapabilityGrant();
   grant.apply({ effectiveCapabilities: ['channels.publish'] });
 
@@ -115,9 +127,10 @@ test('a path in both effectiveCapabilities and deniedCapabilities is rejected as
   }
   assert.ok(thrown instanceof McplRpcError, 'expected a typed JSON-RPC error');
   assert.equal((thrown as McplRpcError).code, -32602);
-  // The previous grant stands: a malformed message widens nothing and
-  // silently narrows nothing.
-  assert.equal(grant.has('channels.publish'), true);
+  // Fail closed means closed: a malformed policy leaves nothing granted and
+  // no ready state. The previous, wider grant does not survive it.
+  assert.equal(grant.isReady(), false);
+  assert.equal(grant.has('channels.publish'), false);
   assert.equal(grant.has('channels.incoming'), false);
 });
 
@@ -238,19 +251,26 @@ test('a featureSets/update Notification establishes nothing before the initial e
   assert.ok(receipt.notes.some((n) => n.includes('ready state')));
 });
 
-test('a Notification may narrow the grant but never widen it (§6.7)', () => {
+test('a Notification neither widens nor rewrites the grant; only `disabled` reductions apply (§6.7)', () => {
   const grant = new CapabilityGrant(declarations());
-  grant.apply({ effectiveCapabilities: ['channels.register', 'channels.publish'] });
+  grant.apply({ effectiveCapabilities: ['channels.register', 'channels.publish', 'channels.incoming'] });
+  assert.equal(grant.isFeatureSetActive('zulip.messaging'), true);
 
-  grant.apply(
-    { effectiveCapabilities: ['channels.register', 'channels.publish', 'channels.incoming'] },
+  const widening = grant.apply(
+    { effectiveCapabilities: ['channels.register', 'channels.publish', 'channels.incoming', 'tools'] },
     'notification',
   );
-  assert.equal(grant.has('channels.incoming'), false, 'a Notification must not widen');
+  assert.equal(grant.has('tools'), false, 'a Notification must not widen');
+  assert.ok(widening.notes.some((n) => n.includes('effectiveCapabilities')), 'the discarded field is named');
+
+  // A grant carried by an unacknowledgeable message is discarded whole — it
+  // is not read as a narrowing either. Reductions travel as `disabled`.
+  grant.apply({ effectiveCapabilities: ['channels.register'] }, 'notification');
   assert.equal(grant.has('channels.publish'), true);
 
-  grant.apply({ effectiveCapabilities: ['channels.register'] }, 'notification');
-  assert.equal(grant.has('channels.publish'), false, 'a reduction is respected immediately');
+  grant.apply({ disabled: ['zulip.messaging'] }, 'notification');
+  assert.equal(grant.isFeatureSetActive('zulip.messaging'), false, 'a reduction is respected immediately');
+  assert.equal(grant.has('channels.publish'), true, 'the capability grant itself is untouched');
 });
 
 test('the Request form is what expands a grant (§6.7 tell → receipt → activate)', () => {
@@ -259,6 +279,18 @@ test('the Request form is what expands a grant (§6.7 tell → receipt → activ
   assert.equal(grant.has('channels.publish'), false);
   grant.apply({ effectiveCapabilities: ['channels.register', 'channels.publish'] }, 'request');
   assert.equal(grant.has('channels.publish'), true);
+});
+
+test('whenReady resolves on the first grant-bearing Request and never on a Notification', async () => {
+  const grant = new CapabilityGrant(declarations());
+  let ready = false;
+  const waiting = grant.whenReady().then(() => { ready = true; });
+  grant.apply({ effectiveCapabilities: ['channels.register'] }, 'notification');
+  await Promise.resolve();
+  assert.equal(ready, false);
+  grant.apply({ effectiveCapabilities: ['channels.register'] }, 'request');
+  await waiting;
+  assert.equal(ready, true);
 });
 
 test('setDeclarations re-derives degradation without touching the grant (§17.5)', () => {

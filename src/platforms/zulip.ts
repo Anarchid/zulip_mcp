@@ -9,14 +9,35 @@
 
 import type {
   ChannelDescriptor,
-  ChannelIncomingMessage,
-  McplContentBlock,
-  McplContextInjection,
-  McplTextContent,
-} from '../mcpl/types.js';
+  ContentBlock,
+  ContextInjection,
+  IncomingChannelMessage,
+  TextContent,
+} from '@animalabs/mcpl-core';
+import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { PlatformAdapter, PublishResult, RoutingHints, OnIncomingMessage, OnSystemEvent } from './adapter.js';
 import { ZulipEventLoop } from './zulip-events.js';
 import { cleanContent, extractZulipAttachments } from '../content.js';
+
+/** The address every `zulip:` descriptor carries. */
+export interface ZulipChannelAddress {
+  stream_name: string;
+  stream_id: number;
+}
+
+export function zulipChannelId(streamName: string): string {
+  return `zulip:${streamName}`;
+}
+
+/** The stream behind a `zulip:{stream_name}` channel id. */
+export function streamNameOf(channelId: string): string {
+  return channelId.slice('zulip:'.length);
+}
+
+function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChannelAddress> {
+  const address = descriptor?.address;
+  return typeof address === 'object' && address !== null ? (address as Partial<ZulipChannelAddress>) : {};
+}
 
 export class ZulipAdapter implements PlatformAdapter {
   readonly type = 'zulip';
@@ -38,12 +59,13 @@ export class ZulipAdapter implements PlatformAdapter {
       });
       const streams = result.streams || [];
       for (const stream of streams) {
+        const address: ZulipChannelAddress = { stream_name: stream.name, stream_id: stream.stream_id };
         channels.push({
-          id: `zulip:${stream.name}`,
+          id: zulipChannelId(stream.name),
           type: 'zulip',
           label: `#${stream.name}`,
           direction: 'bidirectional',
-          address: { stream_name: stream.name, stream_id: stream.stream_id },
+          address,
           metadata: {
             subscriber_count: stream.subscriber_count,
             is_public: !stream.invite_only,
@@ -59,17 +81,16 @@ export class ZulipAdapter implements PlatformAdapter {
   async publish(
     channelId: string,
     _descriptor: ChannelDescriptor | undefined,
-    content: McplContentBlock[],
+    content: ContentBlock[],
     hints?: RoutingHints,
   ): Promise<PublishResult> {
     const textContent = content
-      .filter((c): c is McplTextContent => c.type === 'text')
+      .filter((c): c is TextContent => c.type === 'text')
       .map(c => c.text)
       .join('\n');
     if (!textContent) return { delivered: false };
 
-    // channelId format: zulip:{stream_name}
-    const streamName = channelId.slice('zulip:'.length);
+    const streamName = streamNameOf(channelId);
 
     // Route to the topic of the most recent incoming message on this channel
     // (in-thread answers); fall back to the 'mcpl' topic when the agent
@@ -111,7 +132,7 @@ export class ZulipAdapter implements PlatformAdapter {
     metadata: Record<string, unknown> | undefined,
     op: 'start' | 'stop',
   ): Promise<void> {
-    const streamId = descriptor?.address?.stream_id as number | undefined;
+    const streamId = addressOf(descriptor).stream_id;
     if (!streamId) {
       console.error(`[zulip-mcp] sendTyping: no stream_id for ${channelId} (descriptor=${descriptor ? 'present' : 'missing'})`);
       return;
@@ -140,8 +161,8 @@ export class ZulipAdapter implements PlatformAdapter {
     channelId: string,
     _descriptor: ChannelDescriptor | undefined,
     historySize: number,
-  ): Promise<McplContextInjection | null> {
-    const streamName = channelId.slice('zulip:'.length);
+  ): Promise<ContextInjection | null> {
+    const streamName = streamNameOf(channelId);
 
     const result = await this.zulipClient.messages.retrieve({
       anchor: 'newest',
@@ -162,7 +183,7 @@ export class ZulipAdapter implements PlatformAdapter {
     }).join('\n');
 
     return {
-      namespace: `zulip:${streamName}`,
+      namespace: zulipChannelId(streamName),
       position: 'beforeUser',
       content: `Recent messages from Zulip #${streamName}:\n${formatted}`,
     };
@@ -172,10 +193,10 @@ export class ZulipAdapter implements PlatformAdapter {
     this.eventLoop = new ZulipEventLoop();
     this.eventLoop.start(this.zulipClient, (streamName, msg, flags) => {
       if (this.selfUserId !== null && msg.sender_id === this.selfUserId) return;
-      const channelId = `zulip:${streamName}`;
+      const channelId = zulipChannelId(streamName);
       const cleaned = cleanContent(msg.content);
       const attachments = extractZulipAttachments(msg.content);
-      const content: McplTextContent[] = [{ type: 'text', text: cleaned }];
+      const content: TextContent[] = [{ type: 'text', text: cleaned }];
       if (attachments.length > 0) {
         // Reference-only by default: agent reads the note, then decides
         // whether to call fetch_attachment to pull bytes into context.
@@ -187,19 +208,33 @@ export class ZulipAdapter implements PlatformAdapter {
           text: `[attachments: ${attachments.length}]\n${lines.join('\n')}`,
         });
       }
-      const incoming: ChannelIncomingMessage = {
+
+      // Zulip's server-computed flag: personal or user-group mention of the
+      // bot. Wildcards (@all/@everyone) deliberately don't count.
+      const mentioned = flags.includes('mentioned');
+
+      // RFC-001 tags: the most specific addressing tag; hosts expand the
+      // umbrellas (chat:mention ⇒ chat:addressed). Sender kind is not on the
+      // event envelope, so from-human/from-bot rides on the email heuristic
+      // Zulip itself uses for bot accounts.
+      const tags: string[] = [mentioned ? CHAT_TAGS.mention : CHAT_TAGS.ambient];
+      if (flags.includes('wildcard_mentioned')) tags.push('zulip:wildcard-mention');
+      tags.push(/-bot@/.test(msg.sender_email) ? CHAT_TAGS.fromBot : CHAT_TAGS.fromHuman);
+      if (attachments.some(a => a.isImage)) tags.push(CHAT_TAGS.hasImage);
+      if (attachments.some(a => !a.isImage)) tags.push(CHAT_TAGS.hasFile);
+
+      const incoming: IncomingChannelMessage = {
         channelId,
         messageId: String(msg.id),
         threadId: msg.subject || undefined,
         author: { id: String(msg.sender_id), name: msg.sender_full_name },
         timestamp: new Date(msg.timestamp * 1000).toISOString(),
         content,
+        tags,
         metadata: {
           senderEmail: msg.sender_email,
           topic: msg.subject,
-          // Zulip's server-computed flag: personal or user-group mention of
-          // the bot. Wildcards (@all/@everyone) deliberately don't count.
-          mentioned: flags.includes('mentioned'),
+          mentioned,
           botUserId: this.selfUserId !== null ? String(this.selfUserId) : this.sessionId,
           ...(attachments.length > 0 ? { attachments } : {}),
         },

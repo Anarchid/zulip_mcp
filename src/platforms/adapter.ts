@@ -1,37 +1,35 @@
 /**
  * PlatformAdapter — the seam between the platform-agnostic MCPL layer
- * (ChannelManager, ContextProvider) and platform-specific clients
- * (Zulip, Discord, Slack, ...).
+ * (ChannelManager, ContextProvider) and the platform-specific client.
  *
- * Each adapter owns one platform connection and is responsible for:
+ * One implementer today (Zulip), but the seam is the documented shape a
+ * platform plugs into, and it costs nothing to keep. An adapter owns one
+ * platform connection and is responsible for:
  *   - discovering channels and describing them (ChannelDescriptor)
  *   - delivering outgoing publishes (with thread routing where supported)
  *   - fetching recent history for context/beforeInference injections
  *   - streaming real-time incoming messages (self-filtered)
  *
- * Channel IDs are prefixed with the adapter's `type` ('zulip:...',
- * 'discord:...', 'slack:...'); the MCPL layer routes purely on that prefix
- * and never inspects the remainder.
+ * Channel IDs are prefixed with the adapter's `type` ('zulip:...'); the MCPL
+ * layer routes purely on that prefix and never inspects the remainder.
  */
 
 import type {
   ChannelDescriptor,
-  ChannelIncomingMessage,
-  McplContentBlock,
-  McplContextInjection,
-} from '../mcpl/types.js';
+  ChannelsPublishResult,
+  ContentBlock,
+  ContextInjection,
+  IncomingChannelMessage,
+} from '@animalabs/mcpl-core';
 
-export interface PublishResult {
-  delivered: boolean;
-  messageId?: string;
-}
+export type PublishResult = ChannelsPublishResult;
 
 /**
  * Routing hints for outgoing messages, derived by the MCPL layer from the
  * most recent incoming message on the target channel. The host's
  * channels/publish carries no thread information, so "reply where the
  * conversation is" is reconstructed server-side: Zulip maps threadId to a
- * topic, Slack to a thread_ts.
+ * topic.
  */
 export interface RoutingHints {
   /** threadId of the last incoming message on this channel, if any. */
@@ -40,7 +38,7 @@ export interface RoutingHints {
   metadata?: Record<string, unknown>;
 }
 
-export type OnIncomingMessage = (message: ChannelIncomingMessage) => void;
+export type OnIncomingMessage = (message: IncomingChannelMessage) => void;
 
 /**
  * Out-of-band condition on a platform connection that the host/agent should
@@ -78,13 +76,13 @@ export interface PlatformAdapter {
   publish(
     channelId: string,
     descriptor: ChannelDescriptor | undefined,
-    content: McplContentBlock[],
+    content: ContentBlock[],
     hints?: RoutingHints,
   ): Promise<PublishResult>;
 
   /**
    * Best-effort typing indicator. Optional — platforms without a usable
-   * typing API (e.g. Slack bots) simply omit it.
+   * typing API simply omit it.
    */
   sendTyping?(
     channelId: string,
@@ -101,7 +99,7 @@ export interface PlatformAdapter {
     channelId: string,
     descriptor: ChannelDescriptor | undefined,
     historySize: number,
-  ): Promise<McplContextInjection | null>;
+  ): Promise<ContextInjection | null>;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own

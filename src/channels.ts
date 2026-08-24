@@ -1,36 +1,49 @@
 /**
  * Channel Manager — Maps platform channels to MCPL channels.
  *
- * Platform-agnostic: routes every operation to a PlatformAdapter by the
- * channel ID prefix (the part before the first ':'). Channel ID formats are
- * owned by the adapters (e.g. zulip:{stream_name}, discord:{guildId}:{channelId},
- * slack:{channelId}).
+ * Routes every operation to a PlatformAdapter by the channel ID prefix (the
+ * part before the first ':'). Channel ID formats are owned by the adapters
+ * (zulip:{stream_name}).
  *
  * Handles registration, open/close lifecycle, incoming message batching,
  * publish routing (with last-incoming thread tracking for in-thread replies),
  * and channel listing.
  */
 
+import { ERR_UNKNOWN_CHANNEL } from '@animalabs/mcpl-core';
 import type {
   ChannelDescriptor,
-  ChannelIncomingMessage,
-  ChannelsPublishParams,
-  ChannelsOpenParams,
   ChannelsCloseParams,
+  ChannelsIncomingResult,
   ChannelsListResult,
+  ChannelsPublishParams,
+  ChannelsPublishResult,
   ChannelsRegisterResult,
-} from './types.js';
-import type { McplClient } from './client.js';
+  IncomingChannelMessage,
+} from '@animalabs/mcpl-core';
 import type { CapabilityGrant } from './grant.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
-import type { PlatformAdapter, PlatformSystemEvent, RoutingHints } from '../platforms/adapter.js';
+import type { PlatformAdapter, PlatformSystemEvent, RoutingHints } from './platforms/adapter.js';
 
 const DEFAULT_BATCH_WINDOW_MS = 500;
+
+/**
+ * The server→host calls the manager makes. Implemented over `McplConnection`
+ * by the server; kept as an interface so the manager is testable without a
+ * transport.
+ */
+export interface HostClient {
+  registerChannels(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult | undefined>;
+  sendIncoming(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined>;
+}
+
+/** Pre-0.5 hosts answered `channels/register` with a flat list of accepted ids. */
+type RegisterResultCompat = Partial<ChannelsRegisterResult> & { registered?: string[] };
 
 export class ChannelManager {
   private allChannels = new Map<string, ChannelDescriptor>();
   private openChannels = new Set<string>();
-  private batchBuffer = new Map<string, ChannelIncomingMessage[]>();
+  private batchBuffer = new Map<string, IncomingChannelMessage[]>();
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private batchWindowMs: number;
   /** Per-channel routing hints from the most recent incoming message,
@@ -43,7 +56,7 @@ export class ChannelManager {
    *   default-allow and absence of a capability is denial.
    */
   constructor(
-    private mcplClient: McplClient,
+    private host: HostClient,
     private adapters: Map<string, PlatformAdapter>,
     private grant: CapabilityGrant,
     batchWindowMs?: number,
@@ -83,7 +96,7 @@ export class ChannelManager {
     if (channels.length === 0) return;
 
     try {
-      const result = await this.mcplClient.registerChannels(channels);
+      const result = await this.host.registerChannels(channels);
       const accepted = this.acceptedIds(result, channels);
       for (const id of accepted) {
         const descriptor = discovered.get(id);
@@ -109,7 +122,7 @@ export class ChannelManager {
    * host explicitly rejected.
    */
   private acceptedIds(
-    result: ChannelsRegisterResult | undefined,
+    result: RegisterResultCompat | undefined,
     submitted: ChannelDescriptor[],
   ): Set<string> {
     if (result && Array.isArray(result.results)) {
@@ -125,22 +138,38 @@ export class ChannelManager {
    * Handle channels/open from the host. Requires `channels.lifecycle` (§14.1);
    * a denied capability behaves as if never advertised (§5.4), so this
    * answers with an error rather than acting.
+   *
+   * An exact `channelId` is preferred; otherwise the first registered channel
+   * of the requested type whose address matches every key the host supplied.
    */
-  openChannel(params: ChannelsOpenParams): { channel: ChannelDescriptor } {
+  openChannel(params: { channelId?: string; type: string; address?: unknown }): { channel: ChannelDescriptor } {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
 
-    // Find channel by type and address
+    if (params.channelId) {
+      const descriptor = this.allChannels.get(params.channelId);
+      if (!descriptor) {
+        throw new McplRpcError(ERR_UNKNOWN_CHANNEL, `Unknown channel: ${params.channelId}`, {
+          channelId: params.channelId,
+        });
+      }
+      this.openChannels.add(descriptor.id);
+      return { channel: descriptor };
+    }
+
+    const wanted = isRecord(params.address) ? params.address : null;
     for (const [id, descriptor] of this.allChannels) {
-      if (descriptor.type === params.type) {
-        const matchesAddress = !params.address ||
-          Object.entries(params.address).every(([k, v]) => descriptor.address?.[k] === v);
-        if (matchesAddress) {
-          this.openChannels.add(id);
-          return { channel: descriptor };
-        }
+      if (descriptor.type !== params.type) continue;
+      const have = isRecord(descriptor.address) ? descriptor.address : {};
+      const matchesAddress = !wanted || Object.entries(wanted).every(([k, v]) => have[k] === v);
+      if (matchesAddress) {
+        this.openChannels.add(id);
+        return { channel: descriptor };
       }
     }
-    throw new Error(`No channel found matching type=${params.type}`);
+    throw new McplRpcError(ERR_UNKNOWN_CHANNEL, `No channel found matching type=${params.type}`, {
+      type: params.type,
+      address: params.address,
+    });
   }
 
   /**
@@ -165,13 +194,13 @@ export class ChannelManager {
    * Called when a new message arrives from a platform.
    * Buffers messages and flushes in batches.
    */
-  onIncomingMessage(channelId: string, message: ChannelIncomingMessage): void {
+  onIncomingMessage(channelId: string, message: IncomingChannelMessage): void {
     if (!this.openChannels.has(channelId)) return; // channel not opened by host
 
     // Remember where the conversation is, so publishes reply in-thread.
     this.lastIncoming.set(channelId, {
       threadId: message.threadId,
-      metadata: message.metadata,
+      metadata: isRecord(message.metadata) ? message.metadata : undefined,
     });
 
     this.enqueue(channelId, message);
@@ -213,13 +242,13 @@ export class ChannelManager {
   /**
    * Handle channels/publish from the host — route to the owning adapter.
    */
-  async publish(params: ChannelsPublishParams): Promise<{ delivered: boolean; messageId?: string }> {
+  async publish(params: ChannelsPublishParams): Promise<ChannelsPublishResult> {
     if (!this.grant.has('channels.publish')) throw capabilityDenied('channels.publish');
 
     const channelId = params.channelId;
     const adapter = this.adapterFor(channelId);
     if (!adapter) {
-      throw new McplRpcError(-32023, `Unknown channel format: ${channelId}`, { channelId });
+      throw new McplRpcError(ERR_UNKNOWN_CHANNEL, `Unknown channel format: ${channelId}`, { channelId });
     }
 
     return adapter.publish(
@@ -288,7 +317,7 @@ export class ChannelManager {
 
   // -- Private --
 
-  private enqueue(channelId: string, message: ChannelIncomingMessage): void {
+  private enqueue(channelId: string, message: IncomingChannelMessage): void {
     let buffer = this.batchBuffer.get(channelId);
     if (!buffer) {
       buffer = [];
@@ -308,7 +337,7 @@ export class ChannelManager {
   }
 
   private async flushBatch(): Promise<void> {
-    const allMessages: ChannelIncomingMessage[] = [];
+    const allMessages: IncomingChannelMessage[] = [];
 
     for (const [, messages] of this.batchBuffer) {
       allMessages.push(...messages);
@@ -329,9 +358,13 @@ export class ChannelManager {
     }
 
     try {
-      await this.mcplClient.sendIncoming(allMessages);
+      await this.host.sendIncoming(allMessages);
     } catch (error) {
       console.error('Failed to send incoming messages to host:', error);
     }
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

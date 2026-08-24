@@ -9,15 +9,15 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ChannelManager } from '../src/mcpl/channels.ts';
-import { ContextProvider } from '../src/mcpl/context.ts';
-import { CapabilityGrant } from '../src/mcpl/grant.ts';
+import { ChannelManager } from '../src/channels.ts';
+import { ContextProvider } from '../src/context.ts';
+import { CapabilityGrant } from '../src/grant.ts';
 import type { PlatformAdapter } from '../src/platforms/adapter.ts';
 import type {
-  BeforeInferenceParams,
+  ContextBeforeInferenceParams,
   ChannelDescriptor,
-  McplContextInjection,
-} from '../src/mcpl/types.ts';
+  ContextInjection,
+} from '@animalabs/mcpl-core';
 
 const DESCRIPTOR: ChannelDescriptor = {
   id: 'zulip:general',
@@ -31,12 +31,12 @@ const client = {
   sendIncoming: async () => {},
 } as any;
 
-function adapterInjecting(position: McplContextInjection['position']): PlatformAdapter {
+function adapterInjecting(position: ContextInjection['position']): PlatformAdapter {
   return {
     type: 'zulip',
     async discoverChannels() { return [DESCRIPTOR]; },
     async publish() { return { delivered: true }; },
-    async fetchContext(): Promise<McplContextInjection> {
+    async fetchContext(): Promise<ContextInjection> {
       return { namespace: 'zulip', position, content: [{ type: 'text', text: 'history' }] };
     },
     startEvents() {},
@@ -44,7 +44,7 @@ function adapterInjecting(position: McplContextInjection['position']): PlatformA
   };
 }
 
-async function setup(effectiveCapabilities: string[], position: McplContextInjection['position'] = 'beforeUser') {
+async function setup(effectiveCapabilities: string[], position: ContextInjection['position'] = 'beforeUser') {
   const grant = new CapabilityGrant({
     'zulip.context': { description: 'x', uses: ['contextHooks.beforeInference.inject.beforeUser'] },
   });
@@ -61,7 +61,7 @@ async function setup(effectiveCapabilities: string[], position: McplContextInjec
 }
 
 /** §10.1: `userMessage` is null whenever `observe` is not granted. */
-const PARAMS: BeforeInferenceParams = {
+const PARAMS: ContextBeforeInferenceParams = {
   inferenceId: 'inf_1',
   conversationId: 'conv_1',
   turnIndex: 0,

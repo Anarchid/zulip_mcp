@@ -6,13 +6,15 @@
  * never silence, and never a result carrying a failure flag. The error tells
  * the peer what happened; it grants nothing and negotiates nothing.
  *
- * Codes (App. A, §14.6):
+ * Codes come from @animalabs/mcpl-core (App. A, §14.6):
  *   -32002 Capability denied — `data: { capability }`
  *   -32017 Channel not permitted
  *   -32023 Unknown channel
  *   -32024 Channel open failed
  *   -32602 Invalid params
  */
+
+import { ERR_CAPABILITY_DENIED } from '@animalabs/mcpl-core';
 
 export class McplRpcError extends Error {
   constructor(
@@ -27,5 +29,5 @@ export class McplRpcError extends Error {
 
 /** §14.6 / §5.4 — the method requires a capability not in the effective grant. */
 export function capabilityDenied(capability: string): McplRpcError {
-  return new McplRpcError(-32002, `Capability denied: ${capability}`, { capability });
+  return new McplRpcError(ERR_CAPABILITY_DENIED, `Capability denied: ${capability}`, { capability });
 }

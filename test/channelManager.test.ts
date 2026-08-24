@@ -6,13 +6,13 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ChannelManager } from '../src/mcpl/channels.ts';
-import { CapabilityGrant } from '../src/mcpl/grant.ts';
+import { ChannelManager } from '../src/channels.ts';
+import { CapabilityGrant } from '../src/grant.ts';
 import type { PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
-import type { ChannelDescriptor, McplContentBlock } from '../src/mcpl/types.ts';
+import type { ChannelDescriptor, ContentBlock } from '@animalabs/mcpl-core';
 
 function fakeAdapter(type: string, descriptors: ChannelDescriptor[]) {
-  const calls: { channelId: string; content: McplContentBlock[]; hints?: RoutingHints }[] = [];
+  const calls: { channelId: string; content: ContentBlock[]; hints?: RoutingHints }[] = [];
   const adapter: PlatformAdapter = {
     type,
     async discoverChannels() { return descriptors; },
@@ -51,23 +51,23 @@ function grantedChannels(): CapabilityGrant {
 }
 
 function makeManager() {
-  const slackDesc: ChannelDescriptor = {
-    id: 'slack:C1',
-    type: 'slack',
-    label: '#general (acme)',
+  const zulipDesc: ChannelDescriptor = {
+    id: 'zulip:C1',
+    type: 'zulip',
+    label: '#general',
     direction: 'bidirectional',
     address: { channel_id: 'C1' },
   };
-  const { adapter, calls } = fakeAdapter('slack', [slackDesc]);
-  const adapters = new Map<string, PlatformAdapter>([['slack', adapter]]);
+  const { adapter, calls } = fakeAdapter('zulip', [zulipDesc]);
+  const adapters = new Map<string, PlatformAdapter>([['zulip', adapter]]);
   const manager = new ChannelManager(fakeMcplClient, adapters, grantedChannels(), 10);
   return { manager, calls };
 }
 
 test('adapterFor routes by channel ID prefix', () => {
   const { manager } = makeManager();
-  assert.equal(manager.adapterFor('slack:C1')?.type, 'slack');
-  assert.equal(manager.adapterFor('discord:g:c'), undefined);
+  assert.equal(manager.adapterFor('zulip:C1')?.type, 'zulip');
+  assert.equal(manager.adapterFor('other:g:c'), undefined);
 });
 
 test('publish throws for unknown channel prefix', async () => {
@@ -82,10 +82,10 @@ test('publish throws for unknown channel prefix', async () => {
 test('publish forwards last-incoming thread hints to the adapter', async () => {
   const { manager, calls } = makeManager();
   await manager.registerChannels();
-  manager.openChannel({ type: 'slack' });
+  manager.openChannel({ type: 'zulip' });
 
-  manager.onIncomingMessage('slack:C1', {
-    channelId: 'slack:C1',
+  manager.onIncomingMessage('zulip:C1', {
+    channelId: 'zulip:C1',
     messageId: '1718012345.000200',
     threadId: '1718000000.000100',
     author: { id: 'U1', name: 'alice' },
@@ -96,12 +96,12 @@ test('publish forwards last-incoming thread hints to the adapter', async () => {
 
   await manager.publish({
     conversationId: '',
-    channelId: 'slack:C1',
+    channelId: 'zulip:C1',
     content: [{ type: 'text', text: 'reply' }],
   });
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].channelId, 'slack:C1');
+  assert.equal(calls[0].channelId, 'zulip:C1');
   assert.equal(calls[0].hints?.threadId, '1718000000.000100');
   assert.equal(calls[0].hints?.metadata?.thread_ts, '1718000000.000100');
   manager.destroy();
@@ -113,7 +113,7 @@ test('publish has no hints before any incoming message', async () => {
 
   await manager.publish({
     conversationId: '',
-    channelId: 'slack:C1',
+    channelId: 'zulip:C1',
     content: [{ type: 'text', text: 'first contact' }],
   });
 
@@ -181,7 +181,7 @@ test('broadcastSystemEvent reaches open channels of the platform without clobber
 
 test('broadcastSystemEvent with no open channels does not throw', () => {
   const { manager } = makeManager();
-  manager.broadcastSystemEvent('slack', { kind: 'degraded', text: 'polling failing' });
+  manager.broadcastSystemEvent('zulip', { kind: 'degraded', text: 'polling failing' });
   manager.destroy();
   assert.ok(true);
 });
@@ -190,28 +190,28 @@ test('broadcastSystemEvent with no open channels does not throw', () => {
 
 function ungatedManager(client: any = fakeMcplClient) {
   const desc: ChannelDescriptor = {
-    id: 'slack:C1',
-    type: 'slack',
-    label: '#general (acme)',
+    id: 'zulip:C1',
+    type: 'zulip',
+    label: '#general',
     direction: 'bidirectional',
     address: { channel_id: 'C1' },
   };
-  const { adapter, calls } = fakeAdapter('slack', [desc]);
+  const { adapter, calls } = fakeAdapter('zulip', [desc]);
   // A grant that names nothing: §5.4 makes absence the denial.
   const grant = new CapabilityGrant();
   grant.apply({ effectiveCapabilities: [] });
-  const manager = new ChannelManager(client, new Map([['slack', adapter]]), grant, 10);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grant, 10);
   return { manager, calls };
 }
 
 test('a channel method whose capability is denied answers -32002, not silence (§6.6, §14.6)', async () => {
   const { manager } = ungatedManager();
   for (const [capability, invoke] of [
-    ['channels.lifecycle', () => manager.openChannel({ type: 'slack' })],
-    ['channels.lifecycle', () => manager.closeChannel({ channelId: 'slack:C1' })],
+    ['channels.lifecycle', () => manager.openChannel({ type: 'zulip' })],
+    ['channels.lifecycle', () => manager.closeChannel({ channelId: 'zulip:C1' })],
     ['channels.register', () => manager.listChannels()],
-    ['channels.publish', () => manager.publish({ conversationId: '', channelId: 'slack:C1', content: [] })],
-    ['channels.typing', () => manager.sendTyping('slack:C1')],
+    ['channels.publish', () => manager.publish({ conversationId: '', channelId: 'zulip:C1', content: [] })],
+    ['channels.typing', () => manager.sendTyping('zulip:C1')],
   ] as [string, () => unknown][]) {
     let thrown: any;
     try {
@@ -241,7 +241,7 @@ test('registration is skipped without channels.register, and nothing is recorded
 test('a descriptor the host rejects is not recorded as registered (§14.5)', async () => {
   const client = {
     registerChannels: async () => ({
-      results: [{ id: 'slack:C1', accepted: false, reason: 'capability_denied' }],
+      results: [{ id: 'zulip:C1', accepted: false, reason: 'capability_denied' }],
     }),
     sendIncoming: async () => {},
   } as any;
@@ -249,39 +249,39 @@ test('a descriptor the host rejects is not recorded as registered (§14.5)', asy
   await manager.registerChannels();
   assert.deepEqual(manager.listChannels().channels, []);
   // ...and a channel that was never registered cannot then be opened.
-  assert.throws(() => manager.openChannel({ type: 'slack' }), /No channel found/);
+  assert.throws(() => manager.openChannel({ type: 'zulip' }), /No channel found/);
   manager.destroy();
 });
 
 test('an itemized accept records exactly the accepted descriptors (§14.5)', async () => {
   const client = {
-    registerChannels: async () => ({ results: [{ id: 'slack:C1', accepted: true }] }),
+    registerChannels: async () => ({ results: [{ id: 'zulip:C1', accepted: true }] }),
     sendIncoming: async () => {},
   } as any;
   const { manager } = makeManagerWith(client);
   await manager.registerChannels();
-  assert.deepEqual(manager.listChannels().channels.map((c) => c.id), ['slack:C1']);
+  assert.deepEqual(manager.listChannels().channels.map((c) => c.id), ['zulip:C1']);
   manager.destroy();
 });
 
 test('inbound batches are dropped, not queued, without channels.incoming (§14.1)', async () => {
   const sent: any[][] = [];
   const client = {
-    registerChannels: async () => ({ results: [{ id: 'slack:C1', accepted: true }] }),
+    registerChannels: async () => ({ results: [{ id: 'zulip:C1', accepted: true }] }),
     sendIncoming: async (messages: any[]) => { sent.push(messages); },
   } as any;
   const desc: ChannelDescriptor = {
-    id: 'slack:C1', type: 'slack', label: '#general', direction: 'bidirectional',
+    id: 'zulip:C1', type: 'zulip', label: '#general', direction: 'bidirectional',
   };
-  const { adapter } = fakeAdapter('slack', [desc]);
+  const { adapter } = fakeAdapter('zulip', [desc]);
   const grant = new CapabilityGrant();
   grant.apply({ effectiveCapabilities: ['channels.register', 'channels.lifecycle'] });
-  const manager = new ChannelManager(client, new Map([['slack', adapter]]), grant, 10);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grant, 10);
 
   await manager.registerChannels();
-  manager.openChannel({ type: 'slack' });
-  manager.onIncomingMessage('slack:C1', {
-    channelId: 'slack:C1',
+  manager.openChannel({ type: 'zulip' });
+  manager.onIncomingMessage('zulip:C1', {
+    channelId: 'zulip:C1',
     messageId: '1',
     author: { id: 'U1', name: 'alice' },
     timestamp: new Date(0).toISOString(),
@@ -295,22 +295,22 @@ test('inbound batches are dropped, not queued, without channels.incoming (§14.1
 
 function makeManagerWith(client: any) {
   const desc: ChannelDescriptor = {
-    id: 'slack:C1',
-    type: 'slack',
-    label: '#general (acme)',
+    id: 'zulip:C1',
+    type: 'zulip',
+    label: '#general',
     direction: 'bidirectional',
     address: { channel_id: 'C1' },
   };
-  const { adapter, calls } = fakeAdapter('slack', [desc]);
-  const manager = new ChannelManager(client, new Map([['slack', adapter]]), grantedChannels(), 10);
+  const { adapter, calls } = fakeAdapter('zulip', [desc]);
+  const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), 10);
   return { manager, calls };
 }
 
 test('incoming messages on unopened channels are ignored', () => {
   const { manager } = makeManager();
   // Channel never opened by host — should not record hints or buffer.
-  manager.onIncomingMessage('slack:C1', {
-    channelId: 'slack:C1',
+  manager.onIncomingMessage('zulip:C1', {
+    channelId: 'zulip:C1',
     messageId: '1',
     author: { id: 'U1', name: 'alice' },
     timestamp: new Date(0).toISOString(),

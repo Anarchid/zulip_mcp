@@ -1,6 +1,6 @@
 {
   "name": "zulip-mcp-server",
-  "version": "2.2.1",
+  "version": "3.0.0",
   "description": "Stateful, ergonomic MCP/MCPL server for Zulip with ambient awareness, persistent monitoring, and natural date-based queries",
   "type": "module",
   "main": "build/index.js",
@@ -39,7 +39,7 @@
     "zuliprc.example"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@animalabs/mcpl-core": "^0.3.0",
     "zulip-js": "^2.1.0"
   },
   "devDependencies": {

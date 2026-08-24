@@ -2,22 +2,22 @@
  * Context Provider — Handles context/beforeInference.
  *
  * Injects recent message history from open channels into the inference
- * context. Platform-agnostic: history fetching/formatting is delegated to
- * the owning PlatformAdapter per channel.
+ * context. History fetching/formatting is delegated to the owning
+ * PlatformAdapter per channel.
  */
 
 import type {
-  BeforeInferenceParams,
-  BeforeInferenceResult,
-  McplContextInjection,
-} from './types.js';
+  ContextBeforeInferenceParams,
+  ContextBeforeInferenceResult,
+  ContextInjection,
+} from '@animalabs/mcpl-core';
 import type { ChannelManager } from './channels.js';
 import type { CapabilityGrant } from './grant.js';
 
 const DEFAULT_HISTORY_SIZE = 20;
 
 /** SPEC §6.2 — the capability path for each injection position. */
-const POSITION_CAPABILITY: Record<McplContextInjection['position'], string> = {
+const POSITION_CAPABILITY: Record<ContextInjection['position'], string> = {
   system: 'contextHooks.beforeInference.inject.system',
   beforeUser: 'contextHooks.beforeInference.inject.beforeUser',
   afterUser: 'contextHooks.beforeInference.inject.afterUser',
@@ -45,8 +45,8 @@ export class ContextProvider {
    * independently at response-receipt (§5.4, §10.8), and a server that must
    * respect a reduction immediately (§6.7) should not be offering them.
    */
-  async handleBeforeInference(_params: BeforeInferenceParams): Promise<BeforeInferenceResult> {
-    const injections: McplContextInjection[] = [];
+  async handleBeforeInference(_params: ContextBeforeInferenceParams): Promise<ContextBeforeInferenceResult> {
+    const injections: ContextInjection[] = [];
     const contributingTypes = new Set<string>();
     const openChannels = this.channelManager.getOpenChannels();
 
