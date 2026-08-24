@@ -18,7 +18,23 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import { fetchAround, fetchHistory, type ZulipMessage } from "./history.js";
+import { fetchAround, fetchHistory, renderReactions, type ReactionSummary, type ZulipMessage } from "./history.js";
+
+/** What of a message's reactions the model may see. */
+export interface ReactionPolicy {
+  suppressed(emojiName: string): boolean;
+  suppressAll(): boolean;
+}
+
+const SHOW_ALL: ReactionPolicy = { suppressed: () => false, suppressAll: () => false };
+
+/** Project reactions through the policy. `unavailable` means the policy
+ *  itself is unusable (broken filters plane) — an empty list that actually
+ *  means "couldn't project" must not read as "none". */
+export function projectReactions(reactions: ReactionSummary[], policy: ReactionPolicy): { reactions: ReactionSummary[]; unavailable: boolean } {
+  if (policy.suppressAll()) return { reactions: [], unavailable: true };
+  return { reactions: reactions.filter((r) => !policy.suppressed(r.name)), unavailable: false };
+}
 
 export interface ChannelState {
   channelName: string;
@@ -116,7 +132,12 @@ function numberOrUndefined(value: unknown): number | undefined {
  * One line per message, id first so the agent can fetch_around(id). The
  * anchor of a fetch_around window is marked so it stands out.
  */
-export function formatHistoryLines(messages: ZulipMessage[], anchorId?: number): string {
+export function formatHistoryLines(
+  messages: ZulipMessage[],
+  anchorId?: number,
+  policy: ReactionPolicy = SHOW_ALL,
+  selfUserId: number | null = null,
+): string {
   if (messages.length === 0) return "(no messages)";
   return messages.map((m) => {
     const ts = m.timestamp.toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -124,7 +145,9 @@ export function formatHistoryLines(messages: ZulipMessage[], anchorId?: number):
     const mark = m.id === anchorId ? " <<" : "";
     const mention = m.mentioned ? " (mention)" : "";
     const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => a.path).join(", ")}]` : "";
-    return `[${ts} id=${m.id}] ${where} ${m.authorName}${mention}: ${m.cleanContent}${att}${mark}`;
+    const projected = projectReactions(m.reactions, policy);
+    const reactions = projected.unavailable ? " [reactions: unavailable]" : renderReactions(projected.reactions, selfUserId);
+    return `[${ts} id=${m.id}] ${where} ${m.authorName}${mention}: ${m.cleanContent}${att}${reactions}${mark}`;
   }).join("\n");
 }
 
@@ -144,6 +167,8 @@ export class ZulipToolRuntime {
   private readonly sessionId: string;
   private readonly monitoredChannels = new Map<string, ChannelState>();
 
+  private reactionPolicy: ReactionPolicy = SHOW_ALL;
+
   constructor(
     private readonly session: ZulipSession,
     private readonly stateDir: string = STATE_DIR,
@@ -151,6 +176,11 @@ export class ZulipToolRuntime {
     this.zulipClient = session.client;
     this.sessionId = session.sessionId;
     this.loadState();
+  }
+
+  /** Reaction suppression for history rendering (the filters plane). */
+  setReactionPolicy(policy: ReactionPolicy): void {
+    this.reactionPolicy = policy;
   }
 
   // ── Persistent monitoring state ──
@@ -594,12 +624,28 @@ export class ZulipToolRuntime {
       case "get_user_profile":
         return await zulipClient.users.me.getProfile();
 
-      case "add_reaction":
-        return await zulipClient.reactions.add({
-          message_id: args.message_id,
-          emoji_name: args.emoji_name,
-          reaction_type: "unicode_emoji",
-        });
+      case "add_reaction": {
+        const emoji = await this.resolveEmoji(String(args.emoji_name ?? ""));
+        const result = await zulipClient.reactions.add({ message_id: args.message_id, ...emoji });
+        if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused the reaction");
+        return result;
+      }
+
+      case "remove_reaction": {
+        const emoji = await this.resolveEmoji(String(args.emoji_name ?? ""));
+        const result = await zulipClient.reactions.remove({ message_id: args.message_id, ...emoji });
+        if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused removing the reaction");
+        return result;
+      }
+
+      case "list_emojis": {
+        const emoji = await this.realmEmoji();
+        const list = Object.values(emoji)
+          .filter((e) => !e.deactivated)
+          .map((e) => ({ name: e.name, id: e.id, token: `:${e.name}:` }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        return { count: list.length, emojis: list };
+      }
 
       case "find_user": {
         const usersResult = await zulipClient.users.retrieve();
@@ -658,7 +704,7 @@ export class ZulipToolRuntime {
           newest_id: page.messages[page.messages.length - 1]?.id ?? null,
           reached_oldest: page.foundOldest,
           reached_newest: page.foundNewest,
-          formatted_history: formatHistoryLines(page.messages),
+          formatted_history: formatHistoryLines(page.messages, undefined, this.reactionPolicy, this.session.selfUserId),
         };
       }
 
@@ -676,7 +722,7 @@ export class ZulipToolRuntime {
           count: page.messages.length,
           oldest_id: page.messages[0]?.id ?? null,
           newest_id: page.messages[page.messages.length - 1]?.id ?? null,
-          formatted_history: formatHistoryLines(page.messages, messageId),
+          formatted_history: formatHistoryLines(page.messages, messageId, this.reactionPolicy, this.session.selfUserId),
         };
       }
 
@@ -694,6 +740,33 @@ export class ZulipToolRuntime {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
+  }
+
+  // ── Emoji resolution ──
+
+  private emojiCache: { at: number; emoji: Record<string, { id: string; name: string; deactivated?: boolean }> } | null = null;
+
+  private async realmEmoji(): Promise<Record<string, { id: string; name: string; deactivated?: boolean }>> {
+    const now = Date.now();
+    if (this.emojiCache && now - this.emojiCache.at < 300_000) return this.emojiCache.emoji;
+    const result = await this.zulipClient.emojis.retrieve();
+    const emoji = (result?.emoji ?? {}) as Record<string, { id: string; name: string; deactivated?: boolean }>;
+    this.emojiCache = { at: now, emoji };
+    return emoji;
+  }
+
+  /** `:name:` or `name` → the reaction params Zulip wants: a realm emoji
+   *  needs its code and type; anything else is tried as unicode by name. */
+  private async resolveEmoji(raw: string): Promise<{ emoji_name: string; emoji_code?: string; reaction_type: string }> {
+    const name = raw.trim().replace(/^:|:$/g, "");
+    if (!name) throw new Error("emoji_name is required");
+    try {
+      const realm = Object.values(await this.realmEmoji()).find((e) => e.name === name && !e.deactivated);
+      if (realm) return { emoji_name: name, emoji_code: realm.id, reaction_type: "realm_emoji" };
+    } catch {
+      // Realm emoji lookup is best-effort; fall through to unicode.
+    }
+    return { emoji_name: name, reaction_type: "unicode_emoji" };
   }
 
   // ── User resolution ──

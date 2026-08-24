@@ -67,6 +67,24 @@ export interface PlatformSystemEvent {
 
 export type OnSystemEvent = (event: PlatformSystemEvent) => void;
 
+/** A reaction added to or removed from a message, resolved to its channel. */
+export interface ReactionEvent {
+  action: 'add' | 'remove';
+  channelId: string;
+  messageId: string;
+  /** Emoji name in the platform's vocabulary (Zulip: 'thumbs_up'). */
+  emoji: string;
+  reactorId: string;
+  reactorName: string;
+  /** The reacted-to message was authored by the bot. */
+  onOwnMessage: boolean;
+  /** One-line snippet of the reacted-to message, or null when unknown. */
+  messageSnippet: string | null;
+  timestamp: Date;
+}
+
+export type OnReaction = (event: ReactionEvent) => void;
+
 /** History request against one channel, in the platform's own id space. */
 export interface ChannelHistoryQuery {
   limit: number;
@@ -136,7 +154,7 @@ export interface PlatformAdapter {
    * out-of-band conditions — delivery gaps, degraded polling — so the host
    * can surface them to the agent instead of losing them in stderr.
    */
-  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent): void;
+  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent, onReaction?: OnReaction): void;
 
   /** Stop event delivery and release platform resources. */
   stopEvents(): void;

@@ -99,6 +99,10 @@ async function main(): Promise<void> {
     filters,
   });
   const tools = new ZulipToolRuntime(session, stateDir);
+  tools.setReactionPolicy({
+    suppressed: (name) => filters.reactionSuppressed(name),
+    suppressAll: () => filters.suppressAllReactions(),
+  });
   const server = new ZulipMcplServer(adapter, tools, {
     serverInfo: SERVER_INFO,
     mcplEnabled: process.env.MCPL_ENABLED !== 'false',

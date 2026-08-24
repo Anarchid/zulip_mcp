@@ -54,7 +54,9 @@ import { buildAttachmentBlocks, type AttachmentSource, type InlineOptions } from
 import type { AttachmentRef } from './content.js';
 import { formatAgentDateTime, resolveAgentTimeZone, resolveTimestampStyle } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
-import type { PlatformAdapter, PlatformSystemEvent } from './platforms/adapter.js';
+import type { PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
+import { CHAT_TAGS } from '@animalabs/mcpl-core';
+import type { ReactionSummary } from './history.js';
 import { toolDefinitions } from './tools.js';
 import { toToolCallResult, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
 
@@ -451,7 +453,7 @@ export class ZulipMcplServer {
         afterMessageId:
           params.history?.sinceLastSeen && watermark !== undefined ? String(watermark) : undefined,
       });
-      result.history = history;
+      result.history = this.projectHistoryReactions(history);
       result.historyTruncated = requested > limit;
       for (const m of history) this.delivery.advance(descriptor.id, Number(m.messageId));
     }
@@ -879,6 +881,25 @@ export class ZulipMcplServer {
             : 'Messages from this stream reach you again by the usual rules (mentions always; ambient when the channel is open).',
         };
       }
+      case 'set_reaction_visibility': {
+        const plane = this.requireFilters();
+        const channelId = this.channelIdArg(args.channel);
+        const visible = args.visible === true;
+        const result = plane.update((f) => {
+          const set = new Set(f.reactionChannels ?? []);
+          if (visible) set.add(channelId);
+          else set.delete(channelId);
+          return { ...f, reactionChannels: [...set] };
+        });
+        if (!result.ok) throw new Error(`set_reaction_visibility refused: ${result.reason}`);
+        return {
+          channelId,
+          visible,
+          note: visible
+            ? 'Reaction visibility ON: reactions in this channel now appear in your context as they happen (they never wake you). Persisted.'
+            : 'Reaction visibility OFF for this channel. Persisted.',
+        };
+      }
       case 'refresh_channels': {
         const { visible, added } = await this.applyFilterChange();
         return {
@@ -935,7 +956,72 @@ export class ZulipMcplServer {
           console.error('[zulip-mcp] system event handling failed:', (err as Error).message);
         });
       },
+      (reaction) => {
+        void this.onReaction(reaction).catch((err) => {
+          console.error('[zulip-mcp] reaction handling failed:', (err as Error).message);
+        });
+      },
     );
+  }
+
+  /**
+   * Reaction visibility is a per-channel opt-in (default off). Reactions
+   * never wake the agent — the reaction tags match no wake policy — and
+   * never advance a watermark; they land in context so the agent sees them
+   * when next active. Suppression is decided before any model-visible text
+   * or the event id exists, so a suppressed reaction leaves no glyph or
+   * name anywhere.
+   */
+  private async onReaction(ev: ReactionEvent): Promise<void> {
+    if (!this.filters || !this.filters.reactionsVisible(ev.channelId)) return;
+    if (this.filters.suppressAllReactions() || this.filters.reactionSuppressed(ev.emoji)) return;
+    if (!this.mcplActive || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
+    const verb = ev.action === 'add' ? 'reacted' : 'removed a reaction';
+    const target = ev.onOwnMessage ? 'your message' : `message ${ev.messageId}`;
+    const quoted = ev.messageSnippet ? ` — "${ev.messageSnippet}"` : '';
+    const line = `[reaction] ${ev.reactorName} ${verb} :${ev.emoji}: on ${target}${quoted}`;
+    const message: IncomingChannelMessage = {
+      channelId: ev.channelId,
+      messageId: `reaction:${ev.action}:${ev.messageId}:${ev.reactorId}:${ev.timestamp.getTime()}`,
+      author: { id: ev.reactorId, name: ev.reactorName },
+      timestamp: ev.timestamp.toISOString(),
+      content: [{ type: 'text', text: line }],
+      tags: [ev.action === 'add' ? CHAT_TAGS.reaction : CHAT_TAGS.reactionRemove],
+      metadata: {
+        reaction: true,
+        action: ev.action,
+        emoji: ev.emoji,
+        targetMessageId: ev.messageId,
+        onOwnMessage: ev.onOwnMessage,
+        isDM: false,
+        mentioned: false,
+      },
+    };
+    if (this.channelManager.isOpen(ev.channelId)) {
+      this.channelManager.onIncomingMessage(ev.channelId, message);
+    } else {
+      await this.pushEvent(message, `zulip_reaction_${ev.action}_${ev.messageId}_${ev.reactorId}_${ev.timestamp.getTime()}`, {
+        reaction: true,
+        action: ev.action,
+        onOwnMessage: ev.onOwnMessage,
+      });
+    }
+  }
+
+  /** Apply reaction suppression to replayed history (channels/open, gap recovery). */
+  private projectHistoryReactions(messages: IncomingChannelMessage[]): IncomingChannelMessage[] {
+    if (!this.filters) return messages;
+    const plane = this.filters;
+    return messages.map((m) => {
+      const meta = (typeof m.metadata === 'object' && m.metadata !== null ? m.metadata : {}) as Record<string, unknown>;
+      if (plane.suppressAllReactions()) {
+        const { reactions: _dropped, ...rest } = meta;
+        return { ...m, metadata: { ...rest, reactionsUnavailable: true } };
+      }
+      const reactions = Array.isArray(meta.reactions) ? (meta.reactions as ReactionSummary[]) : null;
+      if (!reactions) return m;
+      return { ...m, metadata: { ...meta, reactions: reactions.filter((r) => !plane.reactionSuppressed(r.name)) } };
+    });
   }
 
   // ── Server → host ──

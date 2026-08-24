@@ -19,6 +19,8 @@ import {
   isDmChannelId,
   normalizeMessage,
   parseDmChannelId,
+  renderReactions,
+  summarizeReactions,
   tagsFor,
   toIncoming,
   type ZulipRawMessage,
@@ -96,12 +98,19 @@ test('toIncoming renders the incoming shape, with the attachment note as a secon
 /** A zulip-js stand-in that records the query and answers with a fixed page. */
 function fakeClient(rows: ZulipRawMessage[], extra: Record<string, unknown> = {}) {
   const calls: Record<string, unknown>[] = [];
+  const byId: Record<string, unknown>[] = [];
   return {
     calls,
+    byId,
     messages: {
       async retrieve(params: Record<string, unknown>) {
         calls.push(params);
         return { messages: rows, ...extra };
+      },
+      async getById(params: Record<string, unknown>) {
+        byId.push(params);
+        const found = rows.find((r) => r.id === params.message_id);
+        return found ? { result: 'success', message: found } : { result: 'error', msg: 'Invalid message(s)' };
       },
     },
   };
@@ -142,13 +151,22 @@ test('fetchHistory: newest page by default, exclusive cursors, raw markdown, old
   assert.equal(client.calls[3].num_before, 5000);
 });
 
-test('fetchAround centres a window on the anchor with no narrow', async () => {
+test('fetchAround centres a window on the anchor within its own conversation', async () => {
   const client = fakeClient([raw({ id: 41 }), raw({ id: 42 }), raw({ id: 43 })]);
   const page = await fetchAround(client, 42, 50);
   assert.deepEqual(page.messages.map((m) => m.id), [41, 42, 43]);
+  assert.deepEqual(client.byId[0], { message_id: 42, apply_markdown: false });
   assert.deepEqual(client.calls[0], {
-    anchor: 42, num_before: 25, num_after: 25, narrow: [], apply_markdown: false, include_anchor: true,
+    anchor: 42, num_before: 25, num_after: 25, narrow: [['stream', 'general'], ['topic', 'deploys']], apply_markdown: false, include_anchor: true,
   });
+
+  // A DM anchor narrows on its conversation.
+  const dm = fakeClient([raw({ id: 5, type: 'private', display_recipient: [{ id: 790, full_name: 'Bot', email: 'b' }, { id: 42, full_name: 'Bo', email: 'bo' }] })]);
+  await fetchAround(dm, 5, 10);
+  assert.deepEqual(dm.calls[0].narrow, [['dm', [790, 42]]]);
+
+  // An unreadable anchor fails loudly instead of widening to the realm timeline.
+  await assert.rejects(fetchAround(client, 999, 10), /Invalid message/);
 });
 
 test('DM channel ids are the sorted counterpart ids, bot excluded, and round-trip', () => {
@@ -186,4 +204,25 @@ test('fetchHistory narrows on a DM conversation when asked', async () => {
   const client = fakeClient([]);
   await fetchHistory(client, { dmUserIds: [7, 42], limit: 5 });
   assert.deepEqual(client.calls[0].narrow, [['dm', [7, 42]]]);
+});
+
+test('reactions are bucketed by emoji and rendered with counts and self-marking', () => {
+  const raw_ = raw({
+    reactions: [
+      { emoji_name: 'thumbs_up', emoji_code: '1f44d', reaction_type: 'unicode_emoji', user_id: 7 },
+      { emoji_name: 'thumbs_up', emoji_code: '1f44d', reaction_type: 'unicode_emoji', user_id: 790 },
+      { emoji_name: 'eyes', emoji_code: '1f440', reaction_type: 'unicode_emoji', user_id: 9 },
+    ],
+  });
+  const m = normalizeMessage(raw_);
+  assert.deepEqual(m.reactions, [
+    { name: 'thumbs_up', count: 2, userIds: [7, 790] },
+    { name: 'eyes', count: 1, userIds: [9] },
+  ]);
+  assert.equal(renderReactions(m.reactions, 790), ' [reactions: :thumbs_up: x2 (incl. me), :eyes: x1]');
+  assert.equal(renderReactions(m.reactions, null), ' [reactions: :thumbs_up: x2, :eyes: x1]');
+  assert.equal(renderReactions([], 790), '');
+  assert.deepEqual(summarizeReactions(undefined), []);
+  assert.deepEqual((toIncoming('zulip:general', m, { selfUserId: 790, sessionId: 's' }).metadata as { reactions: unknown }).reactions, m.reactions);
+  assert.equal((toIncoming('zulip:general', normalizeMessage(raw()), { selfUserId: 790, sessionId: 's' }).metadata as { reactions?: unknown }).reactions, undefined);
 });

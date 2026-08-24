@@ -23,6 +23,7 @@ import type {
 import type {
   ChannelHistoryQuery,
   OnIncomingMessage,
+  OnReaction,
   OnSystemEvent,
   PlatformAdapter,
   PublishResult,
@@ -56,6 +57,19 @@ export function zulipChannelId(streamName: string): string {
 /** The stream behind a `zulip:{stream_name}` channel id. */
 export function streamNameOf(channelId: string): string {
   return channelId.slice('zulip:'.length);
+}
+
+const SNIPPET_MAX = 80;
+
+/** One line of a message body, whitespace collapsed, capped; null when empty. */
+export function snippetOf(text: string): string | null {
+  const one = text.replace(/\s+/g, ' ').trim();
+  if (!one) return null;
+  return one.length > SNIPPET_MAX ? `${one.slice(0, SNIPPET_MAX - 1)}…` : one;
+}
+
+function isDmChannelIdLocal(channelId: string): boolean {
+  return parseDmChannelId(channelId) !== null;
 }
 
 function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChannelAddress> {
@@ -98,6 +112,10 @@ export class ZulipAdapter implements PlatformAdapter {
   private subscribed = new Set<string>();
   /** DM conversations already described to the server, by channel id. */
   private knownDms = new Map<string, ChannelDescriptor>();
+  /** Recently seen messages, so a reaction can be placed without a round
+   *  trip: id → channel, author, snippet. Bounded; oldest evicted. */
+  private seen = new Map<number, { channelId: string; authorId: number; snippet: string | null }>();
+  private static readonly SEEN_CAP = 2000;
 
   constructor(
     private zulipClient: any,
@@ -184,6 +202,33 @@ export class ZulipAdapter implements PlatformAdapter {
       console.error('Failed to discover Zulip DM conversations:', (error as Error).message);
     }
     return [...this.knownDms.values()];
+  }
+
+  private remember(channelId: string, m: ZulipMessage): void {
+    if (this.seen.size >= ZulipAdapter.SEEN_CAP) {
+      const oldest = this.seen.keys().next().value;
+      if (oldest !== undefined) this.seen.delete(oldest);
+    }
+    this.seen.set(m.id, { channelId, authorId: m.authorId, snippet: snippetOf(m.cleanContent) });
+  }
+
+  /** Where a message lives — from the recent-messages cache, else one GET. */
+  private async locate(messageId: number): Promise<{ channelId: string; authorId: number; snippet: string | null } | null> {
+    const cached = this.seen.get(messageId);
+    if (cached) return cached;
+    try {
+      const result = await this.zulipClient.messages.getById({ message_id: messageId, apply_markdown: false });
+      assertApiSuccess(result, `message ${messageId}`);
+      const raw = result?.message as ZulipRawMessage | undefined;
+      if (!raw) return null;
+      const m = normalizeMessage(raw);
+      const channelId = channelIdOf(m, this.identity.selfUserId);
+      this.remember(channelId, m);
+      return this.seen.get(messageId) ?? null;
+    } catch (err) {
+      console.error(`[zulip-mcp] could not resolve message ${messageId} for a reaction:`, (err as Error).message);
+      return null;
+    }
   }
 
   /** The descriptor for a DM's conversation, remembered once described. */
@@ -321,6 +366,7 @@ export class ZulipAdapter implements PlatformAdapter {
       before: query.beforeMessageId !== undefined ? Number(query.beforeMessageId) : undefined,
       after: query.afterMessageId !== undefined ? Number(query.afterMessageId) : undefined,
     });
+    for (const m of page.messages) this.remember(channelId, m);
     return page.messages
       .filter((m) => this.identity.selfUserId === null || m.authorId !== this.identity.selfUserId)
       .map((m) => toIncoming(channelId, m, this.identity, { backscroll: true }));
@@ -352,11 +398,35 @@ export class ZulipAdapter implements PlatformAdapter {
     }
   }
 
-  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent): void {
+  startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent, onReaction?: OnReaction): void {
     this.eventLoop = new ZulipEventLoop();
+    const reactionHandler = onReaction
+      ? (ev: import('./zulip-events.js').ZulipReactionEvent) => {
+          // The bot's own reactions are its own doing; only others' are news.
+          if (this.identity.selfUserId !== null && ev.user_id === this.identity.selfUserId) return;
+          void this.locate(ev.message_id).then((where) => {
+            if (!where) return;
+            if (!isDmChannelIdLocal(where.channelId) && !this.filters.streamAllowed(streamNameOf(where.channelId))) return;
+            onReaction({
+              action: ev.op,
+              channelId: where.channelId,
+              messageId: String(ev.message_id),
+              emoji: ev.emoji_name,
+              reactorId: String(ev.user_id),
+              reactorName: ev.user?.full_name ?? `user ${ev.user_id}`,
+              onOwnMessage: this.identity.selfUserId !== null && where.authorId === this.identity.selfUserId,
+              messageSnippet: where.snippet,
+              timestamp: new Date(),
+            });
+          });
+        }
+      : undefined;
     this.eventLoop.start(this.zulipClient, (_streamName, msg, flags) => {
-      if (this.identity.selfUserId !== null && msg.sender_id === this.identity.selfUserId) return;
       const m = normalizeMessage({ ...(msg as ZulipRawMessage), flags });
+      // Remember our own messages too: reactions to them are the ones that
+      // matter most ("someone reacted to your message").
+      this.remember(m.isDm ? dmDescriptor(dmCounterparts(m.recipients, this.identity.selfUserId), 0).id : channelIdOf(m, this.identity.selfUserId), m);
+      if (this.identity.selfUserId !== null && msg.sender_id === this.identity.selfUserId) return;
       if (m.isDm) {
         if (!this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail })) {
           console.error(`[zulip-mcp] dropping DM from ${m.authorEmail} (${m.authorId}): not in the dmUsers allowlist`);
@@ -368,7 +438,7 @@ export class ZulipAdapter implements PlatformAdapter {
       }
       if (m.streamName !== null && !this.filters.streamAllowed(m.streamName)) return;
       onMessage(toIncoming(channelIdOf(m, this.identity.selfUserId), m, this.identity));
-    }, onSystemEvent).catch(error => {
+    }, onSystemEvent, reactionHandler).catch(error => {
       console.error('Zulip event loop failed:', error);
     });
   }

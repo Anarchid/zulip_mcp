@@ -29,6 +29,38 @@ export interface ZulipRawMessage {
   stream_id?: number;
   /** The requesting user's flags — `mentioned` is Zulip's server-side verdict. */
   flags?: string[];
+  reactions?: { emoji_name: string; emoji_code?: string; reaction_type?: string; user_id: number }[];
+}
+
+/** One emoji reaction bucket on a message. */
+export interface ReactionSummary {
+  /** Zulip emoji name, e.g. 'thumbs_up' — the `:name:` form is what add_reaction takes. */
+  name: string;
+  count: number;
+  /** Who reacted. */
+  userIds: number[];
+}
+
+export function summarizeReactions(raw: ZulipRawMessage['reactions']): ReactionSummary[] {
+  const buckets = new Map<string, ReactionSummary>();
+  for (const r of raw ?? []) {
+    if (!r || typeof r.emoji_name !== 'string') continue;
+    let b = buckets.get(r.emoji_name);
+    if (!b) {
+      b = { name: r.emoji_name, count: 0, userIds: [] };
+      buckets.set(r.emoji_name, b);
+    }
+    b.count += 1;
+    b.userIds.push(r.user_id);
+  }
+  return [...buckets.values()];
+}
+
+/** ` [reactions: :thumbs_up: x2 (incl. me), :eyes: x1]`, or '' when none. */
+export function renderReactions(reactions: ReactionSummary[], selfUserId: number | null): string {
+  if (reactions.length === 0) return '';
+  const parts = reactions.map((r) => `:${r.name}: x${r.count}${selfUserId !== null && r.userIds.includes(selfUserId) ? ' (incl. me)' : ''}`);
+  return ` [reactions: ${parts.join(', ')}]`;
 }
 
 export interface ZulipRecipient {
@@ -55,6 +87,8 @@ export interface ZulipMessage {
   mentioned: boolean;
   wildcardMentioned: boolean;
   attachments: AttachmentRef[];
+  /** Reactions currently on the message (history fetches carry them; events do not). */
+  reactions: ReactionSummary[];
 }
 
 export interface HistoryQuery {
@@ -168,6 +202,7 @@ export function normalizeMessage(raw: ZulipRawMessage): ZulipMessage {
     mentioned: flags.includes('mentioned'),
     wildcardMentioned: flags.includes('wildcard_mentioned'),
     attachments: extractZulipAttachments(raw.content),
+    reactions: summarizeReactions(raw.reactions),
   };
 }
 
@@ -220,16 +255,27 @@ export async function fetchHistory(zulipClient: any, q: HistoryQuery): Promise<H
 
 /**
  * A window centred on one message: the message itself plus roughly half the
- * window on either side. Message ids are global, so no narrow is needed —
- * the window follows whatever conversation the anchor sits in.
+ * window on either side, WITHIN the anchor's own conversation (its stream
+ * and topic, or its DM). Message ids are realm-global, so without a narrow
+ * Zulip would answer with the realm-wide timeline — neighbours from
+ * unrelated streams, which is not "surrounding context". The anchor is
+ * looked up first to learn where it lives; a message that cannot be read
+ * fails loudly rather than silently widening to everything.
  */
 export async function fetchAround(zulipClient: any, messageId: number, limit: number): Promise<HistoryPage> {
   const half = Math.max(0, Math.floor(Math.min(ZULIP_MAX_PAGE, limit) / 2));
+  const single = await zulipClient.messages.getById({ message_id: messageId, apply_markdown: false });
+  assertApiSuccess(single, `message ${messageId}`);
+  const anchorMsg = single?.message ? normalizeMessage(single.message as ZulipRawMessage) : null;
+  if (!anchorMsg) throw new Error(`message ${messageId} is not readable by this bot`);
+  const narrow = anchorMsg.isDm
+    ? narrowFor({ dmUserIds: anchorMsg.recipients.map((r) => r.id) })
+    : narrowFor({ streamName: anchorMsg.streamName ?? undefined, topic: anchorMsg.topic || undefined });
   const result = await zulipClient.messages.retrieve({
     anchor: messageId,
     num_before: half,
     num_after: half,
-    narrow: [],
+    narrow,
     apply_markdown: false,
     include_anchor: true,
   });
@@ -301,6 +347,7 @@ export function toIncoming(
       isDM: m.isDm,
       botUserId: identity.selfUserId !== null ? String(identity.selfUserId) : identity.sessionId,
       ...(m.attachments.length > 0 ? { attachments: m.attachments } : {}),
+      ...(m.reactions.length > 0 ? { reactions: m.reactions } : {}),
       ...extra,
     },
   };

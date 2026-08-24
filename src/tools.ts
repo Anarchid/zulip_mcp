@@ -319,6 +319,41 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: "remove_reaction",
+    description: "Remove this bot's own emoji reaction from a message.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_id: { type: "number", description: "ID of the message" },
+        emoji_name: { type: "string", description: "Name of the emoji previously added by this bot" },
+      },
+      required: ["message_id", "emoji_name"],
+    },
+  },
+  {
+    name: "list_emojis",
+    description:
+      "List the realm's custom emoji. Use the `name` with add_reaction, or `:name:` inside message content to render it. " +
+      "Standard unicode emoji are always available by name (e.g. 'thumbs_up', 'eyes') and are not listed here.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "set_reaction_visibility",
+    description:
+      "Opt a channel in or out of showing emoji reactions live. When ON, reactions added or removed on ANY message in " +
+      "that channel appear in your context as they happen — but they NEVER wake you; you just see them next time you " +
+      "are active. Default OFF, persisted across restarts. (Reactions on history you fetch always show via " +
+      "fetch_history regardless of this setting.)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Stream name, or channel id ('zulip:general', 'zulip:dm:42')" },
+        visible: { type: "boolean", description: "true = surface live reactions from this channel; false = stop." },
+      },
+      required: ["channel", "visible"],
+    },
+  },
+  {
     name: "find_user",
     description: "Find a Zulip user by name or email to get their ID for mentions. Use @**username** format in messages to mention.",
     inputSchema: {

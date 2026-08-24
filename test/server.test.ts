@@ -27,7 +27,7 @@ import {
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ChannelHistoryQuery, OnIncomingMessage, OnSystemEvent, PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
+import type { ChannelHistoryQuery, OnIncomingMessage, OnReaction, OnSystemEvent, PlatformAdapter, RoutingHints } from '../src/platforms/adapter.ts';
 import { ZulipMcplServer, type ZulipMcplServerOptions } from '../src/server.ts';
 import { FiltersPlane } from '../src/filters.ts';
 import type { ZulipToolRuntime } from '../src/tool-runtime.ts';
@@ -45,6 +45,7 @@ interface FakeAdapter extends PlatformAdapter {
   typing: { channelId: string; op: string }[];
   emit: OnIncomingMessage | null;
   systemEvent: OnSystemEvent | null;
+  react: OnReaction | null;
   /** The stream's messages, oldest first; fetchHistory pages over them by id. */
   history: IncomingChannelMessage[];
   historyCalls: { channelId: string; query: ChannelHistoryQuery }[];
@@ -58,6 +59,7 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     typing: [],
     emit: null,
     systemEvent: null,
+    react: null,
     history: [],
     historyCalls: [],
     subscribed: [],
@@ -78,9 +80,10 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     async fetchContext(channelId): Promise<ContextInjection> {
       return { namespace: channelId, position: 'beforeUser', content: 'recent history' };
     },
-    startEvents(onMessage, onSystemEvent) {
+    startEvents(onMessage, onSystemEvent, onReaction) {
       adapter.emit = onMessage;
       adapter.systemEvent = onSystemEvent ?? null;
+      adapter.react = onReaction ?? null;
     },
     stopEvents() { adapter.emit = null; },
   };
@@ -837,4 +840,64 @@ test('attachments on live delivery are inlined from the configured source', asyn
   assert.equal((content[3] as { text: string }).text, '[image attachment: shot.png]');
   assert.equal((content[4] as { text: string }).text, '[attachment: run.log (8B)]\nlog line');
   await h.close();
+});
+
+test('reactions surface only on channels opted in, never wake, and honour suppression', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zulip-reactions-wire-'));
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const plane = new FiltersPlane(join(dir, 'filters.json'), { ZULIP_SUPPRESSED_REACTIONS_BASELINE: 'biohazard' }, { pollMs: 60_000 });
+    plane.start();
+    const h = harness({ filters: plane });
+    await initialize(h, true);
+    await settled(h);
+    await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+
+    const reaction = (over: Partial<Parameters<OnReaction>[0]> = {}) => h.adapter.react!({
+      action: 'add', channelId: 'zulip:general', messageId: '77', emoji: 'thumbs_up',
+      reactorId: '9', reactorName: 'Ann', onOwnMessage: true, messageSnippet: 'ship it', timestamp: new Date(1_700_000_000_000),
+      ...over,
+    });
+
+    // Default off: nothing surfaces.
+    reaction();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(h.incoming.length, 0);
+
+    const on = JSON.parse(((await h.host.sendRequest('tools/call', { name: 'set_reaction_visibility', arguments: { channel: 'general', visible: true } })) as { content: { text: string }[] }).content[0].text);
+    assert.equal(on.visible, true);
+    assert.deepEqual(plane.current().reactionChannels, ['zulip:general']);
+
+    reaction();
+    await until(() => h.incoming.length === 1, 'reaction on the open channel');
+    const r = h.incoming[0];
+    assert.deepEqual(r.tags, ['chat:reaction']);
+    assert.equal((r.content[0] as { text: string }).text, '[reaction] Ann reacted :thumbs_up: on your message — "ship it"');
+    assert.equal((r.metadata as { reaction: boolean; targetMessageId: string }).targetMessageId, '77');
+    assert.equal(h.server.delivery.watermark('zulip:general'), undefined, 'a reaction never advances the watermark');
+
+    reaction({ action: 'remove', onOwnMessage: false, messageSnippet: null });
+    await until(() => h.incoming.length === 2, 'reaction removal');
+    assert.deepEqual(h.incoming[1].tags, ['chat:reaction-remove']);
+    assert.equal((h.incoming[1].content[0] as { text: string }).text, '[reaction] Ann removed a reaction :thumbs_up: on message 77');
+
+    // Suppressed emoji: no glyph, no event, nowhere.
+    reaction({ emoji: 'biohazard' });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(h.incoming.length, 2);
+
+    // Closed channel with visibility on → push/event.
+    await h.host.sendRequest(method.CHANNELS_CLOSE, { channelId: 'zulip:general' });
+    reaction({ emoji: 'eyes' });
+    await until(() => h.pushed.length === 1, 'reaction push on a closed channel');
+    assert.deepEqual(h.pushed[0].tags, ['chat:reaction']);
+    assert.equal((h.pushed[0].origin as { reaction: boolean }).reaction, true);
+
+    plane.stop();
+    await h.close();
+  } finally {
+    console.error = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -346,3 +346,40 @@ test('a throwing onMessage does not abort the batch or inflate the failure count
   // A handler bug is not a poll failure — no spurious degraded marker.
   assert.equal(systemEvents.filter(e => e.kind === 'degraded').length, 0);
 });
+
+test('reaction events are forwarded to the reaction handler and never to onMessage', async () => {
+  let loop: ZulipEventLoop;
+  const { sleep } = makeSleepRecorder(() => loop, 1);
+  loop = new ZulipEventLoop({ sleep });
+  const registered: Record<string, unknown>[] = [];
+  let polls = 0;
+  const zulipClient = {
+    queues: {
+      register: async (params: Record<string, unknown>) => { registered.push(params); return { queue_id: 'q1', last_event_id: -1 }; },
+    },
+    events: {
+      retrieve: async () => {
+        polls++;
+        if (polls > 1) { loop.stop(); return { events: [] }; }
+        return {
+          events: [
+            { id: 1, type: 'reaction', op: 'add', emoji_name: 'thumbs_up', emoji_code: '1f44d', reaction_type: 'unicode_emoji', message_id: 77, user_id: 9, user: { user_id: 9, full_name: 'Ann', email: 'ann@example.com' } },
+            { id: 2, type: 'reaction', op: 'remove', emoji_name: 'eyes', emoji_code: '1f440', reaction_type: 'unicode_emoji', message_id: 78, user_id: 9 },
+            { id: 3, type: 'heartbeat' },
+          ],
+        };
+      },
+    },
+  };
+  const messages: unknown[] = [];
+  const reactions: { op: string; emoji_name: string; message_id: number; name?: string }[] = [];
+  await loop.start(zulipClient, (_s, m) => { messages.push(m); }, undefined, (ev) => {
+    reactions.push({ op: ev.op, emoji_name: ev.emoji_name, message_id: ev.message_id, name: ev.user?.full_name });
+  });
+  assert.deepEqual(registered[0].event_types, ['message', 'reaction'], 'the queue asks for reactions');
+  assert.deepEqual(messages, []);
+  assert.deepEqual(reactions, [
+    { op: 'add', emoji_name: 'thumbs_up', message_id: 77, name: 'Ann' },
+    { op: 'remove', emoji_name: 'eyes', message_id: 78, name: undefined },
+  ]);
+});
