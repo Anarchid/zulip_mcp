@@ -41,6 +41,8 @@ import {
   type McplInitializeParams,
   type McplInitializeResult,
   type PushEventParams,
+  type StateRollbackParams,
+  type StateRollbackResult,
   type TextContent,
 } from '@animalabs/mcpl-core';
 import { ChannelManager, type HostClient } from './channels.js';
@@ -54,6 +56,7 @@ import { buildAttachmentBlocks, type AttachmentSource, type InlineOptions } from
 import type { AttachmentRef } from './content.js';
 import { formatAgentDateTime, resolveAgentTimeZone, resolveTimestampStyle } from './timezone.js';
 import { CapabilityGrant } from './grant.js';
+import { StateTracker } from './state.js';
 import type { PlatformAdapter, PlatformSystemEvent, ReactionEvent } from './platforms/adapter.js';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import type { ReactionSummary } from './history.js';
@@ -105,6 +108,7 @@ export class ZulipMcplServer {
   readonly channelManager: ChannelManager;
   readonly contextProvider: ContextProvider;
   readonly delivery: DeliveryState;
+  readonly stateTracker = new StateTracker();
 
   private detachManifest: (() => void) | null = null;
   private eventsStarted = false;
@@ -374,7 +378,42 @@ export class ZulipMcplServer {
         case method.CHANNELS_PUBLISH: {
           this.requireMcpl();
           const publish = params as unknown as ChannelsPublishParams;
-          conn.sendResponse(req.id, await this.channelManager.publish(publish));
+          const result = await this.channelManager.publish(publish);
+          if (result.delivered) {
+            const text = publish.content
+              .filter((b): b is TextContent => b.type === 'text')
+              .map((b) => b.text)
+              .join('\n');
+            for (const id of (result as { messageIds?: string[] }).messageIds ?? (result.messageId ? [result.messageId] : [])) {
+              this.stateTracker.recordSent(id, publish.channelId, text);
+            }
+            this.stateTracker.createCheckpoint();
+          }
+          conn.sendResponse(req.id, { delivered: result.delivered, ...(result.messageId ? { messageId: result.messageId } : {}) });
+          break;
+        }
+
+        case method.CHANNELS_ACKNOWLEDGE: {
+          this.requireMcpl();
+          if (!this.grant.has('channels.acknowledge')) throw capabilityDenied('channels.acknowledge');
+          const ack = params as { channelId?: string; messageId?: string; intent?: string; value?: string };
+          if (!ack.channelId || !ack.messageId) throw new McplRpcError(-32602, 'channels/acknowledge requires channelId and messageId');
+          if (!this.adapter.acknowledge) {
+            conn.sendResponse(req.id, { acknowledged: false, reason: 'this surface has no acknowledgment representation' });
+            break;
+          }
+          try {
+            const representation = await this.adapter.acknowledge(ack.channelId, ack.messageId, ack.value);
+            conn.sendResponse(req.id, { acknowledged: true, representation });
+          } catch (error) {
+            conn.sendResponse(req.id, { acknowledged: false, reason: (error as Error).message });
+          }
+          break;
+        }
+
+        case method.STATE_ROLLBACK: {
+          this.requireMcpl();
+          conn.sendResponse(req.id, await this.handleRollback(params as unknown as StateRollbackParams));
           break;
         }
 
@@ -419,6 +458,13 @@ export class ZulipMcplServer {
         case method.CHANNELS_TYPING:
         case 'notifications/typing':
           if (this.mcplActive) await this.typing(params);
+          break;
+
+        case method.CHANNELS_OUTGOING_CHUNK:
+        case method.CHANNELS_OUTGOING_COMPLETE:
+          // Advisory stream of what the host is about to publish. Delivery is
+          // NEVER a side effect of a lifecycle event (§14.5): the only send
+          // path is channels/publish. Nothing to finalize here.
           break;
 
         default:
@@ -719,6 +765,33 @@ export class ZulipMcplServer {
       text,
       metadata: { ...event.metadata, ...(event.kind === 'gap' ? { recoveredMessages: recovered } : {}) },
     });
+  }
+
+  // ── Rollback ──
+
+  private async handleRollback(params: StateRollbackParams): Promise<StateRollbackResult> {
+    if (params.featureSet !== MESSAGING_FEATURE_SET) {
+      return { checkpoint: params.checkpoint, success: false, reason: `Feature set '${params.featureSet}' does not support rollback` };
+    }
+    const toDelete = this.stateTracker.rollback(params.checkpoint);
+    if (toDelete === null) {
+      return { checkpoint: params.checkpoint, success: false, reason: 'Checkpoint not found' };
+    }
+    let deleted = 0;
+    for (const msg of toDelete) {
+      if (!this.adapter.deleteMessage) break;
+      try {
+        await this.adapter.deleteMessage(msg.channelId, msg.messageId);
+        deleted++;
+      } catch {
+        // Best-effort — the message may already be gone, or past the realm's delete window.
+      }
+    }
+    return {
+      checkpoint: params.checkpoint,
+      success: true,
+      ...(deleted < toDelete.length ? { reason: `Rolled back (${deleted}/${toDelete.length} messages deleted)` } : {}),
+    };
   }
 
   // ── Helpers ──

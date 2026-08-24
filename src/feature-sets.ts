@@ -18,6 +18,10 @@
  *   channels.publish   — server.ts handles channels/publish
  *   channels.incoming  — ChannelManager.flushBatch sends channels/incoming
  *   channels.typing    — server.ts handles channels/typing (adapter implements it)
+ *   channels.acknowledge — server.ts handles channels/acknowledge (a reaction)
+ *   channels.streaming — server.ts handles the channels/outgoing/chunk and
+ *                        /complete terminators (finalize-only: delivery is
+ *                        never a side effect of a lifecycle event, §14.5)
  *   pushEvents         — server.ts sends push/event for addressed messages on
  *                        channels the host has not opened, and for the
  *                        reconnect catch-up sweep
@@ -88,6 +92,8 @@ export function buildFeatureSets(options: FeatureSetOptions): Record<string, Fea
     'channels.lifecycle',
     'channels.publish',
     'channels.incoming',
+    'channels.acknowledge',
+    'channels.streaming',
     'pushEvents',
     'tools',
   ];
@@ -97,6 +103,9 @@ export function buildFeatureSets(options: FeatureSetOptions): Record<string, Fea
     [MESSAGING_FEATURE_SET]: {
       description: 'Real-time Zulip message delivery and channel management',
       uses: messagingUses,
+      // §8.1: what this server sent since a checkpoint can be undone
+      // (state/rollback deletes the bot's own messages).
+      rollback: true,
       tagOntology: ZULIP_TAG_ONTOLOGY,
     },
     [HISTORY_FEATURE_SET]: {
@@ -128,6 +137,8 @@ export function buildServerCapabilities(options: FeatureSetOptions): McplManifes
       lifecycle: true,
       publish: true,
       incoming: true,
+      acknowledge: true,
+      streaming: true,
       typing: options.typing,
     },
   };

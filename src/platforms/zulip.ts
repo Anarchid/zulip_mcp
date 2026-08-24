@@ -30,6 +30,7 @@ import type {
   RoutingHints,
 } from './adapter.js';
 import { ZulipEventLoop } from './zulip-events.js';
+import { chunkMessage } from '../content.js';
 import {
   assertApiSuccess,
   channelIdOf,
@@ -94,6 +95,8 @@ export interface ZulipAdapterOptions {
   filters?: FilterView;
   /** How many recent DMs to scan for conversations at startup. */
   dmDiscoveryLimit?: number;
+  /** The realm's max message length; longer publishes are split. */
+  maxMessageLength?: number;
 }
 
 export const DEFAULT_BACKSCROLL = 500;
@@ -108,6 +111,7 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly backscrollLimits: ReadonlyMap<string, number>;
   private readonly filters: FilterView;
   private readonly dmDiscoveryLimit: number;
+  private readonly maxMessageLength: number | undefined;
   /** Streams this process has confirmed a subscription for. */
   private subscribed = new Set<string>();
   /** DM conversations already described to the server, by channel id. */
@@ -128,6 +132,7 @@ export class ZulipAdapter implements PlatformAdapter {
     this.backscrollLimits = options.backscrollLimits ?? new Map();
     this.filters = options.filters ?? ALLOW_ALL;
     this.dmDiscoveryLimit = options.dmDiscoveryLimit ?? DEFAULT_DM_DISCOVERY_LIMIT;
+    this.maxMessageLength = options.maxMessageLength;
   }
 
   /** The history cap for a stream (descriptor `capabilities.history.maxMessages`). */
@@ -253,31 +258,46 @@ export class ZulipAdapter implements PlatformAdapter {
     if (!textContent) return { delivered: false };
 
     const dmIds = parseDmChannelId(channelId);
+    let target: Record<string, unknown>;
+    let what: string;
     if (dmIds) {
-      const result = await this.zulipClient.messages.send({ type: 'private', to: dmIds, content: textContent });
-      assertApiSuccess(result, `direct message to ${channelId}`);
-      return { delivered: true, messageId: String(result.id) };
+      target = { type: 'private', to: dmIds };
+      what = `direct message to ${channelId}`;
+    } else {
+      const streamName = streamNameOf(channelId);
+      // Route to the topic of the most recent incoming message on this channel
+      // (in-thread answers); fall back to the 'mcpl' topic when the agent
+      // initiates the conversation.
+      const topic =
+        (typeof hints?.metadata?.topic === 'string' ? hints.metadata.topic : undefined) ??
+        hints?.threadId ??
+        'mcpl';
+      target = { type: 'stream', to: streamName, topic };
+      what = `message to #${streamName}`;
     }
 
-    const streamName = streamNameOf(channelId);
+    // Zulip rejects anything over the realm's max_message_length; a long
+    // reply goes out as several messages rather than failing whole.
+    const messageIds: string[] = [];
+    for (const chunk of chunkMessage(textContent, this.maxMessageLength)) {
+      const result = await this.zulipClient.messages.send({ ...target, content: chunk });
+      assertApiSuccess(result, what);
+      messageIds.push(String(result.id));
+    }
+    return { delivered: true, messageId: messageIds[messageIds.length - 1], messageIds };
+  }
 
-    // Route to the topic of the most recent incoming message on this channel
-    // (in-thread answers); fall back to the 'mcpl' topic when the agent
-    // initiates the conversation.
-    const topic =
-      (typeof hints?.metadata?.topic === 'string' ? hints.metadata.topic : undefined) ??
-      hints?.threadId ??
-      'mcpl';
+  /** Mark a message as seen: a reaction, 👀 by default. `value` may be an emoji name (':eyes:' / 'eyes'). */
+  async acknowledge(_channelId: string, messageId: string, value?: string): Promise<string> {
+    const name = (value ?? '').trim().replace(/^:|:$/g, '') || 'eyes';
+    const result = await this.zulipClient.reactions.add({ message_id: Number(messageId), emoji_name: name, reaction_type: 'unicode_emoji' });
+    assertApiSuccess(result, `acknowledging message ${messageId}`);
+    return `:${name}:`;
+  }
 
-    const result = await this.zulipClient.messages.send({
-      type: 'stream',
-      to: streamName,
-      topic,
-      content: textContent,
-    });
-    assertApiSuccess(result, `message to #${streamName}`);
-
-    return { delivered: true, messageId: String(result.id) };
+  async deleteMessage(_channelId: string, messageId: string): Promise<void> {
+    const result = await this.zulipClient.messages.deleteById({ message_id: Number(messageId) });
+    assertApiSuccess(result, `deleting message ${messageId}`);
   }
 
   /**

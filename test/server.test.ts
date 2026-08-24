@@ -50,6 +50,8 @@ interface FakeAdapter extends PlatformAdapter {
   history: IncomingChannelMessage[];
   historyCalls: { channelId: string; query: ChannelHistoryQuery }[];
   subscribed: string[];
+  acked: string[];
+  deleted: string[];
 }
 
 function fakeAdapter(withTyping = true): FakeAdapter {
@@ -63,6 +65,8 @@ function fakeAdapter(withTyping = true): FakeAdapter {
     history: [],
     historyCalls: [],
     subscribed: [],
+    acked: [],
+    deleted: [],
     async discoverChannels() { return [DESCRIPTOR]; },
     async fetchHistory(channelId, query) {
       adapter.historyCalls.push({ channelId, query });
@@ -73,9 +77,12 @@ function fakeAdapter(withTyping = true): FakeAdapter {
       return rows.map((m) => ({ ...m, metadata: { ...(m.metadata as object), backscroll: true } }));
     },
     async ensureSubscribed(channelId) { adapter.subscribed.push(channelId); },
+    async acknowledge(_channelId, messageId, value) { adapter.acked.push(`${messageId}:${value ?? ''}`); return `:${value ?? 'eyes'}:`; },
+    async deleteMessage(_channelId, messageId) { adapter.deleted.push(messageId); },
     async publish(channelId, _descriptor, content, hints) {
       adapter.published.push({ channelId, content, hints });
-      return { delivered: true, messageId: '42' };
+      const n = adapter.published.length;
+      return { delivered: true, messageId: String(40 + n), messageIds: [String(40 + n)] };
     },
     async fetchContext(channelId): Promise<ContextInjection> {
       return { namespace: channelId, position: 'beforeUser', content: 'recent history' };
@@ -199,6 +206,8 @@ async function initialize(h: Harness, mcpl: boolean) {
 const FULL_GRANT = [
   'tools',
   'pushEvents',
+  'channels.acknowledge',
+  'channels.streaming',
   'channels.register',
   'channels.lifecycle',
   'channels.publish',
@@ -416,7 +425,7 @@ test('open → incoming with tags → publish routes to the topic of the convers
     channelId: 'zulip:general',
     content: [{ type: 'text', text: 'shipping' }],
   })) as { delivered: boolean; messageId?: string };
-  assert.deepEqual(published, { delivered: true, messageId: '42' });
+  assert.deepEqual(published, { delivered: true, messageId: '41' });
   assert.equal(h.adapter.published.length, 1);
   assert.equal(h.adapter.published[0].hints?.threadId, 'deploys');
   assert.equal((h.adapter.published[0].hints?.metadata as { topic: string }).topic, 'deploys');
@@ -900,4 +909,39 @@ test('reactions surface only on channels opted in, never wake, and honour suppre
     console.error = original;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('rollback deletes what was published after the checkpoint; acknowledge reacts; streaming terminators are inert', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:general', type: 'zulip', address: {} });
+
+  const publish = (text: string) => h.host.sendRequest(method.CHANNELS_PUBLISH, { conversationId: 'c', channelId: 'zulip:general', content: [{ type: 'text', text }] });
+  await publish('one');
+  const afterOne = h.server.stateTracker.current!;
+  await publish('two');
+  await publish('three');
+
+  const unknown = (await h.host.sendRequest(method.STATE_ROLLBACK, { featureSet: 'zulip.messaging', checkpoint: 'chk_nope' })) as { success: boolean; reason?: string };
+  assert.equal(unknown.success, false);
+  assert.match(unknown.reason!, /not found/);
+  const wrongSet = (await h.host.sendRequest(method.STATE_ROLLBACK, { featureSet: 'zulip.context', checkpoint: afterOne })) as { success: boolean };
+  assert.equal(wrongSet.success, false);
+
+  const rolled = (await h.host.sendRequest(method.STATE_ROLLBACK, { featureSet: 'zulip.messaging', checkpoint: afterOne })) as { success: boolean; reason?: string };
+  assert.equal(rolled.success, true);
+  assert.equal(rolled.reason, undefined);
+  assert.deepEqual(h.adapter.deleted, ['42', '43'], 'everything sent after the checkpoint, nothing before');
+
+  const ack = (await h.host.sendRequest(method.CHANNELS_ACKNOWLEDGE, { channelId: 'zulip:general', messageId: '7', intent: 'seen-not-opening', value: 'eyes' })) as { acknowledged: boolean; representation?: string };
+  assert.deepEqual(ack, { acknowledged: true, representation: ':eyes:' });
+  assert.deepEqual(h.adapter.acked, ['7:eyes']);
+
+  // Streaming notifications are accepted and deliver nothing.
+  h.host.sendNotification(method.CHANNELS_OUTGOING_CHUNK, { inferenceId: 'i', conversationId: 'c', channelId: 'zulip:general', index: 0, delta: 'never sent' });
+  h.host.sendNotification(method.CHANNELS_OUTGOING_COMPLETE, { inferenceId: 'i', conversationId: 'c', channelId: 'zulip:general', content: [{ type: 'text', text: 'never sent' }] });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(h.adapter.published.length, 3);
+  await h.close();
 });

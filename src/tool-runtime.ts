@@ -19,6 +19,7 @@ import {
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
 import { fetchAround, fetchHistory, renderReactions, type ReactionSummary, type ZulipMessage } from "./history.js";
+import { chunkMessage } from "./content.js";
 
 /** What of a message's reactions the model may see. */
 export interface ReactionPolicy {
@@ -526,22 +527,31 @@ export class ZulipToolRuntime {
         };
       }
 
-      case "send_message":
-        return await zulipClient.messages.send({
-          type: args.type,
-          to: args.to,
-          topic: args.topic,
-          content: args.content,
-        });
+      case "send_message": {
+        if (typeof args.content !== "string" || !args.content.trim()) throw new Error("content is required");
+        const ids: number[] = [];
+        let last: any = null;
+        for (const chunk of chunkMessage(args.content)) {
+          last = await zulipClient.messages.send({ type: args.type, to: args.to, topic: args.topic, content: chunk });
+          if (last?.result === "error") throw new Error(last.msg ?? "Zulip refused the message");
+          ids.push(last.id);
+        }
+        return ids.length > 1 ? { ...last, ids, note: `Sent as ${ids.length} messages (content exceeded the realm's message length).` } : last;
+      }
 
       case "send_dm": {
         const wanted: string[] = Array.isArray(args.to) ? args.to.map(String) : [String(args.to ?? "")];
         if (wanted.length === 0 || wanted.some((w) => !w.trim())) throw new Error("to must name at least one recipient");
         if (typeof args.content !== "string" || !args.content.trim()) throw new Error("content is required");
         const ids = await Promise.all(wanted.map((w) => this.resolveUserId(w)));
-        const result = await zulipClient.messages.send({ type: "private", to: ids, content: args.content });
-        if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused the message");
-        return { ...result, to_user_ids: ids };
+        const sent: number[] = [];
+        let result: any = null;
+        for (const chunk of chunkMessage(args.content)) {
+          result = await zulipClient.messages.send({ type: "private", to: ids, content: chunk });
+          if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused the message");
+          sent.push(result.id);
+        }
+        return { ...result, to_user_ids: ids, ...(sent.length > 1 ? { ids: sent, note: `Sent as ${sent.length} messages.` } : {}) };
       }
 
       case "edit_message":

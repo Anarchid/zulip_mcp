@@ -22,7 +22,9 @@ import type {
   IncomingChannelMessage,
 } from '@animalabs/mcpl-core';
 
-export type PublishResult = ChannelsPublishResult;
+/** `messageIds` lists every platform message a publish produced (a long
+ *  text is chunked); `messageId` is the last of them. */
+export type PublishResult = ChannelsPublishResult & { messageIds?: string[] };
 
 /**
  * Routing hints for outgoing messages, derived by the MCPL layer from the
@@ -145,6 +147,12 @@ export interface PlatformAdapter {
    * sends stream events to subscribers. Optional; idempotent; best-effort.
    */
   ensureSubscribed?(channelId: string): Promise<void>;
+
+  /** channels/acknowledge — mark a message as seen on the surface (a reaction). Returns the representation used. */
+  acknowledge?(channelId: string, messageId: string, value?: string): Promise<string>;
+
+  /** Delete one of the bot's own messages (rollback). */
+  deleteMessage?(channelId: string, messageId: string): Promise<void>;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own
