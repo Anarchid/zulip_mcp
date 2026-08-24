@@ -1,8 +1,9 @@
 /**
  * Zulip Event Loop — Real-time message delivery via long-polling.
  *
- * Registers an event queue for message events, polls for new messages,
- * and routes them through a callback. Handles queue expiry recovery
+ * Registers an event queue for message events, polls for new messages
+ * (stream messages and direct messages alike), and routes them through a
+ * callback. Handles queue expiry recovery
  * and graceful shutdown.
  *
  * Failure semantics — grounded in what the vendored client stack
@@ -49,8 +50,9 @@ export interface ZulipEventMessage {
 }
 
 /** `flags` are the receiving user's message flags from the event envelope
- * (e.g. 'mentioned', 'wildcard_mentioned') — computed server-side by Zulip. */
-export type OnZulipMessage = (streamName: string, message: ZulipEventMessage, flags: string[]) => void;
+ * (e.g. 'mentioned', 'wildcard_mentioned') — computed server-side by Zulip.
+ * `streamName` is null for direct messages. */
+export type OnZulipMessage = (streamName: string | null, message: ZulipEventMessage, flags: string[]) => void;
 
 /**
  * The shape zulip-js `events.retrieve` resolves to. On success it carries an
@@ -257,14 +259,16 @@ export class ZulipEventLoop {
               ? msg.display_recipient
               : null;
 
-            if (streamName && msg.type === 'stream') {
+            const isStream = msg.type === 'stream' && streamName !== null;
+            const isDm = msg.type === 'private';
+            if (isStream || isDm) {
               // A throwing onMessage is a handler bug, not a poll failure —
               // isolate it so it neither aborts the rest of the batch nor
               // inflates consecutiveFailures toward a bogus 'degraded' marker.
               // The event is already acked (lastEventId advanced); Zulip won't
               // redeliver it, so we log and move on (at-most-once).
               try {
-                onMessage(streamName, msg, event.flags ?? []);
+                onMessage(isStream ? streamName : null, msg, event.flags ?? []);
               } catch (handlerError) {
                 console.error('Zulip event loop: onMessage handler threw:', handlerError);
               }

@@ -179,6 +179,26 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: "send_dm",
+    description:
+      "Send a direct message to a Zulip user, identified by full name, email, or numeric user id. To reply " +
+      "to a DM you received, pass the sender's name or id (both are in the message metadata). Names are " +
+      "matched exactly (case-insensitive); an ambiguous name errors and lists the candidates with their " +
+      "ids, which are always a valid address. For group DMs pass several recipients.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        to: {
+          type: "array",
+          items: { type: "string" },
+          description: "One or more recipients: full name, email, or user id each",
+        },
+        content: { type: "string", description: "The message content (supports Markdown)" },
+      },
+      required: ["to", "content"],
+    },
+  },
+  {
     name: "edit_message",
     description: "Edit the content of an existing Zulip message by ID. You can edit your own messages (subject to the realm's message-edit time limit; an expired window returns an error). Useful for maintaining a live status message: post once with send_message, then update it in place instead of flooding the topic.",
     inputSchema: {

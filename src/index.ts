@@ -18,6 +18,8 @@
  *                                                 catch-up sweep and gap recovery (3000)
  *   ZULIP_BACKSCROLL_DEFAULT                    - history cap per channel on channels/open (500)
  *   ZULIP_BACKSCROLL_CHANNELS                   - per-stream caps, "general:50,dev:200"
+ *   ZULIP_DM_USERS                              - comma-separated user ids/emails allowed to
+ *                                                 DM the bot; unset/empty = anyone
  *   MCPL_ENABLED                                - "false" forces plain-MCP mode
  *   MCPL_BATCH_WINDOW_MS                        - channels/incoming batching window (500)
  *   MCPL_CONTEXT_HISTORY_SIZE                   - messages injected per open channel (20)
@@ -68,6 +70,17 @@ export function parseBackscrollLimits(raw: string | undefined): Map<string, numb
   return out;
 }
 
+/** "12, ann@example.com" → { "12", "ann@example.com" }; emails lower-cased. */
+export function parseUserList(raw: string | undefined): Set<string> {
+  return new Set(
+    (raw ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => (s.includes('@') ? s.toLowerCase() : s)),
+  );
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const tcpIdx = args.indexOf('--tcp');
@@ -82,6 +95,7 @@ async function main(): Promise<void> {
   const adapter = new ZulipAdapter(session.client, session.selfUserId, session.sessionId, {
     backscrollDefault: intEnv('ZULIP_BACKSCROLL_DEFAULT', DEFAULT_BACKSCROLL),
     backscrollLimits: parseBackscrollLimits(process.env.ZULIP_BACKSCROLL_CHANNELS),
+    dmUsers: parseUserList(process.env.ZULIP_DM_USERS),
   });
   const tools = new ZulipToolRuntime(session, stateDir);
   const server = new ZulipMcplServer(adapter, tools, {

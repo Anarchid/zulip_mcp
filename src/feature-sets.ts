@@ -140,6 +140,7 @@ export function buildServerCapabilities(options: FeatureSetOptions): McplManifes
 export function featureSetForTool(toolName: string): string | undefined {
   switch (toolName) {
     case 'send_message':
+    case 'send_dm':
     case 'edit_message':
     case 'delete_message':
     case 'add_reaction':

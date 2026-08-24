@@ -13,6 +13,7 @@
 import { ERR_UNKNOWN_CHANNEL } from '@animalabs/mcpl-core';
 import type {
   ChannelDescriptor,
+  ChannelsChangedParams,
   ChannelsCloseParams,
   ChannelsIncomingResult,
   ChannelsListResult,
@@ -34,6 +35,8 @@ const DEFAULT_BATCH_WINDOW_MS = 500;
  */
 export interface HostClient {
   registerChannels(channels: ChannelDescriptor[]): Promise<ChannelsRegisterResult | undefined>;
+  /** `channels/changed`, Request form (§14.5) — itemized like register. */
+  channelsChanged(params: ChannelsChangedParams): Promise<ChannelsRegisterResult | undefined>;
   sendIncoming(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined>;
 }
 
@@ -110,6 +113,38 @@ export class ChannelManager {
     } catch (error) {
       // The registration never landed, so no descriptor is registered.
       console.error('Failed to register channels:', error);
+    }
+  }
+
+  /**
+   * Register channels that appeared after startup (a DM from a new
+   * conversation, a stream the bot was just added to) via `channels/changed`
+   * (§14.5). Descriptors already known are refreshed locally and NOT
+   * re-announced, so repeat calls do not spam the host. Returns the ids the
+   * host accepted.
+   */
+  async registerAdditional(descriptors: ChannelDescriptor[]): Promise<string[]> {
+    const added: ChannelDescriptor[] = [];
+    for (const d of descriptors) {
+      if (this.allChannels.has(d.id)) {
+        this.allChannels.set(d.id, d);
+      } else {
+        added.push(d);
+      }
+    }
+    if (added.length === 0) return [];
+    if (!this.grant.has('channels.register')) {
+      console.error(`channels.register not granted; ${added.length} new channel(s) stay unregistered`);
+      return [];
+    }
+    try {
+      const result = await this.host.channelsChanged({ added });
+      const accepted = this.acceptedIds(result, added);
+      for (const d of added) if (accepted.has(d.id)) this.allChannels.set(d.id, d);
+      return [...accepted];
+    } catch (error) {
+      console.error('Failed to announce new channels:', error);
+      return [];
     }
   }
 

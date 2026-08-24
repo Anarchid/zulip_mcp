@@ -152,6 +152,9 @@ function harness(opts: { mcpl?: boolean; typing?: boolean; stateDir?: string; se
     } else if (req.method === method.PUSH_EVENT) {
       pushed.push(req.params as PushEventParams);
       host.sendResponse(req.id, { accepted: true });
+    } else if (req.method === method.CHANNELS_CHANGED) {
+      const p = req.params as { added?: ChannelDescriptor[] };
+      host.sendResponse(req.id, { results: (p.added ?? []).map((c) => ({ id: c.id, accepted: true })) });
     } else {
       host.sendError(req.id, -32601, `unexpected ${req.method}`);
     }
@@ -655,5 +658,59 @@ test('a queue-expiry gap is healed from history for open channels before the mar
   assert.equal((marker.metadata as { recoveredMessages: number }).recoveredMessages, 2);
   assert.match((marker.content[0] as { text: string }).text, /2 message\(s\) on open channels were recovered/);
   assert.equal(h.server.delivery.watermark('zulip:general'), 3);
+  await h.close();
+});
+
+test('a DM from a new conversation registers its channel, is pushed with a reply affordance, and can be answered', async () => {
+  const h = harness();
+  await initialize(h, true);
+  await settled(h);
+
+  const dmDesc: ChannelDescriptor = {
+    id: 'zulip:dm:42',
+    type: 'zulip',
+    label: 'DM: Bo',
+    direction: 'bidirectional',
+    address: { dm: true, user_ids: [42], emails: ['bo@example.com'] },
+    metadata: { channelType: 'dm', recipientName: 'Bo', recipientId: '42' },
+  };
+  const dm: IncomingChannelMessage = {
+    channelId: 'zulip:dm:42',
+    messageId: '500',
+    author: { id: '42', name: 'Bo' },
+    timestamp: new Date().toISOString(),
+    content: [{ type: 'text', text: 'hey, got a minute?' }],
+    tags: ['chat:dm', 'chat:private', 'chat:from-human'],
+    metadata: { isDM: true, mentioned: false },
+  };
+  h.adapter.emit!(dm, dmDesc);
+
+  await until(() => h.pushed.length === 1, 'push for the DM');
+  assert.ok(h.hostSaw.some((r) => r.method === method.CHANNELS_CHANGED), 'the new conversation was announced first');
+  const listed = (await h.host.sendRequest(method.CHANNELS_LIST)) as { channels: ChannelDescriptor[] };
+  assert.ok(listed.channels.some((c) => c.id === 'zulip:dm:42'));
+
+  const push = h.pushed[0];
+  assert.equal((push.origin as { isDM: boolean }).isDM, true);
+  assert.equal((push.origin as { stream?: string }).stream, undefined);
+  const first = (push.payload.content[0] as { text: string }).text;
+  assert.match(first, /^<system>Direct message from Bo \(user id 42\)\. To reply, use send_dm\(\["42"\]\) or publish to channel zulip:dm:42/);
+  assert.equal((push.payload.content[1] as { text: string }).text, 'hey, got a minute?');
+
+  // The second message from the same conversation carries no affordance.
+  await until(() => h.server.delivery.watermark('zulip:dm:42') === 500, 'watermark');
+  h.adapter.emit!({ ...dm, messageId: '501', content: [{ type: 'text', text: 'still there?' }] });
+  await until(() => h.pushed.length === 2, 'second push');
+  assert.equal((h.pushed[1].payload.content[0] as { text: string }).text, 'still there?');
+
+  // Opening the DM channel routes the conversation through channels/incoming,
+  // and a publish reaches the adapter with the DM channel id.
+  await h.host.sendRequest(method.CHANNELS_OPEN, { channelId: 'zulip:dm:42', type: 'zulip', address: {} });
+  h.adapter.emit!({ ...dm, messageId: '502', content: [{ type: 'text', text: 'ok' }] });
+  await until(() => h.incoming.length === 1, 'incoming on the open DM');
+  await h.host.sendRequest(method.CHANNELS_PUBLISH, {
+    conversationId: 'c1', channelId: 'zulip:dm:42', content: [{ type: 'text', text: 'here now' }],
+  });
+  assert.equal(h.adapter.published[0].channelId, 'zulip:dm:42');
   await h.close();
 });

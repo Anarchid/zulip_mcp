@@ -10,7 +10,7 @@
  * watermark is just the highest id already forwarded.
  */
 
-import type { IncomingChannelMessage, TextContent } from '@animalabs/mcpl-core';
+import type { ChannelDescriptor, IncomingChannelMessage, TextContent } from '@animalabs/mcpl-core';
 import { CHAT_TAGS } from '@animalabs/mcpl-core';
 import { cleanContent, extractZulipAttachments, type AttachmentRef } from './content.js';
 
@@ -31,12 +31,20 @@ export interface ZulipRawMessage {
   flags?: string[];
 }
 
+export interface ZulipRecipient {
+  id: number;
+  full_name: string;
+  email: string;
+}
+
 /** The normalized, model-facing view of one message. */
 export interface ZulipMessage {
   id: number;
   streamName: string | null;
   topic: string;
   isDm: boolean;
+  /** Every party to a DM (the bot included); empty for stream messages. */
+  recipients: ZulipRecipient[];
   authorId: number;
   authorName: string;
   authorEmail: string;
@@ -53,6 +61,8 @@ export interface HistoryQuery {
   /** Stream to read; omit for a cross-stream window (fetch_around). */
   streamName?: string;
   topic?: string;
+  /** The other parties of a DM conversation (user ids); reads that conversation instead of a stream. */
+  dmUserIds?: number[];
   limit: number;
   /** Exclusive upper id bound — page backwards from here. */
   before?: number;
@@ -83,11 +93,53 @@ export function assertApiSuccess(result: unknown, what: string): void {
   }
 }
 
-function narrowFor(q: Pick<HistoryQuery, 'streamName' | 'topic'>): unknown[] {
+function narrowFor(q: Pick<HistoryQuery, 'streamName' | 'topic' | 'dmUserIds'>): unknown[] {
   const narrow: unknown[] = [];
+  if (q.dmUserIds && q.dmUserIds.length > 0) {
+    narrow.push(['dm', q.dmUserIds]);
+    return narrow;
+  }
   if (q.streamName) narrow.push(['stream', q.streamName]);
   if (q.topic) narrow.push(['topic', q.topic]);
   return narrow;
+}
+
+// ── Direct-message channels ──
+//
+// A DM conversation is identified by its participants other than the bot,
+// as sorted user ids: `zulip:dm:42` for a 1:1, `zulip:dm:7+42` for a group.
+// Ids, not names, because names change and ids are what the send API takes.
+
+export const DM_CHANNEL_PREFIX = 'zulip:dm:';
+
+/** The other parties of a DM (the bot excluded), sorted by id. */
+export function dmCounterparts(recipients: ZulipRecipient[], selfUserId: number | null): ZulipRecipient[] {
+  const others = recipients.filter((r) => selfUserId === null || r.id !== selfUserId);
+  // A DM to oneself has no counterpart; it is its own conversation.
+  const parties = others.length > 0 ? others : recipients;
+  return [...parties].sort((a, b) => a.id - b.id);
+}
+
+export function dmChannelIdFor(userIds: number[]): string {
+  return DM_CHANNEL_PREFIX + [...userIds].sort((a, b) => a - b).join('+');
+}
+
+/** `zulip:dm:7+42` → [7, 42]; null for anything else. */
+export function parseDmChannelId(channelId: string): number[] | null {
+  if (!channelId.startsWith(DM_CHANNEL_PREFIX)) return null;
+  const ids = channelId.slice(DM_CHANNEL_PREFIX.length).split('+').map((s) => Number(s));
+  if (ids.length === 0 || ids.some((n) => !Number.isInteger(n) || n <= 0)) return null;
+  return ids;
+}
+
+export function isDmChannelId(channelId: string): boolean {
+  return parseDmChannelId(channelId) !== null;
+}
+
+/** The channel a message belongs to: its stream, or its DM conversation. */
+export function channelIdOf(m: ZulipMessage, selfUserId: number | null): string {
+  if (m.isDm) return dmChannelIdFor(dmCounterparts(m.recipients, selfUserId).map((r) => r.id));
+  return `zulip:${m.streamName ?? ''}`;
 }
 
 /** Bot accounts in Zulip carry a `-bot@` local part; the event envelope has no is_bot. */
@@ -98,11 +150,15 @@ export function looksLikeBotEmail(email: string): boolean {
 export function normalizeMessage(raw: ZulipRawMessage): ZulipMessage {
   const flags = raw.flags ?? [];
   const isDm = raw.type === 'private';
+  const recipients: ZulipRecipient[] = isDm && Array.isArray(raw.display_recipient)
+    ? raw.display_recipient.map((r) => ({ id: r.id, full_name: r.full_name, email: r.email }))
+    : [];
   return {
     id: raw.id,
     streamName: !isDm && typeof raw.display_recipient === 'string' ? raw.display_recipient : null,
     topic: raw.subject ?? '',
     isDm,
+    recipients,
     authorId: raw.sender_id,
     authorName: raw.sender_full_name,
     authorEmail: raw.sender_email,
@@ -246,6 +302,36 @@ export function toIncoming(
       botUserId: identity.selfUserId !== null ? String(identity.selfUserId) : identity.sessionId,
       ...(m.attachments.length > 0 ? { attachments: m.attachments } : {}),
       ...extra,
+    },
+  };
+}
+
+/**
+ * The descriptor for a DM conversation. `recipientName` / `recipientId`
+ * make DM addressing people-first for hosts that resolve mention tokens
+ * against them; the `address` is what the send API takes.
+ */
+export function dmDescriptor(
+  counterparts: ZulipRecipient[],
+  historyCap: number,
+): ChannelDescriptor {
+  const ids = counterparts.map((r) => r.id);
+  const names = counterparts.map((r) => r.full_name);
+  const single = counterparts.length === 1 ? counterparts[0] : null;
+  return {
+    id: dmChannelIdFor(ids),
+    type: 'zulip',
+    label: single ? `DM: ${single.full_name}` : `Group DM: ${names.join(', ')}`,
+    direction: 'bidirectional',
+    address: { dm: true, user_ids: ids, emails: counterparts.map((r) => r.email) },
+    metadata: {
+      channelType: 'dm',
+      recipientName: single ? single.full_name : names.join(', '),
+      ...(single ? { recipientId: String(single.id), recipientEmail: single.email } : {}),
+      participants: counterparts.map((r) => ({ id: r.id, name: r.full_name, email: r.email })),
+    },
+    capabilities: {
+      history: { maxMessages: historyCap, supportsBeforeMessage: true, supportsSinceLastSeen: true },
     },
   };
 }

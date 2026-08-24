@@ -38,7 +38,12 @@ export interface RoutingHints {
   metadata?: Record<string, unknown>;
 }
 
-export type OnIncomingMessage = (message: IncomingChannelMessage) => void;
+/**
+ * Delivery callback. `newChannel` is set when the message belongs to a
+ * channel the adapter has not described before (a DM from a new
+ * conversation) — the server registers it with the host before routing.
+ */
+export type OnIncomingMessage = (message: IncomingChannelMessage, newChannel?: ChannelDescriptor) => void;
 
 /**
  * Out-of-band condition on a platform connection that the host/agent should

@@ -504,6 +504,16 @@ export class ZulipToolRuntime {
           content: args.content,
         });
 
+      case "send_dm": {
+        const wanted: string[] = Array.isArray(args.to) ? args.to.map(String) : [String(args.to ?? "")];
+        if (wanted.length === 0 || wanted.some((w) => !w.trim())) throw new Error("to must name at least one recipient");
+        if (typeof args.content !== "string" || !args.content.trim()) throw new Error("content is required");
+        const ids = await Promise.all(wanted.map((w) => this.resolveUserId(w)));
+        const result = await zulipClient.messages.send({ type: "private", to: ids, content: args.content });
+        if (result?.result === "error") throw new Error(result.msg ?? "Zulip refused the message");
+        return { ...result, to_user_ids: ids };
+      }
+
       case "edit_message":
         return await zulipClient.messages.update({
           message_id: args.message_id,
@@ -684,6 +694,40 @@ export class ZulipToolRuntime {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
+  }
+
+  // ── User resolution ──
+
+  private userCache: { at: number; members: any[] } | null = null;
+
+  private async members(): Promise<any[]> {
+    const now = Date.now();
+    if (this.userCache && now - this.userCache.at < 60_000) return this.userCache.members;
+    const result = await this.zulipClient.users.retrieve({});
+    const members = Array.isArray(result?.members) ? result.members : [];
+    this.userCache = { at: now, members };
+    return members;
+  }
+
+  /**
+   * A user id from a name, email, or id. Exact, case-insensitive matches
+   * only — a near-miss fails loudly rather than messaging the wrong person,
+   * and an ambiguous name lists the candidates with their ids.
+   */
+  async resolveUserId(query: string): Promise<number> {
+    const q = query.trim();
+    if (/^\d+$/.test(q)) return Number(q);
+    const members = await this.members();
+    const lower = q.toLowerCase();
+    const byEmail = members.filter((u: any) => typeof u.email === "string" && u.email.toLowerCase() === lower);
+    if (byEmail.length === 1) return byEmail[0].user_id;
+    const byName = members.filter((u: any) => typeof u.full_name === "string" && u.full_name.toLowerCase() === lower);
+    if (byName.length === 1) return byName[0].user_id;
+    if (byName.length > 1) {
+      const options = byName.map((u: any) => `${u.full_name} <${u.email}> (id ${u.user_id})`).join("; ");
+      throw new Error(`"${q}" matches ${byName.length} users — pass an id or email instead: ${options}`);
+    }
+    throw new Error(`No user matches "${q}" (by full name, email, or id). Use find_user to search.`);
   }
 
   // ── Resources ──

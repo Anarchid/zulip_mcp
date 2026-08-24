@@ -10,9 +10,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   attachmentNote,
+  channelIdOf,
+  dmChannelIdFor,
+  dmCounterparts,
+  dmDescriptor,
   fetchAround,
   fetchHistory,
+  isDmChannelId,
   normalizeMessage,
+  parseDmChannelId,
   tagsFor,
   toIncoming,
   type ZulipRawMessage,
@@ -143,4 +149,41 @@ test('fetchAround centres a window on the anchor with no narrow', async () => {
   assert.deepEqual(client.calls[0], {
     anchor: 42, num_before: 25, num_after: 25, narrow: [], apply_markdown: false, include_anchor: true,
   });
+});
+
+test('DM channel ids are the sorted counterpart ids, bot excluded, and round-trip', () => {
+  const recipients = [
+    { id: 790, full_name: 'Bot', email: 'x-bot@example.com' },
+    { id: 42, full_name: 'Bo', email: 'bo@example.com' },
+    { id: 7, full_name: 'Al', email: 'al@example.com' },
+  ];
+  assert.deepEqual(dmCounterparts(recipients, 790).map((r) => r.id), [7, 42]);
+  assert.equal(dmChannelIdFor([42, 7]), 'zulip:dm:7+42');
+  assert.deepEqual(parseDmChannelId('zulip:dm:7+42'), [7, 42]);
+  assert.equal(parseDmChannelId('zulip:general'), null);
+  assert.equal(parseDmChannelId('zulip:dm:'), null);
+  assert.equal(parseDmChannelId('zulip:dm:x'), null);
+  assert.equal(isDmChannelId('zulip:dm:42'), true);
+
+  // A self-DM is its own conversation rather than an empty one.
+  assert.deepEqual(dmCounterparts([recipients[0]], 790).map((r) => r.id), [790]);
+
+  const m = normalizeMessage(raw({ type: 'private', display_recipient: recipients, flags: [] }));
+  assert.equal(channelIdOf(m, 790), 'zulip:dm:7+42');
+  assert.equal(channelIdOf(normalizeMessage(raw()), 790), 'zulip:general');
+
+  const single = dmDescriptor(dmCounterparts(recipients.slice(0, 2), 790), 100);
+  assert.equal(single.id, 'zulip:dm:42');
+  assert.equal(single.label, 'DM: Bo');
+  assert.deepEqual(single.address, { dm: true, user_ids: [42], emails: ['bo@example.com'] });
+  assert.equal((single.metadata as { recipientId: string }).recipientId, '42');
+  const group = dmDescriptor(dmCounterparts(recipients, 790), 100);
+  assert.equal(group.label, 'Group DM: Al, Bo');
+  assert.equal((group.metadata as { recipientId?: string }).recipientId, undefined);
+});
+
+test('fetchHistory narrows on a DM conversation when asked', async () => {
+  const client = fakeClient([]);
+  await fetchHistory(client, { dmUserIds: [7, 42], limit: 5 });
+  assert.deepEqual(client.calls[0].narrow, [['dm', [7, 42]]]);
 });

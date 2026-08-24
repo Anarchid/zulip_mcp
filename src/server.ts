@@ -24,6 +24,7 @@ import {
   ManifestTracker,
   McplConnection,
   method,
+  type ChannelsChangedParams,
   type ChannelsCloseParams,
   type ChannelsIncomingResult,
   type ChannelsOpenParams,
@@ -47,6 +48,7 @@ import { ContextProvider } from './context.js';
 import { DeliveryState, renderMissedBlock, selectMissed, viewOf } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
 import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
+import { isDmChannelId } from './history.js';
 import { CapabilityGrant } from './grant.js';
 import type { PlatformAdapter, PlatformSystemEvent } from './platforms/adapter.js';
 import { toolDefinitions } from './tools.js';
@@ -128,6 +130,7 @@ export class ZulipMcplServer {
 
     const host: HostClient = {
       registerChannels: (channels) => this.registerChannelsWithHost(channels),
+      channelsChanged: (params) => this.channelsChangedWithHost(params),
       sendIncoming: (messages) => this.sendIncomingToHost(messages),
     };
     this.channelManager = new ChannelManager(host, this.adapters, this.grant, options.batchWindowMs);
@@ -462,11 +465,29 @@ export class ZulipMcplServer {
    * does not, so the next sweep can still find it if the host opens the
    * channel meanwhile.
    */
-  private async onIncoming(message: IncomingChannelMessage): Promise<void> {
+  private async onIncoming(message: IncomingChannelMessage, newChannel?: ChannelDescriptor): Promise<void> {
     const channelId = message.channelId;
     const id = Number(message.messageId);
     const meta = (typeof message.metadata === 'object' && message.metadata !== null ? message.metadata : {}) as Record<string, unknown>;
     const addressed = meta.mentioned === true || meta.isDM === true;
+
+    // A conversation the host has never seen (a DM from someone new): make
+    // it a registered channel first, so the host can open it and route a
+    // reply back to it.
+    if (newChannel && !this.channelManager.getChannel(channelId)) {
+      await this.channelManager.registerAdditional([newChannel]);
+    }
+
+    // The first message of a DM conversation carries an explicit reply
+    // affordance: DMs have no subscription semantics, and the agent should
+    // not have to discover the send path by trial.
+    if (meta.isDM === true && this.delivery.watermark(channelId) === undefined) {
+      const authorId = message.author.id;
+      const note = `<system>Direct message from ${message.author.name} (user id ${authorId}). ` +
+        `To reply, use send_dm(["${authorId}"]) or publish to channel ${channelId}. ` +
+        `DMs always reach you; there is nothing to subscribe to.</system>`;
+      message = { ...message, content: [{ type: 'text', text: note }, ...message.content] };
+    }
 
     if (this.channelManager.isOpen(channelId)) {
       this.channelManager.onIncomingMessage(channelId, message);
@@ -507,7 +528,9 @@ export class ZulipMcplServer {
         source: 'zulip',
         mcplChannelId: message.channelId,
         messageId: message.messageId,
-        stream: message.channelId.startsWith('zulip:') ? message.channelId.slice('zulip:'.length) : undefined,
+        stream: !isDmChannelId(message.channelId) && message.channelId.startsWith('zulip:')
+          ? message.channelId.slice('zulip:'.length)
+          : undefined,
         topic: meta.topic,
         authorId: message.author.id,
         authorName: message.author.name,
@@ -559,7 +582,7 @@ export class ZulipMcplServer {
       if (msgs.length === 0) continue;
       const newestId = Number(msgs[msgs.length - 1].messageId);
       const views = msgs.map(viewOf);
-      const keepAll = this.delivery.wasOpen(channelId);
+      const keepAll = this.delivery.wasOpen(channelId) || isDmChannelId(channelId);
       const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
       if (kept.length === 0) {
         // Nothing to deliver, but advance the anchor so these are not re-scanned.
@@ -567,7 +590,9 @@ export class ZulipMcplServer {
         continue;
       }
       const mentionCount = views.filter((v) => v.mentioned).length;
-      const streamName = channelId.startsWith('zulip:') ? channelId.slice('zulip:'.length) : channelId;
+      const streamName = isDmChannelId(channelId)
+        ? (this.channelManager.getChannel(channelId)?.label ?? channelId)
+        : channelId.slice('zulip:'.length);
       const block = renderMissedBlock(kept, {
         streamName,
         channelId,
@@ -582,7 +607,7 @@ export class ZulipMcplServer {
         timestamp: new Date().toISOString(),
         content: [{ type: 'text', text: block } satisfies TextContent],
         tags: ['zulip:missed', ...(mentionCount > 0 ? ['chat:mention'] : ['chat:ambient'])],
-        metadata: { missed: true, topic: undefined, mentioned: mentionCount > 0, isDM: false },
+        metadata: { missed: true, topic: undefined, mentioned: mentionCount > 0, isDM: isDmChannelId(channelId) },
       };
       const ok = await this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
         missed: true,
@@ -749,8 +774,8 @@ export class ZulipMcplServer {
     if (this.eventsStarted) return;
     this.eventsStarted = true;
     this.adapter.startEvents(
-      (message) => {
-        void this.onIncoming(message).catch((err) => {
+      (message, newChannel) => {
+        void this.onIncoming(message, newChannel).catch((err) => {
           console.error('[zulip-mcp] inbound delivery failed:', (err as Error).message);
         });
       },
@@ -768,6 +793,12 @@ export class ZulipMcplServer {
     const conn = this.conn;
     if (!conn) throw new Error('not connected');
     return (await conn.sendRequest(method.CHANNELS_REGISTER, { channels })) as ChannelsRegisterResult | undefined;
+  }
+
+  private async channelsChangedWithHost(params: ChannelsChangedParams): Promise<ChannelsRegisterResult | undefined> {
+    const conn = this.conn;
+    if (!conn) throw new Error('not connected');
+    return (await conn.sendRequest(method.CHANNELS_CHANGED, params)) as ChannelsRegisterResult | undefined;
   }
 
   private async sendIncomingToHost(messages: IncomingChannelMessage[]): Promise<ChannelsIncomingResult | undefined> {
