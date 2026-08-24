@@ -62,6 +62,15 @@ export interface PlatformSystemEvent {
 
 export type OnSystemEvent = (event: PlatformSystemEvent) => void;
 
+/** History request against one channel, in the platform's own id space. */
+export interface ChannelHistoryQuery {
+  limit: number;
+  /** Exclusive: only messages older than this id. */
+  beforeMessageId?: string;
+  /** Exclusive: only messages newer than this id. */
+  afterMessageId?: string;
+}
+
 export interface PlatformAdapter {
   /** Channel ID prefix and ChannelDescriptor.type, e.g. 'zulip'. */
   readonly type: string;
@@ -100,6 +109,19 @@ export interface PlatformAdapter {
     descriptor: ChannelDescriptor | undefined,
     historySize: number,
   ): Promise<ContextInjection | null>;
+
+  /**
+   * Channel history as incoming-shaped messages, oldest first. Optional —
+   * without it channels/open cannot return backscroll and the reconnect
+   * sweep has nothing to scan.
+   */
+  fetchHistory?(channelId: string, query: ChannelHistoryQuery): Promise<IncomingChannelMessage[]>;
+
+  /**
+   * Make sure the platform delivers events for this channel — Zulip only
+   * sends stream events to subscribers. Optional; idempotent; best-effort.
+   */
+  ensureSubscribed?(channelId: string): Promise<void>;
 
   /**
    * Start delivering real-time messages. Adapters filter the bot's own

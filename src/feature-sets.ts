@@ -6,6 +6,7 @@
  * `mcpl/manifest`.
  *
  *   zulip.messaging — real-time delivery + channel management
+ *   zulip.history   — reading back through streams (tools)
  *   zulip.context   — history injection before inference
  *
  * `uses` is a closed vocabulary in 0.5 (§6.2) and derivation is fail-closed
@@ -17,15 +18,15 @@
  *   channels.publish   — server.ts handles channels/publish
  *   channels.incoming  — ChannelManager.flushBatch sends channels/incoming
  *   channels.typing    — server.ts handles channels/typing (adapter implements it)
+ *   pushEvents         — server.ts sends push/event for addressed messages on
+ *                        channels the host has not opened, and for the
+ *                        reconnect catch-up sweep
  *   tools              — the MCP tool surface of this server
  *   contextHooks.beforeInference.inject.beforeUser
  *                      — ContextProvider returns injections, all at
  *                        position 'beforeUser' (platforms/zulip.ts fetchContext)
  *
  * Deliberately NOT declared:
- *   pushEvents  — nothing in this server ever sends `push/event`; platform
- *                 system events are delivered as channels/incoming messages
- *                 (ChannelManager.broadcastSystemEvent → enqueue → flushBatch).
  *   contextHooks.beforeInference.observe
  *               — ContextProvider.handleBeforeInference ignores its params
  *                 entirely, so it never reads `userMessage` (§10.1).
@@ -42,6 +43,7 @@ import type {
 } from '@animalabs/mcpl-core';
 
 export const MESSAGING_FEATURE_SET = 'zulip.messaging';
+export const HISTORY_FEATURE_SET = 'zulip.history';
 export const CONTEXT_FEATURE_SET = 'zulip.context';
 
 export interface FeatureSetOptions {
@@ -60,12 +62,22 @@ export interface FeatureSetOptions {
  */
 export const ZULIP_TAG_ONTOLOGY: TagOntology = {
   coreTags: [
-    'chat:addressed', 'chat:mention', 'chat:dm', 'chat:ambient',
+    'chat:addressed', 'chat:mention', 'chat:dm', 'chat:private', 'chat:ambient',
     'chat:from-human', 'chat:from-bot',
     'chat:has-image', 'chat:has-file',
   ],
-  // Zulip-specific extensions (e.g. zulip:wildcard-mention) may be emitted;
-  // consumers should tolerate undeclared tags.
+  tags: {
+    'zulip:wildcard-mention': {
+      desc: 'An @all / @everyone / @stream wildcard reached the bot; never counts as addressed.',
+      facet: 'addressing',
+    },
+    'zulip:missed': {
+      desc: 'Catch-up delivery of messages that arrived while the server was offline.',
+      facet: 'lifecycle',
+    },
+  },
+  // Zulip-specific extensions may be emitted; consumers should tolerate
+  // undeclared tags.
   open: true,
 };
 
@@ -75,6 +87,7 @@ export function buildFeatureSets(options: FeatureSetOptions): Record<string, Fea
     'channels.lifecycle',
     'channels.publish',
     'channels.incoming',
+    'pushEvents',
     'tools',
   ];
   if (options.typing) messagingUses.push('channels.typing');
@@ -84,6 +97,10 @@ export function buildFeatureSets(options: FeatureSetOptions): Record<string, Fea
       description: 'Real-time Zulip message delivery and channel management',
       uses: messagingUses,
       tagOntology: ZULIP_TAG_ONTOLOGY,
+    },
+    [HISTORY_FEATURE_SET]: {
+      description: 'Read back through Zulip stream history',
+      uses: ['tools'],
     },
     [CONTEXT_FEATURE_SET]: {
       description: 'Zulip message history injection before inference',
@@ -95,6 +112,7 @@ export function buildFeatureSets(options: FeatureSetOptions): Record<string, Fea
 export function buildServerCapabilities(options: FeatureSetOptions): McplManifest {
   return {
     version: '0.5',
+    pushEvents: true,
     contextHooks: {
       beforeInference: {
         // Injection without observation — the write-without-read shape of
@@ -129,7 +147,13 @@ export function featureSetForTool(toolName: string): string | undefined {
     case 'unlisten':
     case 'start_monitoring':
     case 'stop_monitoring':
+    case 'channel_missed':
       return MESSAGING_FEATURE_SET;
+    case 'fetch_history':
+    case 'fetch_around':
+    case 'get_channel_history':
+    case 'get_unread_messages':
+      return HISTORY_FEATURE_SET;
     default:
       return undefined;
   }

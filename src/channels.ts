@@ -144,7 +144,16 @@ export class ChannelManager {
    */
   openChannel(params: { channelId?: string; type: string; address?: unknown }): { channel: ChannelDescriptor } {
     if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
+    const descriptor = this.findChannel(params);
+    this.openChannels.add(descriptor.id);
+    return { channel: descriptor };
+  }
 
+  /**
+   * Find the descriptor channels/open names without opening it — for callers
+   * that must do work (fetch history) before committing the lifecycle.
+   */
+  findChannel(params: { channelId?: string; type: string; address?: unknown }): ChannelDescriptor {
     if (params.channelId) {
       const descriptor = this.allChannels.get(params.channelId);
       if (!descriptor) {
@@ -152,24 +161,28 @@ export class ChannelManager {
           channelId: params.channelId,
         });
       }
-      this.openChannels.add(descriptor.id);
-      return { channel: descriptor };
+      return descriptor;
     }
-
     const wanted = isRecord(params.address) ? params.address : null;
-    for (const [id, descriptor] of this.allChannels) {
+    for (const descriptor of this.allChannels.values()) {
       if (descriptor.type !== params.type) continue;
       const have = isRecord(descriptor.address) ? descriptor.address : {};
-      const matchesAddress = !wanted || Object.entries(wanted).every(([k, v]) => have[k] === v);
-      if (matchesAddress) {
-        this.openChannels.add(id);
-        return { channel: descriptor };
-      }
+      if (!wanted || Object.entries(wanted).every(([k, v]) => have[k] === v)) return descriptor;
     }
     throw new McplRpcError(ERR_UNKNOWN_CHANNEL, `No channel found matching type=${params.type}`, {
       type: params.type,
       address: params.address,
     });
+  }
+
+  /** Commit the open half of the lifecycle. Requires `channels.lifecycle`. */
+  markOpen(channelId: string): void {
+    if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
+    this.openChannels.add(channelId);
+  }
+
+  isOpen(channelId: string): boolean {
+    return this.openChannels.has(channelId);
   }
 
   /**

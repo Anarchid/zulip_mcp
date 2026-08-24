@@ -12,16 +12,24 @@
  *   ZULIP_RC_PATH                               - alternative: a zuliprc file
  *   ZULIP_SESSION_ID                            - persistent monitoring state id
  *   ZULIP_SUBSCRIBE                             - comma-separated streams to join on startup
+ *   ZULIP_STATE_DIR                             - where monitoring + delivery state lives
+ *                                                 (default ~/.zulip_mcp_state)
+ *   ZULIP_CATCHUP_LIMIT                         - per-channel ceiling for the reconnect
+ *                                                 catch-up sweep and gap recovery (3000)
+ *   ZULIP_BACKSCROLL_DEFAULT                    - history cap per channel on channels/open (500)
+ *   ZULIP_BACKSCROLL_CHANNELS                   - per-stream caps, "general:50,dev:200"
  *   MCPL_ENABLED                                - "false" forces plain-MCP mode
  *   MCPL_BATCH_WINDOW_MS                        - channels/incoming batching window (500)
  *   MCPL_CONTEXT_HISTORY_SIZE                   - messages injected per open channel (20)
  */
 
 import * as net from 'node:net';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { isMainModule } from './content.js';
-import { ZulipAdapter } from './platforms/zulip.js';
-import { ZulipMcplServer } from './server.js';
+import { DEFAULT_BACKSCROLL, ZulipAdapter } from './platforms/zulip.js';
+import { DEFAULT_CATCHUP_LIMIT, ZulipMcplServer } from './server.js';
 import { ZulipToolRuntime } from './tool-runtime.js';
 import { initializeZulipClient } from './zulip-client.js';
 
@@ -29,6 +37,36 @@ export { fetchAttachmentBytes, extractZulipAttachments, cleanContent } from './c
 export { formatMessages } from './tool-runtime.js';
 
 const SERVER_INFO = { name: 'zulip-mcp-server', version: '3.0.0' };
+
+function intEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) {
+    console.error(`[zulip-mcp] ignoring ${name}=${JSON.stringify(raw)} (not a non-negative integer); using ${fallback}`);
+    return fallback;
+  }
+  return n;
+}
+
+/** "general:50,dev:200" → Map { general → 50, dev → 200 }. Bad entries are reported and skipped. */
+export function parseBackscrollLimits(raw: string | undefined): Map<string, number> {
+  const out = new Map<string, number>();
+  if (!raw) return out;
+  for (const entry of raw.split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const sep = trimmed.lastIndexOf(':');
+    const name = sep > 0 ? trimmed.slice(0, sep).trim() : '';
+    const n = sep > 0 ? parseInt(trimmed.slice(sep + 1), 10) : NaN;
+    if (!name || !Number.isFinite(n) || n < 0) {
+      console.error(`[zulip-mcp] ignoring ZULIP_BACKSCROLL_CHANNELS entry ${JSON.stringify(trimmed)} (want "stream:limit")`);
+      continue;
+    }
+    out.set(name.replace(/^#/, ''), n);
+  }
+  return out;
+}
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -40,13 +78,20 @@ async function main(): Promise<void> {
   }
 
   const session = await initializeZulipClient();
-  const adapter = new ZulipAdapter(session.client, session.selfUserId, session.sessionId);
-  const tools = new ZulipToolRuntime(session);
+  const stateDir = process.env.ZULIP_STATE_DIR || join(homedir(), '.zulip_mcp_state');
+  const adapter = new ZulipAdapter(session.client, session.selfUserId, session.sessionId, {
+    backscrollDefault: intEnv('ZULIP_BACKSCROLL_DEFAULT', DEFAULT_BACKSCROLL),
+    backscrollLimits: parseBackscrollLimits(process.env.ZULIP_BACKSCROLL_CHANNELS),
+  });
+  const tools = new ZulipToolRuntime(session, stateDir);
   const server = new ZulipMcplServer(adapter, tools, {
     serverInfo: SERVER_INFO,
     mcplEnabled: process.env.MCPL_ENABLED !== 'false',
-    batchWindowMs: parseInt(process.env.MCPL_BATCH_WINDOW_MS || '500', 10),
-    contextHistorySize: parseInt(process.env.MCPL_CONTEXT_HISTORY_SIZE || '20', 10),
+    batchWindowMs: intEnv('MCPL_BATCH_WINDOW_MS', 500),
+    contextHistorySize: intEnv('MCPL_CONTEXT_HISTORY_SIZE', 20),
+    stateDir,
+    sessionId: session.sessionId,
+    catchupLimit: intEnv('ZULIP_CATCHUP_LIMIT', DEFAULT_CATCHUP_LIMIT),
   });
 
   if (tcpPort) {

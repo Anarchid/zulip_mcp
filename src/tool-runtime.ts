@@ -18,6 +18,7 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
+import { fetchAround, fetchHistory, type ZulipMessage } from "./history.js";
 
 export interface ChannelState {
   channelName: string;
@@ -98,6 +99,33 @@ export function formatMessages(messages: any[], format: string): string {
   }).join('\n' + '─'.repeat(80) + '\n\n');
 
   return `📊 Retrieved ${messages.length} messages\n${'='.repeat(80)}\n\n${formatted}`;
+}
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
+  return undefined;
+}
+
+/**
+ * One line per message, id first so the agent can fetch_around(id). The
+ * anchor of a fetch_around window is marked so it stands out.
+ */
+export function formatHistoryLines(messages: ZulipMessage[], anchorId?: number): string {
+  if (messages.length === 0) return "(no messages)";
+  return messages.map((m) => {
+    const ts = m.timestamp.toISOString().replace(/\.\d{3}Z$/, "Z");
+    const where = m.isDm ? "[DM]" : `[#${m.streamName} > ${m.topic}]`;
+    const mark = m.id === anchorId ? " <<" : "";
+    const mention = m.mentioned ? " (mention)" : "";
+    const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => a.path).join(", ")}]` : "";
+    return `[${ts} id=${m.id}] ${where} ${m.authorName}${mention}: ${m.cleanContent}${att}${mark}`;
+  }).join("\n");
 }
 
 /**
@@ -596,6 +624,49 @@ export class ZulipToolRuntime {
             is_bot: u.is_bot,
             mention_syntax: `@**${u.full_name}**`,
           })),
+        };
+      }
+
+      case "fetch_history": {
+        const channel = String(args.channel ?? "");
+        const streamName = channel.startsWith("zulip:") ? channel.slice("zulip:".length) : channel;
+        if (!streamName) throw new Error("channel is required");
+        const limit = clampInt(args.limit, 50, 1, 1000);
+        const page = await fetchHistory(zulipClient, {
+          streamName,
+          topic: typeof args.topic === "string" && args.topic ? args.topic : undefined,
+          limit,
+          before: numberOrUndefined(args.before),
+          after: numberOrUndefined(args.after),
+        });
+        return {
+          channel: streamName,
+          channelId: `zulip:${streamName}`,
+          topic: args.topic,
+          count: page.messages.length,
+          oldest_id: page.messages[0]?.id ?? null,
+          newest_id: page.messages[page.messages.length - 1]?.id ?? null,
+          reached_oldest: page.foundOldest,
+          reached_newest: page.foundNewest,
+          formatted_history: formatHistoryLines(page.messages),
+        };
+      }
+
+      case "fetch_around": {
+        const messageId = numberOrUndefined(args.message_id);
+        if (messageId === undefined) throw new Error("message_id must be a number");
+        const limit = clampInt(args.limit, 50, 1, 200);
+        const page = await fetchAround(zulipClient, messageId, limit);
+        const anchor = page.messages.find((m) => m.id === messageId);
+        return {
+          message_id: messageId,
+          channel: anchor?.streamName ?? null,
+          channelId: anchor?.streamName ? `zulip:${anchor.streamName}` : null,
+          topic: anchor?.topic ?? null,
+          count: page.messages.length,
+          oldest_id: page.messages[0]?.id ?? null,
+          newest_id: page.messages[page.messages.length - 1]?.id ?? null,
+          formatted_history: formatHistoryLines(page.messages, messageId),
         };
       }
 

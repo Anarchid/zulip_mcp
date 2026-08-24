@@ -4,7 +4,18 @@
  * Speaks plain MCP to any client (initialize, tools/*, resources/*) and MCPL
  * 0.5 to hosts that advertise `experimental.mcpl` in their initialize
  * capabilities: featureSets/update (the §5.3 policy exchange), mcpl/manifest,
- * channels/*, and context/beforeInference.
+ * channels/*, push/event, and context/beforeInference.
+ *
+ * Delivery model (per message the adapter hands over):
+ *   - channel open by the host  → channels/incoming (batched)
+ *   - channel closed, addressed → push/event with the closed-channel origin,
+ *                                  carrying the missed-ambient tally so the
+ *                                  host can show what staying out has cost
+ *   - channel closed, ambient   → dropped and tallied (`channel_missed`)
+ *
+ * Every forward advances a persisted per-channel watermark; on the next
+ * connection a catch-up sweep delivers what arrived in between, and a Zulip
+ * event-queue expiry is healed from history instead of merely reported.
  *
  * One connection at a time. `serve()` resolves when the peer disconnects.
  */
@@ -16,6 +27,7 @@ import {
   type ChannelsCloseParams,
   type ChannelsIncomingResult,
   type ChannelsOpenParams,
+  type ChannelsOpenResult,
   type ChannelsPublishParams,
   type ChannelsRegisterResult,
   type ChannelDescriptor,
@@ -27,20 +39,30 @@ import {
   type JsonRpcRequest,
   type McplInitializeParams,
   type McplInitializeResult,
+  type PushEventParams,
+  type TextContent,
 } from '@animalabs/mcpl-core';
 import { ChannelManager, type HostClient } from './channels.js';
 import { ContextProvider } from './context.js';
+import { DeliveryState, renderMissedBlock, selectMissed, viewOf } from './delivery.js';
 import { McplRpcError, capabilityDenied } from './errors.js';
-import { buildServerCapabilities, featureSetForTool } from './feature-sets.js';
+import { MESSAGING_FEATURE_SET, buildServerCapabilities, featureSetForTool } from './feature-sets.js';
 import { CapabilityGrant } from './grant.js';
-import type { PlatformAdapter } from './platforms/adapter.js';
+import type { PlatformAdapter, PlatformSystemEvent } from './platforms/adapter.js';
 import { toolDefinitions } from './tools.js';
-import { toToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
+import { toToolCallResult, type ToolCallResult, type ZulipToolRuntime } from './tool-runtime.js';
 
 /** MCP protocol revisions this server answers with verbatim. Anything else
  *  is answered with the oldest, which every client can speak. */
 const KNOWN_MCP_PROTOCOL_VERSIONS = new Set(['2024-11-05', '2025-03-26', '2025-06-18']);
 const FALLBACK_MCP_PROTOCOL_VERSION = '2024-11-05';
+
+/** Messages kept around each mention in a catch-up block for a closed channel. */
+const MISSED_VICINITY = 7;
+/** Hard ceiling on what one channel's catch-up fetches. */
+const CATCHUP_HARD_CAP = 10_000;
+export const DEFAULT_CATCHUP_LIMIT = 3000;
+const HISTORY_ON_OPEN_CAP = 500;
 
 export interface ZulipMcplServerOptions {
   /** Server name/version reported in `initialize`. */
@@ -51,6 +73,14 @@ export interface ZulipMcplServerOptions {
   batchWindowMs?: number;
   /** Messages injected per open channel on context/beforeInference. */
   contextHistorySize?: number;
+  /** Where delivery state (watermarks, tallies) persists. null = in-memory. */
+  stateDir?: string | null;
+  /** Session id the delivery state file is keyed by. */
+  sessionId?: string;
+  /** Per-channel ceiling for the reconnect sweep and gap recovery. */
+  catchupLimit?: number;
+  /** Renders timestamps in agent-visible catch-up lines. */
+  formatTime?: (d: Date) => string;
 }
 
 export class ZulipMcplServer {
@@ -62,9 +92,13 @@ export class ZulipMcplServer {
   readonly manifestTracker: ManifestTracker;
   readonly channelManager: ChannelManager;
   readonly contextProvider: ContextProvider;
+  readonly delivery: DeliveryState;
 
   private detachManifest: (() => void) | null = null;
   private eventsStarted = false;
+  private sweepDone = false;
+  private readonly catchupLimit: number;
+  private readonly formatTime: (d: Date) => string;
 
   constructor(
     private readonly adapter: PlatformAdapter,
@@ -72,6 +106,9 @@ export class ZulipMcplServer {
     private readonly options: ZulipMcplServerOptions,
   ) {
     this.adapters = new Map([[adapter.type, adapter]]);
+    this.catchupLimit = Math.min(CATCHUP_HARD_CAP, Math.max(0, options.catchupLimit ?? DEFAULT_CATCHUP_LIMIT));
+    this.formatTime = options.formatTime ?? ((d) => d.toISOString().replace(/\.\d{3}Z$/, 'Z'));
+    this.delivery = new DeliveryState(options.stateDir ?? null, options.sessionId ?? 'default');
 
     // Derived from the adapter rather than restated, so `channels.typing`
     // cannot be advertised when the adapter does not implement it (§6.4).
@@ -138,12 +175,19 @@ export class ZulipMcplServer {
       // Runs concurrently with the loop: the policy arrives as a Request the
       // loop must read and answer, and channels/register is itself a
       // server→host Request the host answers only once policy is settled.
+      // The catch-up sweep follows registration so its pushes land on
+      // registered channels inside the granted window.
       void this.grant.whenReady().then(async () => {
         if (this.conn !== conn) return;
         try {
           await this.channelManager.registerChannels();
         } catch (error) {
           console.error('Failed to register channels after initial policy:', error);
+        }
+        try {
+          await this.runReconnectSweep();
+        } catch (error) {
+          console.error('[zulip-mcp] Reconnect catch-up sweep failed:', error);
         }
       });
 
@@ -167,6 +211,7 @@ export class ZulipMcplServer {
       this.eventsStarted = false;
     }
     this.channelManager.destroy();
+    this.delivery.save();
   }
 
   // ── Handshake ──
@@ -292,14 +337,14 @@ export class ZulipMcplServer {
         case method.CHANNELS_OPEN: {
           this.requireMcpl();
           const open = params as unknown as ChannelsOpenParams;
-          conn.sendResponse(req.id, this.channelManager.openChannel(open));
+          conn.sendResponse(req.id, await this.handleChannelOpen(open));
           break;
         }
 
         case method.CHANNELS_CLOSE: {
           this.requireMcpl();
           const close = params as unknown as ChannelsCloseParams;
-          conn.sendResponse(req.id, this.channelManager.closeChannel(close));
+          conn.sendResponse(req.id, this.handleChannelClose(close));
           break;
         }
 
@@ -364,6 +409,260 @@ export class ZulipMcplServer {
     void conn;
   }
 
+  // ── Channel lifecycle ──
+
+  private async handleChannelOpen(params: ChannelsOpenParams): Promise<ChannelsOpenResult> {
+    if (!this.grant.has('channels.lifecycle')) throw capabilityDenied('channels.lifecycle');
+    const descriptor = this.channelManager.findChannel(params);
+    const result: ChannelsOpenResult = { channel: descriptor };
+
+    // Requested history is fetched BEFORE the lifecycle is committed, so a
+    // failed open cannot leave the channel open while the host records the
+    // operation as failed.
+    const requested = Math.max(0, Math.floor(params.history?.limit ?? 0));
+    if (requested > 0 && this.adapter.fetchHistory) {
+      const cap = Math.min(HISTORY_ON_OPEN_CAP, historyCapOf(descriptor));
+      const limit = Math.min(requested, cap);
+      const watermark = this.delivery.watermark(descriptor.id);
+      const history = await this.adapter.fetchHistory(descriptor.id, {
+        limit,
+        beforeMessageId: params.history?.beforeMessageId,
+        afterMessageId:
+          params.history?.sinceLastSeen && watermark !== undefined ? String(watermark) : undefined,
+      });
+      result.history = history;
+      result.historyTruncated = requested > limit;
+      for (const m of history) this.delivery.advance(descriptor.id, Number(m.messageId));
+    }
+
+    this.channelManager.markOpen(descriptor.id);
+    this.delivery.markOpen(descriptor.id);
+    this.delivery.save();
+
+    // Zulip only delivers stream events to subscribers; an open channel the
+    // bot is not subscribed to would be listening to silence.
+    if (this.adapter.ensureSubscribed) {
+      await this.adapter.ensureSubscribed(descriptor.id).catch(() => {});
+    }
+    return result;
+  }
+
+  private handleChannelClose(params: ChannelsCloseParams): { closed: boolean } {
+    const result = this.channelManager.closeChannel(params);
+    this.delivery.markClosed(params.channelId);
+    this.delivery.save();
+    return result;
+  }
+
+  // ── Inbound delivery ──
+
+  /**
+   * Route one message from the adapter. See the delivery model in the file
+   * header. Every forward advances the watermark; a dropped ambient message
+   * does not, so the next sweep can still find it if the host opens the
+   * channel meanwhile.
+   */
+  private async onIncoming(message: IncomingChannelMessage): Promise<void> {
+    const channelId = message.channelId;
+    const id = Number(message.messageId);
+    const meta = (typeof message.metadata === 'object' && message.metadata !== null ? message.metadata : {}) as Record<string, unknown>;
+    const addressed = meta.mentioned === true || meta.isDM === true;
+
+    if (this.channelManager.isOpen(channelId)) {
+      this.channelManager.onIncomingMessage(channelId, message);
+      if (this.delivery.advance(channelId, id)) this.delivery.save();
+      return;
+    }
+
+    if (addressed) {
+      const delivered = await this.pushEvent(message, `zulip_msg_${message.messageId}`);
+      if (delivered && this.delivery.advance(channelId, id)) this.delivery.save();
+      return;
+    }
+
+    if (this.delivery.countMissed(channelId, { id, text: viewOf(message).text })) this.delivery.save();
+  }
+
+  /**
+   * Addressed message on a closed channel → push/event. Requires the
+   * `pushEvents` capability and an active zulip.messaging. The origin carries
+   * the MCPL channel id (what the host registers and routes replies to) and
+   * the missed-ambient tally, so the host's closed-channel invitation can
+   * show what staying out has cost.
+   */
+  private async pushEvent(message: IncomingChannelMessage, eventId: string, extraOrigin: Record<string, unknown> = {}): Promise<boolean> {
+    const conn = this.conn;
+    if (!conn || !this.mcplActive) return false;
+    if (!this.grant.has('pushEvents') || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) {
+      console.error(`[zulip-mcp] pushEvents not granted; dropping addressed message ${message.messageId} on closed ${message.channelId}`);
+      return false;
+    }
+    const meta = (typeof message.metadata === 'object' && message.metadata !== null ? message.metadata : {}) as Record<string, unknown>;
+    const missed = this.delivery.tally(message.channelId);
+    const params: PushEventParams = {
+      featureSet: MESSAGING_FEATURE_SET,
+      eventId,
+      timestamp: message.timestamp,
+      origin: {
+        source: 'zulip',
+        mcplChannelId: message.channelId,
+        messageId: message.messageId,
+        stream: message.channelId.startsWith('zulip:') ? message.channelId.slice('zulip:'.length) : undefined,
+        topic: meta.topic,
+        authorId: message.author.id,
+        authorName: message.author.name,
+        isMention: meta.mentioned === true,
+        isDM: meta.isDM === true,
+        ...(missed ? { missedMessages: missed.messages, missedCharacters: missed.characters } : {}),
+        ...extraOrigin,
+      },
+      tags: message.tags,
+      payload: { content: message.content },
+    };
+    try {
+      await conn.sendRequest(method.PUSH_EVENT, params);
+      return true;
+    } catch (err) {
+      console.error('[zulip-mcp] push/event failed:', (err as Error).message);
+      return false;
+    }
+  }
+
+  /**
+   * On (re)connect, deliver what arrived while the server was offline.
+   * Channels the host had open get their full missed backscroll; every other
+   * watermarked channel gets each mention with its vicinity. One `<missed>`
+   * block per channel, as a push event. Runs at most once per process.
+   */
+  private async runReconnectSweep(): Promise<void> {
+    if (this.sweepDone) return;
+    this.sweepDone = true;
+    if (!this.conn || !this.mcplActive || !this.adapter.fetchHistory || this.catchupLimit === 0) return;
+    if (!this.grant.has('pushEvents') || !this.grant.isFeatureSetActive(MESSAGING_FEATURE_SET)) return;
+
+    const candidates = new Set<string>([
+      ...this.delivery.watermarkedChannels(),
+      ...this.delivery.lastOpenChannels(),
+    ]);
+    let delivered = 0;
+    for (const channelId of candidates) {
+      if (!this.channelManager.getChannel(channelId)) continue;
+      const watermark = this.delivery.watermark(channelId);
+      if (watermark === undefined) continue;
+      let msgs: IncomingChannelMessage[];
+      try {
+        msgs = await this.adapter.fetchHistory(channelId, { limit: this.catchupLimit, afterMessageId: String(watermark) });
+      } catch (err) {
+        console.error(`[zulip-mcp] sweep: history fetch failed for ${channelId}:`, (err as Error).message);
+        continue;
+      }
+      if (msgs.length === 0) continue;
+      const newestId = Number(msgs[msgs.length - 1].messageId);
+      const views = msgs.map(viewOf);
+      const keepAll = this.delivery.wasOpen(channelId);
+      const kept = selectMissed(views, { keepAll, vicinity: MISSED_VICINITY });
+      if (kept.length === 0) {
+        // Nothing to deliver, but advance the anchor so these are not re-scanned.
+        this.delivery.advance(channelId, newestId);
+        continue;
+      }
+      const mentionCount = views.filter((v) => v.mentioned).length;
+      const streamName = channelId.startsWith('zulip:') ? channelId.slice('zulip:'.length) : channelId;
+      const block = renderMissedBlock(kept, {
+        streamName,
+        channelId,
+        reason: keepAll ? 'backscroll' : 'mention',
+        count: keepAll ? kept.length : mentionCount,
+        formatTime: this.formatTime,
+      });
+      const synthetic: IncomingChannelMessage = {
+        channelId,
+        messageId: String(newestId),
+        author: { id: 'system', name: 'zulip catch-up' },
+        timestamp: new Date().toISOString(),
+        content: [{ type: 'text', text: block } satisfies TextContent],
+        tags: ['zulip:missed', ...(mentionCount > 0 ? ['chat:mention'] : ['chat:ambient'])],
+        metadata: { missed: true, topic: undefined, mentioned: mentionCount > 0, isDM: false },
+      };
+      const ok = await this.pushEvent(synthetic, `zulip_missed_${channelId}_${newestId}`, {
+        missed: true,
+        reason: keepAll ? 'backscroll' : 'mention',
+        messages: kept.length,
+      });
+      if (ok) {
+        // Advance past everything scanned, not just what was delivered, so a
+        // mention-only channel does not re-surface its non-mention tail.
+        this.delivery.advance(channelId, newestId);
+        delivered++;
+      }
+    }
+
+    await this.backfillMissedTallies();
+    this.delivery.save();
+    if (delivered > 0) {
+      console.error(`[zulip-mcp] Reconnect catch-up: delivered missed messages from ${delivered} channel(s)`);
+    }
+  }
+
+  /** Count the ambient that arrived on tallied channels during downtime. */
+  private async backfillMissedTallies(): Promise<void> {
+    if (!this.adapter.fetchHistory) return;
+    for (const channelId of this.delivery.talliedChannels()) {
+      const tally = this.delivery.tally(channelId)!;
+      if (!tally.talliedThrough) continue;
+      let msgs: IncomingChannelMessage[];
+      try {
+        msgs = await this.adapter.fetchHistory(channelId, { limit: this.catchupLimit, afterMessageId: String(tally.talliedThrough) });
+      } catch {
+        continue;
+      }
+      if (msgs.length === 0) continue;
+      const views = msgs.map(viewOf);
+      // Only ambient counts as missed: mentions are delivered by the sweep.
+      const ambient = views.filter((v) => !v.mentioned);
+      this.delivery.backfillMissed(channelId, ambient, views[views.length - 1].id);
+    }
+  }
+
+  /**
+   * A Zulip event queue died and its replacement starts from "now". Heal
+   * the gap for open channels from history (watermark → now) before the
+   * gap marker itself is delivered, so the agent gets the messages, not
+   * advice to go looking for them.
+   */
+  private async onSystemEvent(event: PlatformSystemEvent): Promise<void> {
+    let recovered = 0;
+    if (event.kind === 'gap' && this.adapter.fetchHistory) {
+      for (const channelId of this.channelManager.getOpenChannels()) {
+        const watermark = this.delivery.watermark(channelId);
+        if (watermark === undefined) continue;
+        try {
+          const msgs = await this.adapter.fetchHistory(channelId, { limit: this.catchupLimit, afterMessageId: String(watermark) });
+          for (const m of msgs) {
+            this.channelManager.onIncomingMessage(channelId, {
+              ...m,
+              tags: [...(m.tags ?? []), 'zulip:missed'],
+              metadata: { ...(m.metadata as Record<string, unknown>), backscroll: undefined, recovered: true },
+            });
+            this.delivery.advance(channelId, Number(m.messageId));
+            recovered++;
+          }
+        } catch (err) {
+          console.error(`[zulip-mcp] gap recovery failed for ${channelId}:`, (err as Error).message);
+        }
+      }
+      if (recovered > 0) this.delivery.save();
+    }
+    const text = recovered > 0
+      ? `${event.text} ${recovered} message(s) on open channels were recovered from history and delivered above.`
+      : event.text;
+    this.channelManager.broadcastSystemEvent(this.adapter.type, {
+      ...event,
+      text,
+      metadata: { ...event.metadata, ...(event.kind === 'gap' ? { recoveredMessages: recovered } : {}) },
+    });
+  }
+
   // ── Helpers ──
 
   private requireMcpl(): void {
@@ -389,7 +688,7 @@ export class ZulipMcplServer {
    * by a feature set the host disabled is unavailable with it (§6.7). Plain
    * MCP clients are not subject to a grant — there is none to consult.
    */
-  private async callTool(name: string, args: Record<string, unknown>) {
+  private async callTool(name: string, args: Record<string, unknown>): Promise<ToolCallResult> {
     if (this.mcplActive) {
       if (!this.grant.has('tools')) throw capabilityDenied('tools');
       const owner = featureSetForTool(name);
@@ -401,11 +700,49 @@ export class ZulipMcplServer {
       }
     }
     try {
-      return toToolCallResult(await this.tools.handleToolCall(name, args));
+      const own = await this.serverTool(name, args);
+      return toToolCallResult(own !== undefined ? own : await this.tools.handleToolCall(name, args));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
     }
+  }
+
+  /** Tools that read the server's own delivery state. undefined = not ours. */
+  private async serverTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    switch (name) {
+      case 'channel_missed': {
+        const channelId = this.channelIdArg(args.channel);
+        const tally = this.delivery.tally(channelId);
+        if (!tally) {
+          return {
+            channelId,
+            tracked: false,
+            open: this.channelManager.isOpen(channelId),
+            note: this.channelManager.isOpen(channelId)
+              ? 'This channel is open: everything is delivered, nothing is missed.'
+              : 'Not tracked: the host has not closed this channel since delivery began, so there is no baseline to count from.',
+          };
+        }
+        return {
+          channelId,
+          tracked: true,
+          missedMessages: tally.messages,
+          missedCharacters: tally.characters,
+          sinceMessageId: tally.anchorId || null,
+          talliedThroughMessageId: tally.talliedThrough || null,
+          note: 'Ambient messages dropped since the host closed this channel. Mentions were delivered and are not counted.',
+        };
+      }
+      default:
+        return undefined;
+    }
+  }
+
+  private channelIdArg(value: unknown): string {
+    const raw = String(value ?? '').trim();
+    if (!raw) throw new Error('channel is required');
+    return raw.startsWith('zulip:') ? raw : `zulip:${raw.replace(/^#/, '')}`;
   }
 
   private startEvents(): void {
@@ -413,12 +750,14 @@ export class ZulipMcplServer {
     this.eventsStarted = true;
     this.adapter.startEvents(
       (message) => {
-        this.channelManager.onIncomingMessage(message.channelId, message);
+        void this.onIncoming(message).catch((err) => {
+          console.error('[zulip-mcp] inbound delivery failed:', (err as Error).message);
+        });
       },
       (event) => {
-        // Delivery gaps / degraded polling: surface to the agent as a
-        // synthetic system message on the platform's open channels.
-        this.channelManager.broadcastSystemEvent(this.adapter.type, event);
+        void this.onSystemEvent(event).catch((err) => {
+          console.error('[zulip-mcp] system event handling failed:', (err as Error).message);
+        });
       },
     );
   }
@@ -436,4 +775,9 @@ export class ZulipMcplServer {
     if (!conn) throw new Error('not connected');
     return (await conn.sendRequest(method.CHANNELS_INCOMING, { messages })) as ChannelsIncomingResult | undefined;
   }
+}
+
+function historyCapOf(descriptor: ChannelDescriptor): number {
+  const max = descriptor.capabilities?.history?.maxMessages;
+  return typeof max === 'number' && max > 0 ? max : HISTORY_ON_OPEN_CAP;
 }

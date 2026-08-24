@@ -14,10 +14,22 @@ import type {
   IncomingChannelMessage,
   TextContent,
 } from '@animalabs/mcpl-core';
-import { CHAT_TAGS } from '@animalabs/mcpl-core';
-import type { PlatformAdapter, PublishResult, RoutingHints, OnIncomingMessage, OnSystemEvent } from './adapter.js';
+import type {
+  ChannelHistoryQuery,
+  OnIncomingMessage,
+  OnSystemEvent,
+  PlatformAdapter,
+  PublishResult,
+  RoutingHints,
+} from './adapter.js';
 import { ZulipEventLoop } from './zulip-events.js';
-import { cleanContent, extractZulipAttachments } from '../content.js';
+import {
+  fetchHistory,
+  normalizeMessage,
+  toIncoming,
+  type ZulipIdentity,
+  type ZulipRawMessage,
+} from '../history.js';
 
 /** The address every `zulip:` descriptor carries. */
 export interface ZulipChannelAddress {
@@ -39,16 +51,40 @@ function addressOf(descriptor: ChannelDescriptor | undefined): Partial<ZulipChan
   return typeof address === 'object' && address !== null ? (address as Partial<ZulipChannelAddress>) : {};
 }
 
+export interface ZulipAdapterOptions {
+  /** Backscroll cap advertised per channel and enforced on channels/open. */
+  backscrollDefault?: number;
+  /** Per-stream overrides of the backscroll cap. */
+  backscrollLimits?: ReadonlyMap<string, number>;
+}
+
+export const DEFAULT_BACKSCROLL = 500;
+
 export class ZulipAdapter implements PlatformAdapter {
   readonly type = 'zulip';
 
   private eventLoop: ZulipEventLoop | null = null;
+  private readonly identity: ZulipIdentity;
+  private readonly backscrollDefault: number;
+  private readonly backscrollLimits: ReadonlyMap<string, number>;
+  /** Streams this process has confirmed a subscription for. */
+  private subscribed = new Set<string>();
 
   constructor(
     private zulipClient: any,
-    private selfUserId: number | null,
-    private sessionId: string,
-  ) {}
+    selfUserId: number | null,
+    sessionId: string,
+    options: ZulipAdapterOptions = {},
+  ) {
+    this.identity = { selfUserId, sessionId };
+    this.backscrollDefault = options.backscrollDefault ?? DEFAULT_BACKSCROLL;
+    this.backscrollLimits = options.backscrollLimits ?? new Map();
+  }
+
+  /** The history cap for a stream (descriptor `capabilities.history.maxMessages`). */
+  backscrollLimitFor(streamName: string): number {
+    return this.backscrollLimits.get(streamName) ?? this.backscrollDefault;
+  }
 
   async discoverChannels(): Promise<ChannelDescriptor[]> {
     const channels: ChannelDescriptor[] = [];
@@ -69,6 +105,13 @@ export class ZulipAdapter implements PlatformAdapter {
           metadata: {
             subscriber_count: stream.subscriber_count,
             is_public: !stream.invite_only,
+          },
+          capabilities: {
+            history: {
+              maxMessages: this.backscrollLimitFor(stream.name),
+              supportsBeforeMessage: true,
+              supportsSinceLastSeen: true,
+            },
           },
         });
       }
@@ -163,23 +206,12 @@ export class ZulipAdapter implements PlatformAdapter {
     historySize: number,
   ): Promise<ContextInjection | null> {
     const streamName = streamNameOf(channelId);
+    const page = await fetchHistory(this.zulipClient, { streamName, limit: historySize });
+    if (page.messages.length === 0) return null;
 
-    const result = await this.zulipClient.messages.retrieve({
-      anchor: 'newest',
-      num_before: historySize,
-      num_after: 0,
-      narrow: [['stream', streamName]],
-    });
-
-    const messages = result.messages || [];
-    if (messages.length === 0) return null;
-
-    const formatted = messages.map((msg: any) => {
-      const time = new Date(msg.timestamp * 1000).toLocaleTimeString('en-US', {
-        hour: '2-digit', minute: '2-digit',
-      });
-      const content = cleanContent(msg.content);
-      return `[${time}] [${msg.subject}] ${msg.sender_full_name}: ${content}`;
+    const formatted = page.messages.map((m) => {
+      const time = m.timestamp.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      return `[${time}] [${m.topic}] ${m.authorName}: ${m.cleanContent}`;
     }).join('\n');
 
     return {
@@ -189,57 +221,56 @@ export class ZulipAdapter implements PlatformAdapter {
     };
   }
 
+  /**
+   * History as incoming-shaped messages, oldest first, the bot's own
+   * messages excluded (they are already in the agent's own record as its
+   * turns). Marked `backscroll: true` so consumers can tell replayed history
+   * from live delivery.
+   */
+  async fetchHistory(channelId: string, query: ChannelHistoryQuery): Promise<IncomingChannelMessage[]> {
+    const streamName = streamNameOf(channelId);
+    const page = await fetchHistory(this.zulipClient, {
+      streamName,
+      limit: query.limit,
+      before: query.beforeMessageId !== undefined ? Number(query.beforeMessageId) : undefined,
+      after: query.afterMessageId !== undefined ? Number(query.afterMessageId) : undefined,
+    });
+    return page.messages
+      .filter((m) => this.identity.selfUserId === null || m.authorId !== this.identity.selfUserId)
+      .map((m) => toIncoming(channelId, m, this.identity, { backscroll: true }));
+  }
+
+  /**
+   * Zulip delivers stream events only to subscribers — even with
+   * `all_public_streams` on the queue — so opening a channel must also
+   * subscribe the bot, or the host would be listening to silence.
+   * Idempotent; subscription persists server-side.
+   */
+  async ensureSubscribed(channelId: string): Promise<void> {
+    const streamName = streamNameOf(channelId);
+    if (this.subscribed.has(streamName)) return;
+    try {
+      const result = await this.zulipClient.users.me.subscriptions.add({
+        subscriptions: [{ name: streamName }],
+      });
+      if (result?.result === 'success') {
+        this.subscribed.add(streamName);
+        const fresh = result.subscribed && Object.keys(result.subscribed).length > 0;
+        if (fresh) console.error(`[zulip-mcp] subscribed to #${streamName} for channel ${channelId}`);
+      } else {
+        console.error(`[zulip-mcp] could not subscribe to #${streamName}: ${result?.msg ?? 'unknown error'}`);
+      }
+    } catch (err) {
+      console.error(`[zulip-mcp] subscribe to #${streamName} failed:`, (err as Error).message);
+    }
+  }
+
   startEvents(onMessage: OnIncomingMessage, onSystemEvent?: OnSystemEvent): void {
     this.eventLoop = new ZulipEventLoop();
     this.eventLoop.start(this.zulipClient, (streamName, msg, flags) => {
-      if (this.selfUserId !== null && msg.sender_id === this.selfUserId) return;
-      const channelId = zulipChannelId(streamName);
-      const cleaned = cleanContent(msg.content);
-      const attachments = extractZulipAttachments(msg.content);
-      const content: TextContent[] = [{ type: 'text', text: cleaned }];
-      if (attachments.length > 0) {
-        // Reference-only by default: agent reads the note, then decides
-        // whether to call fetch_attachment to pull bytes into context.
-        const lines = attachments.map(a =>
-          `- ${a.name} (${a.mimeType})${a.isImage ? ' — image, fetchable via fetch_attachment' : ''}: ${a.path}`,
-        );
-        content.push({
-          type: 'text',
-          text: `[attachments: ${attachments.length}]\n${lines.join('\n')}`,
-        });
-      }
-
-      // Zulip's server-computed flag: personal or user-group mention of the
-      // bot. Wildcards (@all/@everyone) deliberately don't count.
-      const mentioned = flags.includes('mentioned');
-
-      // RFC-001 tags: the most specific addressing tag; hosts expand the
-      // umbrellas (chat:mention ⇒ chat:addressed). Sender kind is not on the
-      // event envelope, so from-human/from-bot rides on the email heuristic
-      // Zulip itself uses for bot accounts.
-      const tags: string[] = [mentioned ? CHAT_TAGS.mention : CHAT_TAGS.ambient];
-      if (flags.includes('wildcard_mentioned')) tags.push('zulip:wildcard-mention');
-      tags.push(/-bot@/.test(msg.sender_email) ? CHAT_TAGS.fromBot : CHAT_TAGS.fromHuman);
-      if (attachments.some(a => a.isImage)) tags.push(CHAT_TAGS.hasImage);
-      if (attachments.some(a => !a.isImage)) tags.push(CHAT_TAGS.hasFile);
-
-      const incoming: IncomingChannelMessage = {
-        channelId,
-        messageId: String(msg.id),
-        threadId: msg.subject || undefined,
-        author: { id: String(msg.sender_id), name: msg.sender_full_name },
-        timestamp: new Date(msg.timestamp * 1000).toISOString(),
-        content,
-        tags,
-        metadata: {
-          senderEmail: msg.sender_email,
-          topic: msg.subject,
-          mentioned,
-          botUserId: this.selfUserId !== null ? String(this.selfUserId) : this.sessionId,
-          ...(attachments.length > 0 ? { attachments } : {}),
-        },
-      };
-      onMessage(incoming);
+      if (this.identity.selfUserId !== null && msg.sender_id === this.identity.selfUserId) return;
+      const normalized = normalizeMessage({ ...(msg as ZulipRawMessage), flags });
+      onMessage(toIncoming(zulipChannelId(streamName), normalized, this.identity));
     }, onSystemEvent).catch(error => {
       console.error('Zulip event loop failed:', error);
     });

@@ -313,6 +313,57 @@ export const toolDefinitions: ToolDefinition[] = [
     },
   },
   {
+    name: "fetch_history",
+    description:
+      "Fetch message history from a stream (optionally one topic), oldest first. By default returns " +
+      "the most recent messages. Use `before` (a message id) to scroll further back — pass the id of " +
+      "the oldest message you have seen to page backwards. Use `after` (a message id) to fetch only " +
+      "messages newer than a given point. Message ids are realm-global and increase over time, so " +
+      "they work as cursors across streams and topics. Each line leads with the id so you can " +
+      "fetch_around(id) for more context.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Stream name (e.g. 'general') or channel id ('zulip:general')" },
+        topic: { type: "string", description: "Optional: limit to one topic" },
+        limit: { type: "number", description: "Max messages to fetch (default 50, max 1000)" },
+        before: { type: "number", description: "Only messages older than this message id (exclusive)" },
+        after: { type: "number", description: "Only messages newer than this message id (exclusive)" },
+      },
+      required: ["channel"],
+    },
+  },
+  {
+    name: "fetch_around",
+    description:
+      "Scroll to a specific message and fetch the surrounding context: the message itself plus roughly " +
+      "half the window on either side, in whatever stream and topic it lives in. Message ids come " +
+      "from incoming messages, fetch_history lines, and <missed> catch-up blocks.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_id: { type: "number", description: "Message to centre the window on" },
+        limit: { type: "number", description: "Total window size (default 50, max 200)" },
+      },
+      required: ["message_id"],
+    },
+  },
+  {
+    name: "channel_missed",
+    description:
+      "Report how much ambient (non-mention) traffic you have missed in a stream since the host CLOSED " +
+      "its channel — returns missed message and character counts. Mentions always reach you and are " +
+      "not counted. Counts are durable across restarts and backfill downtime on reconnect. Useful for " +
+      "deciding whether to reopen the channel.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Stream name (e.g. 'general') or channel id ('zulip:general')" },
+      },
+      required: ["channel"],
+    },
+  },
+  {
     name: "fetch_attachment",
     description:
       "Fetch a Zulip user-upload attachment by path and return its bytes inline. " +
