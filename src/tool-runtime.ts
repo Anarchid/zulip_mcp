@@ -18,7 +18,7 @@ import {
   toFetchResult,
 } from "./content.js";
 import type { ZulipSession } from "./zulip-client.js";
-import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, renderReactions, type ReactionSummary, type ZulipMessage } from "./history.js";
+import { assertApiSuccess, dmChannelIdFor, fetchAround, fetchHistory, parseDmChannelId, renderReactions, type ReactionSummary, type ZulipMessage } from "./history.js";
 import { chunkMessage } from "./content.js";
 
 /** A message this server sent through a tool — recorded for rollback. */
@@ -30,18 +30,34 @@ export interface SentRecord {
 
 /** What of a message's reactions the model may see. */
 export interface ReactionPolicy {
-  suppressed(emojiName: string): boolean;
-  suppressAll(): boolean;
+  /** `code`/`type` are Zulip's `emoji_code`/`reaction_type` when known. */
+  suppressed(emojiName: string, emojiCode?: string, reactionType?: string): boolean;
 }
 
-const SHOW_ALL: ReactionPolicy = { suppressed: () => false, suppressAll: () => false };
+const SHOW_ALL: ReactionPolicy = { suppressed: () => false };
 
-/** Project reactions through the policy. `unavailable` means the policy
- *  itself is unusable (broken filters plane) — an empty list that actually
- *  means "couldn't project" must not read as "none". */
-export function projectReactions(reactions: ReactionSummary[], policy: ReactionPolicy): { reactions: ReactionSummary[]; unavailable: boolean } {
-  if (policy.suppressAll()) return { reactions: [], unavailable: true };
-  return { reactions: reactions.filter((r) => !policy.suppressed(r.name)), unavailable: false };
+/** Project reactions through the policy. */
+export function projectReactions(reactions: ReactionSummary[], policy: ReactionPolicy): ReactionSummary[] {
+  return reactions.filter((r) => !policy.suppressed(r.name, r.code, r.type));
+}
+
+/**
+ * Withhold suppressed reactions from raw Zulip message payloads before any
+ * model-visible serialization (the legacy `raw` format hands the payload to
+ * the model as is).
+ */
+export function stripSuppressedReactions<T extends { reactions?: unknown }>(messages: T[], policy: ReactionPolicy): T[] {
+  return messages.map((m) => {
+    if (!Array.isArray(m.reactions)) return m;
+    const kept = (m.reactions as { emoji_name?: unknown; emoji_code?: unknown; reaction_type?: unknown }[]).filter(
+      (r) => !policy.suppressed(
+        typeof r?.emoji_name === "string" ? r.emoji_name : "",
+        typeof r?.emoji_code === "string" ? r.emoji_code : undefined,
+        typeof r?.reaction_type === "string" ? r.reaction_type : undefined,
+      ),
+    );
+    return { ...m, reactions: kept };
+  });
 }
 
 export interface ChannelState {
@@ -154,8 +170,7 @@ export function formatHistoryLines(
     const mark = m.id === anchorId ? " <<" : "";
     const mention = m.mentioned ? " (mention)" : "";
     const att = m.attachments.length > 0 ? ` [attachments: ${m.attachments.map((a) => a.path).join(", ")}]` : "";
-    const projected = projectReactions(m.reactions, policy);
-    const reactions = projected.unavailable ? " [reactions: unavailable]" : renderReactions(projected.reactions, selfUserId);
+    const reactions = renderReactions(projectReactions(m.reactions, policy), selfUserId);
     return `[${ts} id=${m.id}] ${where} ${m.authorName}${mention}: ${m.cleanContent}${att}${reactions}${mark}`;
   }).join("\n");
 }
@@ -441,9 +456,9 @@ export class ZulipToolRuntime {
           monitoringStatus = "already_monitored";
         }
 
-        // Format output
+        // Format output — suppressed reaction markers never reach the model, raw format included.
         const format = args.format || "detailed";
-        const formattedOutput = formatMessages(filteredMessages, format);
+        const formattedOutput = formatMessages(stripSuppressedReactions(filteredMessages, this.reactionPolicy), format);
 
         return {
           channel: args.channel,
@@ -528,9 +543,9 @@ export class ZulipToolRuntime {
           this.saveState();
         }
 
-        // Format output
+        // Format output — suppressed reaction markers never reach the model, raw format included.
         const format = args.format || "detailed";
-        const formattedOutput = formatMessages(allUnreadMessages, format);
+        const formattedOutput = formatMessages(stripSuppressedReactions(allUnreadMessages, this.reactionPolicy), format);
 
         return {
           total_unread: allUnreadMessages.length,
@@ -689,6 +704,7 @@ export class ZulipToolRuntime {
 
       case "find_user": {
         const usersResult = await zulipClient.users.retrieve();
+        assertApiSuccess(usersResult, "listing users");
         const members = usersResult.members || [];
         const query = args.query.toLowerCase();
 
@@ -724,21 +740,24 @@ export class ZulipToolRuntime {
       }
 
       case "fetch_history": {
-        const channel = String(args.channel ?? "");
+        const channel = String(args.channel ?? "").trim().replace(/^#/, "");
+        if (!channel) throw new Error("channel is required");
+        // A DM conversation reads by its channel id (`zulip:dm:<ids>`, the
+        // form every catch-up note and history line quotes); anything else
+        // is a stream name or stream channel id.
+        const dmIds = parseDmChannelId(channel.startsWith("zulip:") ? channel : `zulip:${channel}`);
         const streamName = channel.startsWith("zulip:") ? channel.slice("zulip:".length) : channel;
-        if (!streamName) throw new Error("channel is required");
         const limit = clampInt(args.limit, 50, 1, 1000);
         const page = await fetchHistory(zulipClient, {
-          streamName,
-          topic: typeof args.topic === "string" && args.topic ? args.topic : undefined,
+          ...(dmIds ? { dmUserIds: dmIds } : { streamName, topic: typeof args.topic === "string" && args.topic ? args.topic : undefined }),
           limit,
           before: numberOrUndefined(args.before),
           after: numberOrUndefined(args.after),
         });
         return {
-          channel: streamName,
-          channelId: `zulip:${streamName}`,
-          topic: args.topic,
+          channel: dmIds ? dmChannelIdFor(dmIds) : streamName,
+          channelId: dmIds ? dmChannelIdFor(dmIds) : `zulip:${streamName}`,
+          topic: dmIds ? undefined : args.topic,
           count: page.messages.length,
           oldest_id: page.messages[0]?.id ?? null,
           newest_id: page.messages[page.messages.length - 1]?.id ?? null,
@@ -790,6 +809,8 @@ export class ZulipToolRuntime {
     const now = Date.now();
     if (this.emojiCache && now - this.emojiCache.at < 300_000) return this.emojiCache.emoji;
     const result = await this.zulipClient.emojis.retrieve();
+    // An API error is an error, not an empty realm — and never cached as one.
+    assertApiSuccess(result, "listing realm emoji");
     const emoji = (result?.emoji ?? {}) as Record<string, { id: string; name: string; deactivated?: boolean }>;
     this.emojiCache = { at: now, emoji };
     return emoji;

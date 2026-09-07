@@ -21,6 +21,7 @@ import type {
   TextContent,
 } from '@animalabs/mcpl-core';
 import type {
+  ChannelHistoryPage,
   ChannelHistoryQuery,
   OnIncomingMessage,
   OnReaction,
@@ -112,8 +113,6 @@ export class ZulipAdapter implements PlatformAdapter {
   private readonly filters: FilterView;
   private readonly dmDiscoveryLimit: number;
   private readonly maxMessageLength: number | undefined;
-  /** Streams this process has confirmed a subscription for. */
-  private subscribed = new Set<string>();
   /** DM conversations already described to the server, by channel id. */
   private knownDms = new Map<string, ChannelDescriptor>();
   /** Recently seen messages, so a reaction can be placed without a round
@@ -346,18 +345,34 @@ export class ZulipAdapter implements PlatformAdapter {
     }
   }
 
+  /**
+   * The allowlists, applied to what a history read may hand on: a message
+   * from a stream outside `streams`, or a DM from a sender outside `dmUsers`,
+   * is withheld here the same way the live event path withholds it — so a
+   * narrowed allowlist is enforced on catch-up, gap recovery, backscroll and
+   * context injection, not only on live delivery. The bot's own messages
+   * pass (they are its own doing); callers decide whether to show them.
+   */
+  private allowed(m: ZulipMessage): boolean {
+    if (this.identity.selfUserId !== null && m.authorId === this.identity.selfUserId) return true;
+    if (m.isDm) return this.filters.dmAllowed({ id: m.authorId, email: m.authorEmail });
+    return m.streamName === null || this.filters.streamAllowed(m.streamName);
+  }
+
   async fetchContext(
     channelId: string,
     _descriptor: ChannelDescriptor | undefined,
     historySize: number,
   ): Promise<ContextInjection | null> {
     const dmIds = parseDmChannelId(channelId);
+    if (!dmIds && !this.filters.streamAllowed(streamNameOf(channelId))) return null;
     const page = await fetchHistory(this.zulipClient, dmIds
       ? { dmUserIds: dmIds, limit: historySize }
       : { streamName: streamNameOf(channelId), limit: historySize });
-    if (page.messages.length === 0) return null;
+    const messages = page.messages.filter((m) => this.allowed(m));
+    if (messages.length === 0) return null;
 
-    const formatted = page.messages.map((m) => {
+    const formatted = messages.map((m) => {
       const time = m.timestamp.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
       return dmIds
         ? `[${time}] ${m.authorName}: ${m.cleanContent}`
@@ -375,11 +390,16 @@ export class ZulipAdapter implements PlatformAdapter {
   /**
    * History as incoming-shaped messages, oldest first, the bot's own
    * messages excluded (they are already in the agent's own record as its
-   * turns). Marked `backscroll: true` so consumers can tell replayed history
-   * from live delivery.
+   * turns) and disallowed senders withheld. Marked `backscroll: true` so
+   * consumers can tell replayed history from live delivery. The page's
+   * `scannedThrough` covers the excluded rows too, so a pager never mistakes
+   * a page of nothing but the bot's own messages for the end of history.
    */
-  async fetchHistory(channelId: string, query: ChannelHistoryQuery): Promise<IncomingChannelMessage[]> {
+  async fetchHistory(channelId: string, query: ChannelHistoryQuery): Promise<ChannelHistoryPage> {
     const dmIds = parseDmChannelId(channelId);
+    if (!dmIds && !this.filters.streamAllowed(streamNameOf(channelId))) {
+      return { messages: [], scannedThrough: null, reachedNewest: true };
+    }
     const page = await fetchHistory(this.zulipClient, {
       ...(dmIds ? { dmUserIds: dmIds } : { streamName: streamNameOf(channelId) }),
       limit: query.limit,
@@ -387,9 +407,15 @@ export class ZulipAdapter implements PlatformAdapter {
       after: query.afterMessageId !== undefined ? Number(query.afterMessageId) : undefined,
     });
     for (const m of page.messages) this.remember(channelId, m);
-    return page.messages
+    const messages = page.messages
       .filter((m) => this.identity.selfUserId === null || m.authorId !== this.identity.selfUserId)
+      .filter((m) => this.allowed(m))
       .map((m) => toIncoming(channelId, m, this.identity, { backscroll: true }));
+    return {
+      messages,
+      scannedThrough: page.messages.length > 0 ? page.messages[page.messages.length - 1].id : null,
+      reachedNewest: page.foundNewest,
+    };
   }
 
   /**
@@ -397,6 +423,11 @@ export class ZulipAdapter implements PlatformAdapter {
    * `all_public_streams` on the queue — so opening a channel must also
    * subscribe the bot, or the host would be listening to silence.
    * Idempotent; subscription persists server-side. DMs need nothing.
+   *
+   * Asks Zulip every time rather than remembering: the `unlisten` tool
+   * removes subscriptions behind this adapter's back, and a remembered
+   * "subscribed" would let a later open succeed onto silence. The add call
+   * is cheap and answers `already_subscribed` when there is nothing to do.
    *
    * Throws when the subscription did not happen: an API error, a transport
    * failure, or — Zulip's way of refusing a private stream — a `success`
@@ -406,7 +437,6 @@ export class ZulipAdapter implements PlatformAdapter {
   async ensureSubscribed(channelId: string): Promise<void> {
     if (parseDmChannelId(channelId)) return;
     const streamName = streamNameOf(channelId);
-    if (this.subscribed.has(streamName)) return;
     const result = await this.zulipClient.users.me.subscriptions.add({
       subscriptions: [{ name: streamName }],
     });
@@ -415,7 +445,6 @@ export class ZulipAdapter implements PlatformAdapter {
     if (unauthorized.includes(streamName)) {
       throw new Error(`not authorized to subscribe to #${streamName} (private stream; the bot must be invited)`);
     }
-    this.subscribed.add(streamName);
     const fresh = result.subscribed && Object.keys(result.subscribed).length > 0;
     if (fresh) console.error(`[zulip-mcp] subscribed to #${streamName} for channel ${channelId}`);
   }
@@ -434,6 +463,8 @@ export class ZulipAdapter implements PlatformAdapter {
               channelId: where.channelId,
               messageId: String(ev.message_id),
               emoji: ev.emoji_name,
+              emojiCode: ev.emoji_code || undefined,
+              emojiType: ev.reaction_type || undefined,
               reactorId: String(ev.user_id),
               reactorName: ev.user?.full_name ?? `user ${ev.user_id}`,
               onOwnMessage: this.identity.selfUserId !== null && where.authorId === this.identity.selfUserId,

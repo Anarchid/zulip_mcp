@@ -321,3 +321,70 @@ test('incoming messages on unopened channels are ignored', () => {
   // covered indirectly by the publish-hints test requiring openChannel.
   assert.ok(true);
 });
+
+test('policy is rechecked at send time: withheld messages are reported, and a batch the host never answers is given up on after the retry', async () => {
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const sent: any[][] = [];
+    let fail = 0;
+    const client = {
+      registerChannels: async () => ({ results: [{ id: 'zulip:C1', accepted: true }] }),
+      sendIncoming: async (messages: any[]) => {
+        if (fail > 0) { fail--; throw new Error('host hiccup'); }
+        sent.push(messages);
+        return { results: messages.map((m) => ({ messageId: m.messageId, accepted: true })) };
+      },
+    } as any;
+    const desc: ChannelDescriptor = { id: 'zulip:C1', type: 'zulip', label: '#general', direction: 'bidirectional' };
+    const { adapter } = fakeAdapter('zulip', [desc]);
+    const withheld: string[] = [];
+    const givenUp: string[] = [];
+    const delivered: string[] = [];
+    let allow = true;
+    const manager = new ChannelManager(client, new Map([['zulip', adapter]]), grantedChannels(), 10, {
+      deliverable: () => allow,
+      onWithheld: (_channelId, messages) => withheld.push(...messages.map((m) => m.messageId)),
+      onGivenUp: (_channelId, messages) => givenUp.push(...messages.map((m) => m.messageId)),
+      onDelivered: (_channelId, accepted) => delivered.push(...accepted.map((m) => m.messageId)),
+    });
+    await manager.registerChannels();
+    manager.openChannel({ type: 'zulip' });
+    const msg = (id: string) => ({
+      channelId: 'zulip:C1', messageId: id, author: { id: 'U1', name: 'alice' },
+      timestamp: new Date(0).toISOString(), content: [{ type: 'text' as const, text: id }],
+    });
+
+    // Queued while allowed, policy flips before the window closes: withheld, never sent.
+    manager.onIncomingMessage('zulip:C1', msg('1'));
+    allow = false;
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(sent, []);
+    assert.deepEqual(withheld, ['1']);
+
+    // Allowed again; the host fails the attempt and the retry: given up, not dropped silently.
+    allow = true;
+    fail = 2;
+    manager.onIncomingMessage('zulip:C1', msg('2'));
+    await new Promise((r) => setTimeout(r, 60));
+    assert.deepEqual(sent, []);
+    assert.deepEqual(givenUp, ['2']);
+    assert.equal(manager.pendingCount(), 0);
+
+    // A healthy host: delivered and reported as such.
+    manager.onIncomingMessage('zulip:C1', msg('3'));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(sent.map((b) => b.map((m: any) => m.messageId)), [['3']]);
+    assert.deepEqual(delivered, ['3']);
+
+    // reset() forgets the connection's registrations, opens and buffer.
+    manager.onIncomingMessage('zulip:C1', msg('4'));
+    assert.equal(manager.pendingCount(), 1);
+    manager.reset();
+    assert.equal(manager.pendingCount(), 0);
+    assert.equal(manager.isOpen('zulip:C1'), false);
+    assert.equal(manager.getChannel('zulip:C1'), undefined);
+  } finally {
+    console.error = original;
+  }
+});

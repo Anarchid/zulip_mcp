@@ -59,6 +59,16 @@ export class CapabilityGrant {
     this.declarations = declarations;
   }
 
+  /**
+   * Forget the grant: a new connection starts from nothing (§5.3) — the
+   * previous peer's policy is not this peer's. Waiters from the old
+   * connection are dropped; their callers guard on the connection anyway.
+   */
+  reset(): void {
+    this.state = emptyGrantState();
+    this.readyWaiters = [];
+  }
+
   /** True once a grant-bearing `featureSets/update` Request has been accepted. */
   isReady(): boolean {
     return this.state.ready;

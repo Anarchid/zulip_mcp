@@ -30,9 +30,11 @@
  *   }
  *
  * Failure posture: an unparseable or vanished file keeps the last-known-good
- * filters in force (never fail-open) and marks the plane stale; a broken
- * file at startup runs the env seed for the allowlists and withholds ALL
- * reactions until the file is repaired. `filters_get` reports the plane's
+ * filters in force (never fail-open) and marks the plane stale. At startup
+ * there is no last-known-good, so a file that exists but cannot be parsed
+ * is a startup failure — the alternative would be running every
+ * authorization list on the env seed, which for a deployment that never set
+ * one means unrestricted. `filters_get` reports the plane's
  * desired-vs-effective state so disk ≠ process is always witnessed.
  */
 
@@ -65,9 +67,17 @@ function stripHash(s: string): string {
   return s.replace(/^#/, '');
 }
 
-/** Normalize a reaction emoji name for matching: strip VS-16 and colons. */
+/**
+ * The matching key of a reaction marker. A name (`biohazard`, `:eyes:`) is
+ * lower-cased without colons. A glyph (☣️, as the host's baseline carries
+ * them) becomes its codepoints in hex joined by '-', VS-16 stripped — the
+ * form Zulip reports as `emoji_code` for unicode emoji — so a glyph-shaped
+ * entry and a name-shaped event meet on the code.
+ */
 export function normalizeReactionEmoji(emoji: string): string {
-  return emoji.replace(/️/g, '').trim().replace(/^:|:$/g, '').toLowerCase();
+  const s = emoji.replace(/\uFE0F/g, '').trim().replace(/^:|:$/g, '');
+  if (/[^\x00-\x7F]/.test(s)) return [...s].map((c) => c.codePointAt(0)!.toString(16)).join('-');
+  return s.toLowerCase();
 }
 
 /** Drop empty lists so "unset" and "empty" stay one state (= unrestricted),
@@ -202,10 +212,8 @@ function sha256(s: string): string {
 
 export interface FiltersPlaneStatus {
   /** live: the file parsed and is applied. stale: the file is unreadable or
-   *  gone and the last-known-good filters are enforced (process-lifetime).
-   *  unavailable: broken with no good parse ever this process — allowlists
-   *  run on the env seed, reactions are withheld. */
-  status: 'live' | 'stale' | 'unavailable';
+   *  gone and the last-known-good filters are enforced (process-lifetime). */
+  status: 'live' | 'stale';
   desiredState: 'ok' | 'invalid' | 'missing';
   path: string;
   /** Digest of the normalized effective filters — the whole plane. */
@@ -215,7 +223,7 @@ export interface FiltersPlaneStatus {
 }
 
 export interface ReactionSuppressionStatus {
-  status: 'not-configured' | 'configured-empty' | 'active' | 'stale' | 'unavailable';
+  status: 'not-configured' | 'configured-empty' | 'active' | 'stale';
   protectionActive: boolean;
   /** File entries plus the host baseline, deduplicated. */
   effectiveCount: number;
@@ -223,7 +231,6 @@ export interface ReactionSuppressionStatus {
   effectiveDigest: string | null;
   /** How many of the effective entries come from the host-injected baseline. */
   baselineCount: number;
-  suppressingAllReactions?: true;
   source: 'file' | 'baseline' | 'file+baseline' | 'none';
 }
 
@@ -238,7 +245,6 @@ export class FiltersPlane {
   private digest: string | null = null;
   private loadedAt: string | null = null;
   private broken: { since: string; desired: 'invalid' | 'missing' } | null = null;
-  private everParsed = false;
   private listeners: ((next: ZulipFilters, prev: ZulipFilters) => void)[] = [];
   private poll: ReturnType<typeof setInterval> | null = null;
   private tracker: FiltersFilePollTracker | null = null;
@@ -260,22 +266,23 @@ export class FiltersPlane {
    * Throws when the file does not exist and cannot be created: "the file
    * always exists" is the contract every hot-reload guarantee rests on, and
    * a server that cannot keep it is misconfigured (unwritable state dir),
-   * not degraded.
+   * not degraded. Throws, too, when the file exists but cannot be parsed:
+   * every key in it is an authorization list, there is no last-known-good
+   * yet to fall back on, and the env seed behind it may well be "everything".
+   * The file is never overwritten — the operator repairs or removes it.
    */
   start(): void {
     if (this.poll) return;
     if (existsSync(this.path)) {
       const fromFile = loadFiltersFile(this.path);
-      if (fromFile) {
-        this.apply(fromFile, true);
-        console.error(`[zulip-mcp] filters loaded from ${this.path}`);
-      } else {
-        this.broken = { since: new Date().toISOString(), desired: 'invalid' };
-        console.error(
-          `[zulip-mcp] filters file ${this.path} exists but cannot be parsed — NOT overwriting it. ` +
-            'Running on the env seed; reaction suppression fails closed until the file is repaired.',
+      if (!fromFile) {
+        throw new Error(
+          `the filters file ${this.path} exists but cannot be parsed (invalid JSON or a wrong-typed key); ` +
+            'refusing to start on the env seed — repair the file, or remove it to re-seed from the environment',
         );
       }
+      this.apply(fromFile, true);
+      console.error(`[zulip-mcp] filters loaded from ${this.path}`);
     } else {
       try {
         saveFiltersFile(this.path, this.effective);
@@ -376,30 +383,30 @@ export class FiltersPlane {
     return this.effective.reactionChannels?.includes(channelId) ?? false;
   }
 
-  /** The withhold-everything posture: broken with no usable set ever. */
-  suppressAllReactions(): boolean {
-    if (!this.broken) return false;
-    if (!this.everParsed) return true;
-    const list = this.effective.suppressedReactionEmojis;
-    return list !== undefined && list.length === 0;
-  }
-
-  /** The file's entries plus the host baseline. */
+  /** The file's entries plus the host baseline, as matching keys. */
   private effectiveSuppressed(): string[] {
     return [...new Set([...(this.effective.suppressedReactionEmojis ?? []), ...this.baseline])];
   }
 
-  reactionSuppressed(emojiName: string): boolean {
+  /**
+   * Is a reaction withheld? Matched on the emoji name and, for unicode
+   * emoji, on its codepoints — so the host's glyph-shaped baseline (☣️)
+   * meets Zulip's name-shaped event (`biohazard`, code `2623`). A realm
+   * emoji's code is its realm id and is never compared against a glyph.
+   */
+  reactionSuppressed(emojiName: string, emojiCode?: string, reactionType?: string): boolean {
     const list = this.effectiveSuppressed();
     if (list.length === 0) return false;
-    return list.includes(normalizeReactionEmoji(emojiName));
+    if (list.includes(normalizeReactionEmoji(emojiName))) return true;
+    const unicode = reactionType === undefined || reactionType === 'unicode_emoji';
+    return unicode && !!emojiCode && list.includes(emojiCode.toLowerCase());
   }
 
   planeStatus(): FiltersPlaneStatus {
     const loaded = this.loadedAt ? { loadedAt: this.loadedAt } : {};
     if (this.broken) {
       return {
-        status: this.everParsed ? 'stale' : 'unavailable',
+        status: 'stale',
         desiredState: this.broken.desired,
         path: this.path,
         effectiveDigest: this.digest,
@@ -412,9 +419,6 @@ export class FiltersPlane {
 
   suppressionStatus(): ReactionSuppressionStatus {
     const baselineCount = this.baseline.length;
-    if (this.suppressAllReactions()) {
-      return { status: 'unavailable', protectionActive: true, effectiveCount: 0, effectiveDigest: null, baselineCount, suppressingAllReactions: true, source: this.everParsed ? 'file' : 'none' };
-    }
     const fromFile = this.effective.suppressedReactionEmojis;
     const list = this.effectiveSuppressed();
     const n = list.length;
@@ -441,7 +445,6 @@ export class FiltersPlane {
     const digest = sha256(stableStringify(normalized));
     const changed = digest !== this.digest;
     this.broken = null;
-    this.everParsed = true;
     if (changed) this.loadedAt = new Date().toISOString();
     this.digest = digest;
     this.effective = normalized;

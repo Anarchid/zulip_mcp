@@ -341,9 +341,10 @@ export const toolDefinitions: ToolDefinition[] = [
     name: "set_reaction_visibility",
     description:
       "Opt a channel in or out of showing emoji reactions live. When ON, reactions added or removed on ANY message in " +
-      "that channel appear in your context as they happen — but they NEVER wake you; you just see them next time you " +
-      "are active. Default OFF, persisted across restarts. (Reactions on history you fetch always show via " +
-      "fetch_history regardless of this setting.)",
+      "that channel appear in your context as they happen. They carry only reaction tags (chat:reaction, " +
+      "chat:reaction-remove), so a wake policy keyed on tags leaves you asleep; a policy that wakes on everything in " +
+      "the channel wakes on them too. Default OFF, persisted across restarts. (Reactions on history you fetch always " +
+      "show via fetch_history regardless of this setting.)",
     inputSchema: {
       type: "object",
       properties: {
@@ -370,7 +371,7 @@ export const toolDefinitions: ToolDefinition[] = [
   {
     name: "fetch_history",
     description:
-      "Fetch message history from a stream (optionally one topic), oldest first. By default returns " +
+      "Fetch message history from a stream (optionally one topic) or a DM conversation, oldest first. By default returns " +
       "the most recent messages. Use `before` (a message id) to scroll further back — pass the id of " +
       "the oldest message you have seen to page backwards. Use `after` (a message id) to fetch only " +
       "messages newer than a given point. Message ids are realm-global and increase over time, so " +
@@ -379,8 +380,8 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: {
-        channel: { type: "string", description: "Stream name (e.g. 'general') or channel id ('zulip:general')" },
-        topic: { type: "string", description: "Optional: limit to one topic" },
+        channel: { type: "string", description: "Stream name (e.g. 'general'), stream channel id ('zulip:general'), or DM conversation id ('zulip:dm:42')" },
+        topic: { type: "string", description: "Optional: limit to one topic (streams only)" },
         limit: { type: "number", description: "Max messages to fetch (default 50, max 1000)" },
         before: { type: "number", description: "Only messages older than this message id (exclusive)" },
         after: { type: "number", description: "Only messages newer than this message id (exclusive)" },
@@ -423,7 +424,7 @@ export const toolDefinitions: ToolDefinition[] = [
     description:
       "Show the active event filters: which streams may deliver events to you (null = every stream the bot can " +
       "see), which users may DM you (null = anyone), and which streams are muted. Reports the filters plane's " +
-      "desired-vs-effective state (live / stale / unavailable) and the reaction-suppression state as a count and " +
+      "desired-vs-effective state (live / stale) and the reaction-suppression state as a count and " +
       "digest — the suppressed entries themselves are operator-owned and never shown here.",
     inputSchema: { type: "object", properties: {} },
   },

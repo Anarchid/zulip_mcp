@@ -103,8 +103,7 @@ async function main(): Promise<void> {
   });
   const tools = new ZulipToolRuntime(session, stateDir);
   tools.setReactionPolicy({
-    suppressed: (name) => filters.reactionSuppressed(name),
-    suppressAll: () => filters.suppressAllReactions(),
+    suppressed: (name, code, type) => filters.reactionSuppressed(name, code, type),
   });
   const server = new ZulipMcplServer(adapter, tools, {
     serverInfo: SERVER_INFO,

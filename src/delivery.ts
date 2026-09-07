@@ -6,7 +6,10 @@
  *   watermarks   channelId → highest message id forwarded to the host. The
  *                "since when" anchor for the reconnect sweep, for gap
  *                recovery after a Zulip event-queue expiry, and for
- *                `sinceLastSeen` history on channels/open.
+ *                `sinceLastSeen` history on channels/open. It never passes
+ *                an id the host was offered but has not accepted (the
+ *                undelivered floor, below), so a later acceptance cannot
+ *                bury an earlier loss.
  *   missed       channelId → tally of ambient messages dropped because the
  *                host had the channel closed. Reported by `channel_missed`
  *                and carried on closed-channel push events so "reply without
@@ -39,10 +42,40 @@ interface DeliveryFile {
   lastOpen?: string[];
 }
 
+/** Why an offered message is not (yet) accepted. `queued` is on its way;
+ *  `failed` outlived the transport retry; `rejected` the host refused. */
+export type HeldStatus = 'queued' | 'failed' | 'rejected';
+
+interface Held {
+  status: HeldStatus;
+  /** A live replay from history has been attempted once already. */
+  replayed: boolean;
+}
+
+/** Ids held per channel before the newest ones stop being tracked. Far
+ *  beyond any real outage; the floor (the lowest id) is what matters and
+ *  the lowest ids are the ones kept. */
+const HELD_CAP_PER_CHANNEL = 50_000;
+
 export class DeliveryState {
   private watermarks = new Map<string, number>();
   private missed = new Map<string, MissedTally>();
   private lastOpen = new Set<string>();
+  /**
+   * The undelivered floor (in-memory). Every message id offered to the host
+   * on a channel — queued for `channels/incoming`, or sent as `push/event` —
+   * is held here until the host accepts it. The watermark never advances
+   * past the lowest held id, whatever is accepted after it: a message the
+   * host refused or a batch lost to a transport failure stays below the
+   * watermark, so the next sweep, a gap recovery, or a live replay can offer
+   * it again instead of a later acceptance burying it. Not persisted: the
+   * persisted watermark is already below every held id, which is all a
+   * restart needs.
+   */
+  private held = new Map<string, Map<number, Held>>();
+  /** The highest id acceptance has reached per channel; the watermark is
+   *  this, capped by the floor. Recomputed when a hold is released. */
+  private reached = new Map<string, number>();
 
   constructor(
     private readonly stateDir: string | null,
@@ -103,16 +136,118 @@ export class DeliveryState {
     return this.watermarks.get(channelId);
   }
 
-  /** Advance (never retreat) the forwarded watermark. Returns true if it moved. */
+  /**
+   * Advance (never retreat) the forwarded watermark towards `messageId`,
+   * stopping below the undelivered floor. Returns true if it moved.
+   */
   advance(channelId: string, messageId: number): boolean {
+    const reached = Math.max(this.reached.get(channelId) ?? 0, this.watermarks.get(channelId) ?? 0, messageId);
+    this.reached.set(channelId, reached);
+    return this.settle(channelId);
+  }
+
+  /**
+   * Everything at or below `messageId` has been delivered (a catch-up block
+   * scanned and pushed the whole range): release the holds in it and
+   * advance. Returns true if the watermark moved.
+   */
+  advanceThrough(channelId: string, messageId: number): boolean {
+    const held = this.held.get(channelId);
+    if (held) {
+      for (const id of held.keys()) if (id <= messageId) held.delete(id);
+      if (held.size === 0) this.held.delete(channelId);
+    }
+    return this.advance(channelId, messageId);
+  }
+
+  /** Apply the floor: watermark = highest reached, capped below the lowest held id. */
+  private settle(channelId: string): boolean {
+    const reached = this.reached.get(channelId);
+    if (reached === undefined) return false;
+    const floor = this.floor(channelId);
+    const target = floor === undefined ? reached : Math.min(reached, floor - 1);
     const current = this.watermarks.get(channelId) ?? 0;
-    if (messageId <= current) return false;
-    this.watermarks.set(channelId, messageId);
+    if (target <= current) return false;
+    this.watermarks.set(channelId, target);
     return true;
   }
 
   watermarkedChannels(): string[] {
     return [...this.watermarks.keys()];
+  }
+
+  // ── undelivered floor ──
+
+  /** The message was offered to the host and is not accepted yet. An id at
+   *  or below the watermark is already forwarded and is not held. */
+  hold(channelId: string, messageId: number, status: HeldStatus = 'queued'): void {
+    if (!Number.isFinite(messageId) || messageId <= 0) return;
+    if (messageId <= (this.watermarks.get(channelId) ?? 0)) return;
+    let held = this.held.get(channelId);
+    if (!held) {
+      held = new Map();
+      this.held.set(channelId, held);
+    }
+    const existing = held.get(messageId);
+    if (existing) {
+      existing.status = status;
+      return;
+    }
+    if (held.size >= HELD_CAP_PER_CHANNEL) {
+      // Keep the lowest ids: the floor protects everything above it anyway.
+      const highest = Math.max(...held.keys());
+      if (messageId >= highest) {
+        console.error(`[zulip-mcp] ${channelId}: undelivered floor holds ${held.size} ids; not tracking ${messageId}`);
+        return;
+      }
+      held.delete(highest);
+    }
+    held.set(messageId, { status, replayed: false });
+  }
+
+  /** The host accepted the message. Returns true if the watermark moved. */
+  release(channelId: string, messageId: number): boolean {
+    const held = this.held.get(channelId);
+    if (!held?.delete(messageId)) return false;
+    if (held.size === 0) this.held.delete(channelId);
+    return this.settle(channelId);
+  }
+
+  /** Drop every hold on a channel (nothing from it may reach the agent any more). */
+  releaseAll(channelId: string): boolean {
+    if (!this.held.delete(channelId)) return false;
+    return this.settle(channelId);
+  }
+
+  /** The lowest id offered but not accepted, if any. */
+  floor(channelId: string): number | undefined {
+    const held = this.held.get(channelId);
+    if (!held || held.size === 0) return undefined;
+    return Math.min(...held.keys());
+  }
+
+  heldChannels(): string[] {
+    return [...this.held.keys()];
+  }
+
+  /** Held ids on a channel, ascending; optionally only those a live replay may still try. */
+  heldIds(channelId: string, opts: { replayable?: boolean } = {}): number[] {
+    const held = this.held.get(channelId);
+    if (!held) return [];
+    return [...held.entries()]
+      .filter(([, h]) => !opts.replayable || (h.status !== 'queued' && !h.replayed))
+      .map(([id]) => id)
+      .sort((a, b) => a - b);
+  }
+
+  /** A live replay of these ids has been attempted; only a sweep or gap recovery re-offers them after this. */
+  markReplayed(channelId: string, ids: number[]): void {
+    const held = this.held.get(channelId);
+    if (!held) return;
+    for (const id of ids) {
+      const h = held.get(id);
+      if (h) h.replayed = true;
+    }
   }
 
   // ── open mirror ──
@@ -236,21 +371,23 @@ export interface MissedBlockOptions {
   newestScannedId?: number;
 }
 
+/** The channel a `<missed>` note points the agent at — `fetch_history`
+ *  reads DM conversations by their channel id, so the id is quoted as is. */
+function historyPointer(channelId: string, cursor: 'before' | 'after', id: number | undefined): string {
+  return `fetch_history(channel="${channelId}", ${cursor}=${id})`;
+}
+
 /**
  * The `<missed>` transcript block delivered after downtime. Each line leads
  * with the message id so the agent can fetch_around(id) for more context,
- * and mention lines are flagged so they stand out from vicinity. Over the
- * character budget the oldest lines go first, replaced by one line naming
- * the elided id range so fetch_history can page into it.
+ * and mention lines are flagged so they stand out from vicinity.
+ *
+ * `maxChars` is a hard cap on the whole serialized block, header and notes
+ * included: the oldest lines go first, replaced by one line naming the
+ * elided id range so fetch_history can page into it; when the single
+ * newest line is itself over budget it is cut and says so.
  */
 export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions): string {
-  const attrs = [
-    `stream="#${opts.streamName}"`,
-    `channelId="${opts.channelId}"`,
-    `count="${opts.count}"`,
-  ];
-  if (opts.reason === 'mention') attrs.push(`lines="${msgs.length}"`);
-  attrs.push(`reason="${opts.reason}"`);
   const render = (m: MissedView): string => {
     const ts = opts.formatTime(m.timestamp);
     const att = m.attachmentNames.length > 0 ? ` [attachments: ${m.attachmentNames.join(', ')}]` : '';
@@ -258,28 +395,44 @@ export function renderMissedBlock(msgs: MissedView[], opts: MissedBlockOptions):
     return `[${ts ? `${ts} ` : ''}id=${m.id}] [${m.topic}] ${m.authorName}${mark}: ${m.text}${att}`;
   };
   const lines = msgs.map(render);
-
   const budget = opts.maxChars ?? Infinity;
-  let total = lines.reduce((n, l) => n + l.length + 1, 0);
+  const newestScanned = opts.newestScannedId ?? msgs[msgs.length - 1]?.id;
+
+  const assemble = (elided: number, cut: string | null): string => {
+    const attrs = [`stream="#${opts.streamName}"`, `channelId="${opts.channelId}"`, `count="${opts.count}"`];
+    if (opts.reason === 'mention') attrs.push(`lines="${msgs.length}"`);
+    attrs.push(`reason="${opts.reason}"`);
+    const head: string[] = [];
+    const tail: string[] = [];
+    if (elided > 0) {
+      head.push(
+        `[${elided} earlier line(s) elided (ids ${msgs[0].id}–${msgs[elided - 1].id}) to fit the catch-up budget — ` +
+          `${historyPointer(opts.channelId, 'before', msgs[elided].id)} pages into them]`,
+      );
+      attrs.push(`elided="${elided}"`);
+    }
+    if (opts.moreBeyond) {
+      tail.push(`[the catch-up ceiling was reached; newer messages exist — ${historyPointer(opts.channelId, 'after', newestScanned)} continues]`);
+      attrs.push('truncated="true"');
+    }
+    const body = cut !== null ? [cut] : lines.slice(elided);
+    return [`<missed ${attrs.join(' ')}>`, ...head, ...body, ...tail, '</missed>'].join('\n');
+  };
+
+  // Elide the oldest lines until the whole block fits; always keep the newest.
   let elided = 0;
-  while (elided < lines.length - 1 && total > budget) {
-    total -= lines[elided].length + 1;
+  let block = assemble(elided, null);
+  while (block.length > budget && elided < lines.length - 1) {
     elided++;
+    block = assemble(elided, null);
   }
-  const kept = lines.slice(elided);
-  const notes: string[] = [];
-  if (elided > 0) {
-    const firstKept = msgs[elided].id;
-    notes.push(
-      `[${elided} earlier line(s) elided (ids ${msgs[0].id}–${msgs[elided - 1].id}) to fit the catch-up budget — ` +
-        `fetch_history(channel, before=${firstKept}) pages into them]`,
-    );
-    attrs.push(`elided="${elided}"`);
+  if (block.length > budget && lines.length > 0) {
+    // One line is over budget by itself: cut it to what fits, and say so.
+    const last = msgs[msgs.length - 1];
+    const marker = ` … [line cut to fit the catch-up budget — fetch_around(${last.id}) has the whole message]`;
+    const room = budget - (assemble(elided, '').length + marker.length);
+    const full = lines[lines.length - 1];
+    block = assemble(elided, `${full.slice(0, Math.max(0, room))}${marker}`);
   }
-  if (opts.moreBeyond) {
-    const last = opts.newestScannedId ?? msgs[msgs.length - 1]?.id;
-    notes.push(`[the catch-up ceiling was reached; newer messages exist — fetch_history(channel, after=${last}) continues]`);
-    attrs.push('truncated="true"');
-  }
-  return [`<missed ${attrs.join(' ')}>`, ...(elided > 0 ? [notes.shift()!] : []), ...kept, ...notes, '</missed>'].join('\n');
+  return block;
 }

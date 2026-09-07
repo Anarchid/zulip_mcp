@@ -163,7 +163,7 @@ test('fetchAround centres a window on the anchor within its own conversation', a
   // A DM anchor narrows on its conversation.
   const dm = fakeClient([raw({ id: 5, type: 'private', display_recipient: [{ id: 790, full_name: 'Bot', email: 'b' }, { id: 42, full_name: 'Bo', email: 'bo' }] })]);
   await fetchAround(dm, 5, 10);
-  assert.deepEqual(dm.calls[0].narrow, [['dm', [790, 42]]]);
+  assert.deepEqual(dm.calls[0].narrow, [{ operator: 'dm', operand: [790, 42] }]);
 
   // An unreadable anchor fails loudly instead of widening to the realm timeline.
   await assert.rejects(fetchAround(client, 999, 10), /Invalid message/);
@@ -207,7 +207,8 @@ test('DM channel ids are the sorted counterpart ids, bot excluded, and round-tri
 test('fetchHistory narrows on a DM conversation when asked', async () => {
   const client = fakeClient([]);
   await fetchHistory(client, { dmUserIds: [7, 42], limit: 5 });
-  assert.deepEqual(client.calls[0].narrow, [['dm', [7, 42]]]);
+  // The object form: a pair with a list operand is refused by Zulip.
+  assert.deepEqual(client.calls[0].narrow, [{ operator: 'dm', operand: [7, 42] }]);
 });
 
 test('reactions are bucketed by emoji and rendered with counts and self-marking', () => {
@@ -220,8 +221,8 @@ test('reactions are bucketed by emoji and rendered with counts and self-marking'
   });
   const m = normalizeMessage(raw_);
   assert.deepEqual(m.reactions, [
-    { name: 'thumbs_up', count: 2, userIds: [7, 790] },
-    { name: 'eyes', count: 1, userIds: [9] },
+    { name: 'thumbs_up', code: '1f44d', type: 'unicode_emoji', count: 2, userIds: [7, 790] },
+    { name: 'eyes', code: '1f440', type: 'unicode_emoji', count: 1, userIds: [9] },
   ]);
   assert.equal(renderReactions(m.reactions, 790), ' [reactions: :thumbs_up: x2 (incl. me), :eyes: x1]');
   assert.equal(renderReactions(m.reactions, null), ' [reactions: :thumbs_up: x2, :eyes: x1]');

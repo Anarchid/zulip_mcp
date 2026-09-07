@@ -39,6 +39,52 @@ test('watermarks only advance, and survive a restart', () => {
   }
 });
 
+test('the undelivered floor: the watermark never passes an offered-but-unaccepted id, and lifts when it is delivered', () => {
+  const state = new DeliveryState(null, 'mem');
+  // 1, 2, 3 offered; 1 and 3 accepted, 2 rejected.
+  for (const id of [1, 2, 3]) state.hold('zulip:general', id);
+  assert.equal(state.floor('zulip:general'), 1);
+  state.release('zulip:general', 1);
+  state.release('zulip:general', 3);
+  state.hold('zulip:general', 2, 'rejected');
+  assert.equal(state.advance('zulip:general', 3), true);
+  assert.equal(state.watermark('zulip:general'), 1, 'stops below the rejected id');
+
+  // A later batch is accepted in full: still capped by the floor.
+  state.hold('zulip:general', 4);
+  state.release('zulip:general', 4);
+  assert.equal(state.advance('zulip:general', 4), false);
+  assert.equal(state.watermark('zulip:general'), 1);
+  assert.deepEqual(state.heldIds('zulip:general'), [2]);
+  assert.deepEqual(state.heldIds('zulip:general', { replayable: true }), [2], 'rejected → a live replay may try once');
+  state.markReplayed('zulip:general', [2]);
+  assert.deepEqual(state.heldIds('zulip:general', { replayable: true }), [], 'and only once');
+
+  // The replay is accepted: the floor lifts and the watermark catches up to everything accepted.
+  assert.equal(state.release('zulip:general', 2), true);
+  assert.equal(state.watermark('zulip:general'), 4);
+  assert.equal(state.floor('zulip:general'), undefined);
+
+  // A batch given up on holds too; a catch-up block that scanned past it releases it.
+  state.hold('zulip:general', 5, 'failed');
+  state.hold('zulip:general', 6);
+  state.release('zulip:general', 6);
+  state.advance('zulip:general', 6);
+  assert.equal(state.watermark('zulip:general'), 4);
+  assert.equal(state.advanceThrough('zulip:general', 6), true);
+  assert.equal(state.watermark('zulip:general'), 6);
+  assert.deepEqual(state.heldChannels(), []);
+
+  // Already forwarded ids are never held; releasing everything drops a channel's floor.
+  state.hold('zulip:general', 3);
+  assert.equal(state.floor('zulip:general'), undefined);
+  state.hold('zulip:general', 9, 'failed');
+  state.advance('zulip:general', 10);
+  assert.equal(state.watermark('zulip:general'), 8);
+  assert.equal(state.releaseAll('zulip:general'), true);
+  assert.equal(state.watermark('zulip:general'), 10);
+});
+
 test('closing a channel starts a tally anchored at the watermark; reopening clears it', () => {
   const state = new DeliveryState(null, 'mem');
   state.advance('zulip:dev', 100);
@@ -182,7 +228,7 @@ test('renderMissedBlock elides the oldest lines over budget and points at what l
   const lines = block.split('\n');
   assert.match(lines[0], /elided="\d+"/);
   assert.match(lines[0], /truncated="true"/);
-  assert.match(lines[1], /^\[\d+ earlier line\(s\) elided \(ids 1–\d+\).*fetch_history\(channel, before=\d+\)/);
+  assert.match(lines[1], /^\[\d+ earlier line\(s\) elided \(ids 1–\d+\).*fetch_history\(channel="zulip:general", before=\d+\)/);
   assert.match(lines[2], /^\[id=\d+\] /);
   assert.match(lines[lines.length - 1], /^<\/missed>$/);
   assert.match(lines[lines.length - 2], /catch-up ceiling was reached.*after=50/);
@@ -194,4 +240,25 @@ test('renderMissedBlock elides the oldest lines over budget and points at what l
     streamName: 'general', channelId: 'zulip:general', reason: 'backscroll', count: 2, formatTime: () => '', maxChars: 40_000,
   });
   assert.doesNotMatch(small, /elided|truncated/);
+});
+
+test('renderMissedBlock: the budget is a hard cap on the whole block, one long line included', () => {
+  // Header, elision note and ceiling note all count; the block never exceeds the budget.
+  const views = Array.from({ length: 30 }, (_, i) => viewOf(msg(i + 1, false, 'y'.repeat(120))));
+  const tight = renderMissedBlock(views, {
+    streamName: 'general', channelId: 'zulip:dm:42', reason: 'backscroll', count: 30, formatTime: () => '',
+    maxChars: 1000, moreBeyond: true, newestScannedId: 30,
+  });
+  assert.ok(tight.length <= 1000, `block is ${tight.length} chars`);
+  assert.match(tight, /elided="\d+"/);
+  assert.match(tight, /fetch_history\(channel="zulip:dm:42", before=\d+\)/, 'a DM conversation is pointed at by its channel id');
+  assert.match(tight, /fetch_history\(channel="zulip:dm:42", after=30\)/);
+  assert.ok(tight.includes('[id=30]'), 'the newest line survives');
+
+  // A single 5 000-character message under a 1 000-character budget: cut, and said so.
+  const huge = renderMissedBlock([viewOf(msg(7, true, 'z'.repeat(5000)))], {
+    streamName: 'general', channelId: 'zulip:general', reason: 'mention', count: 1, formatTime: () => '', maxChars: 1000,
+  });
+  assert.ok(huge.length <= 1000, `block is ${huge.length} chars`);
+  assert.match(huge, /^<missed stream="#general" channelId="zulip:general" count="1" lines="1" reason="mention">\n\[id=7\] \[topic-a\] Ann \(mention\): z+ … \[line cut to fit the catch-up budget — fetch_around\(7\) has the whole message\]\n<\/missed>$/);
 });

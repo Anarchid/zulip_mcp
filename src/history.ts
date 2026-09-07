@@ -36,6 +36,10 @@ export interface ZulipRawMessage {
 export interface ReactionSummary {
   /** Zulip emoji name, e.g. 'thumbs_up' — the `:name:` form is what add_reaction takes. */
   name: string;
+  /** Zulip's `emoji_code`: codepoints ('1f44d') for unicode emoji, the realm emoji id otherwise. */
+  code?: string;
+  /** Zulip's `reaction_type`. */
+  type?: string;
   count: number;
   /** Who reacted. */
   userIds: number[];
@@ -47,7 +51,13 @@ export function summarizeReactions(raw: ZulipRawMessage['reactions']): ReactionS
     if (!r || typeof r.emoji_name !== 'string') continue;
     let b = buckets.get(r.emoji_name);
     if (!b) {
-      b = { name: r.emoji_name, count: 0, userIds: [] };
+      b = {
+        name: r.emoji_name,
+        ...(typeof r.emoji_code === 'string' ? { code: r.emoji_code } : {}),
+        ...(typeof r.reaction_type === 'string' ? { type: r.reaction_type } : {}),
+        count: 0,
+        userIds: [],
+      };
       buckets.set(r.emoji_name, b);
     }
     b.count += 1;
@@ -127,10 +137,18 @@ export function assertApiSuccess(result: unknown, what: string): void {
   }
 }
 
+/**
+ * The narrow for a query. Stream and topic use the `[operator, operand]`
+ * pair form. A DM conversation cannot: its operand is a list of user ids,
+ * and Zulip rejects a pair whose operand is not a string ("element is not
+ * a string pair") while a stringified id is read as an email ("unknown
+ * user"). The `{operator, operand}` object form takes the list as is. The
+ * `dm` operator needs Zulip 7.0 (June 2023).
+ */
 function narrowFor(q: Pick<HistoryQuery, 'streamName' | 'topic' | 'dmUserIds'>): unknown[] {
   const narrow: unknown[] = [];
   if (q.dmUserIds && q.dmUserIds.length > 0) {
-    narrow.push(['dm', q.dmUserIds]);
+    narrow.push({ operator: 'dm', operand: q.dmUserIds });
     return narrow;
   }
   if (q.streamName) narrow.push(['stream', q.streamName]);

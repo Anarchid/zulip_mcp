@@ -222,27 +222,66 @@ test('a filters file that cannot be created fails the start, not silently', () =
   }
 });
 
-test('a broken file at startup runs the env seed and withholds all reactions until repaired', () => {
+test('a broken file at startup is a startup failure, never a run on the env seed', () => {
   const dir = tmp();
   try {
+    // Unparseable: with no ZULIP_STREAMS/ZULIP_DM_USERS in the environment,
+    // "run on the env seed" would mean every stream and every DM sender.
     const path = join(dir, 'filters.json');
     writeFileSync(path, '{nope');
-    const plane = new FiltersPlane(path, { ZULIP_STREAMS: 'general' }, { pollMs: 60_000 });
-    quiet(() => plane.start());
+    const plane = new FiltersPlane(path, {}, { pollMs: 60_000 });
+    assert.throws(() => quiet(() => plane.start()), /exists but cannot be parsed.*refusing to start/);
     assert.equal(readFileSync(path, 'utf-8'), '{nope', 'the operator file is never overwritten');
-    assert.equal(plane.streamAllowed('general'), true);
-    assert.equal(plane.planeStatus().status, 'unavailable');
-    assert.equal(plane.suppressAllReactions(), true);
-    assert.equal(plane.suppressionStatus().suppressingAllReactions, true);
-    assert.equal(plane.update((f) => f).ok, false);
 
-    writeFileSync(path, JSON.stringify({ streams: ['general'], suppressedReactionEmojis: [] }));
+    // Wrong-typed key: one typo in an authorization list, same posture.
+    writeFileSync(path, JSON.stringify({ streams: 'private' }));
+    assert.throws(() => quiet(() => new FiltersPlane(path, {}, { pollMs: 60_000 }).start()), /cannot be parsed/);
+
+    // Repaired: starts, and a later corruption keeps the last-known-good.
+    writeFileSync(path, JSON.stringify({ streams: ['private'], suppressedReactionEmojis: [] }));
+    const fixed = new FiltersPlane(path, {}, { pollMs: 60_000 });
+    quiet(() => fixed.start());
+    assert.equal(fixed.streamAllowed('general'), false);
+    assert.equal(fixed.suppressionStatus().status, 'configured-empty');
+    writeFileSync(path, '{nope');
     utimesSync(path, new Date(Date.now() + 5000), new Date(Date.now() + 5000));
-    quiet(() => plane.tick());
-    assert.equal(plane.planeStatus().status, 'live');
-    assert.equal(plane.suppressAllReactions(), false);
-    assert.equal(plane.suppressionStatus().status, 'configured-empty');
+    quiet(() => fixed.tick());
+    assert.equal(fixed.planeStatus().status, 'stale');
+    assert.equal(fixed.streamAllowed('general'), false, 'last-known-good stays in force');
+    assert.equal(fixed.update((f) => f).ok, false);
+    fixed.stop();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the host baseline is glyph-shaped and matches Zulip reactions on their codepoints', () => {
+  const dir = tmp();
+  try {
+    // What connectome-host injects: the framework's refusal glyphs, verbatim.
+    const plane = new FiltersPlane(join(dir, 'filters.json'), { DISCORD_SUPPRESSED_REACTIONS_BASELINE: '☣️,🧪,☢️,💻,🧠,🛑' }, { pollMs: 60_000 });
+    quiet(() => plane.start());
+    assert.equal(normalizeReactionEmoji('☣️'), '2623', 'VS-16 stripped, codepoints in hex');
+    assert.equal(normalizeReactionEmoji('🧑‍💻'), '1f9d1-200d-1f4bb', 'sequences join with -');
+    // A Zulip event or history row: name + emoji_code + reaction_type.
+    assert.equal(plane.reactionSuppressed('biohazard', '2623', 'unicode_emoji'), true);
+    assert.equal(plane.reactionSuppressed('test_tube', '1f9ea', 'unicode_emoji'), true);
+    assert.equal(plane.reactionSuppressed('octagonal_sign', '1f6d1', 'unicode_emoji'), true);
+    assert.equal(plane.reactionSuppressed('thumbs_up', '1f44d', 'unicode_emoji'), false);
+    // Name-only (no code known) still matches a name-shaped entry, not a glyph one.
+    assert.equal(plane.reactionSuppressed('biohazard'), false);
+    // A realm emoji's code is its realm id: never compared against a glyph.
+    assert.equal(plane.reactionSuppressed('custom', '2623', 'realm_emoji'), false);
+    assert.equal(plane.suppressionStatus().baselineCount, 6);
     plane.stop();
+
+    // A name-shaped entry still matches by name, code or no code.
+    const named = new FiltersPlane(join(dir, 'named.json'), { ZULIP_SUPPRESSED_REACTIONS_BASELINE: 'biohazard' }, { pollMs: 60_000 });
+    quiet(() => named.start());
+    assert.equal(named.reactionSuppressed('biohazard'), true);
+    assert.equal(named.reactionSuppressed('biohazard', '2623', 'unicode_emoji'), true);
+    assert.equal(named.reactionSuppressed('eyes', '1f440', 'unicode_emoji'), false);
+    named.stop();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

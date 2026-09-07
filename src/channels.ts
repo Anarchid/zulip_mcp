@@ -61,6 +61,19 @@ export interface ChannelManagerHooks {
    * may advance.
    */
   onDelivered?: (channelId: string, accepted: IncomingChannelMessage[], rejected: IncomingChannelMessage[]) => void;
+  /**
+   * Decides at send time whether a queued message may still go out. A mute,
+   * an allowlist narrowing or a feature-set reduction that landed while the
+   * message sat in the batch window (or waited for its retry) is honoured
+   * here, not only at enqueue.
+   */
+  deliverable?: (message: IncomingChannelMessage) => boolean;
+  /** Messages removed from a batch by policy — `deliverable`, or a missing
+   *  `channels.incoming` grant — grouped per channel. Not sent, not answered. */
+  onWithheld?: (channelId: string, messages: IncomingChannelMessage[]) => void;
+  /** Messages given up on after the transport retry, per channel: never
+   *  accepted, never rejected — the host simply did not answer. */
+  onGivenUp?: (channelId: string, messages: IncomingChannelMessage[]) => void;
 }
 
 export class ChannelManager {
@@ -409,6 +422,20 @@ export class ChannelManager {
     }
   }
 
+  /**
+   * Forget everything that belonged to a connection: the descriptors the
+   * peer accepted, what it had open, what was buffered for it. A new peer
+   * registers and opens afresh; whatever was buffered is re-offered by the
+   * catch-up sweep, not sent to a host that never asked for it.
+   */
+  reset(): void {
+    this.destroy();
+    this.allChannels.clear();
+    this.openChannels.clear();
+    this.batchBuffer.clear();
+    this.lastIncoming.clear();
+  }
+
   // -- Private --
 
   private enqueue(channelId: string, message: IncomingChannelMessage, attempts = 0): void {
@@ -443,15 +470,32 @@ export class ChannelManager {
    * The buffer is taken, not cleared: on a failed request the batch goes
    * back (front of the queue, attempts + 1) for one more try, and only
    * messages the host itemizes as accepted reach `onDelivered`. A host that
-   * rejects a message has refused it (§14.5) — it is logged and dropped, and
-   * its watermark does not move, so the reconnect sweep can offer it again.
+   * rejects a message has refused it (§14.5) — it is logged and reported
+   * rejected, and a batch that outlives the retry is reported given up; in
+   * neither case does a watermark move, so the message can be offered again.
    */
   private async flushBatch(): Promise<void> {
     const taken = new Map(this.batchBuffer);
     this.batchBuffer.clear();
-    const queued: Queued[] = [];
+    let queued: Queued[] = [];
     for (const items of taken.values()) queued.push(...items);
     if (queued.length === 0) return;
+
+    // Policy is rechecked at send time, not only at enqueue: what changed
+    // during the batch window (a mute, a narrowed allowlist, a reduced
+    // grant) applies to what is still waiting.
+    if (this.hooks.deliverable) {
+      const withheld = new Map<string, IncomingChannelMessage[]>();
+      queued = queued.filter((q) => {
+        if (this.hooks.deliverable!(q.message)) return true;
+        const list = withheld.get(q.message.channelId) ?? [];
+        list.push(q.message);
+        withheld.set(q.message.channelId, list);
+        return false;
+      });
+      for (const [channelId, messages] of withheld) this.report(this.hooks.onWithheld, channelId, messages);
+      if (queued.length === 0) return;
+    }
     const allMessages = queued.map((q) => q.message);
 
     // §14.1: `channels/incoming` is server→host content injection plus wake
@@ -462,6 +506,7 @@ export class ChannelManager {
       console.error(
         `channels.incoming not granted; dropping ${allMessages.length} inbound message(s)`,
       );
+      for (const [channelId, messages] of groupByChannel(allMessages)) this.report(this.hooks.onWithheld, channelId, messages);
       return;
     }
 
@@ -470,14 +515,15 @@ export class ChannelManager {
       result = await this.host.sendIncoming(allMessages);
     } catch (error) {
       const retry = queued.filter((q) => q.attempts + 1 < MAX_BATCH_ATTEMPTS);
-      const dropped = queued.length - retry.length;
+      const givenUp = queued.filter((q) => q.attempts + 1 >= MAX_BATCH_ATTEMPTS).map((q) => q.message);
       console.error(
         `Failed to send ${allMessages.length} incoming message(s) to host` +
           (retry.length > 0 ? `; retrying ${retry.length}` : '') +
-          (dropped > 0 ? `; giving up on ${dropped} (left for the next catch-up sweep)` : '') +
+          (givenUp.length > 0 ? `; giving up on ${givenUp.length} (held below the watermark for a later replay)` : '') +
           ':',
         (error as Error).message ?? error,
       );
+      for (const [channelId, messages] of groupByChannel(givenUp)) this.report(this.hooks.onGivenUp, channelId, messages);
       // Put the retry set back ahead of anything buffered meanwhile.
       const requeued = new Map<string, Queued[]>();
       for (const q of retry) {
@@ -519,6 +565,19 @@ export class ChannelManager {
     }
   }
 
+  private report(
+    hook: ((channelId: string, messages: IncomingChannelMessage[]) => void) | undefined,
+    channelId: string,
+    messages: IncomingChannelMessage[],
+  ): void {
+    if (!hook || messages.length === 0) return;
+    try {
+      hook(channelId, messages);
+    } catch (error) {
+      console.error('channel manager hook failed:', (error as Error).message ?? error);
+    }
+  }
+
   /** Itemized `channels/incoming` result (§14.5); a host that does not
    *  itemize has accepted the batch as a whole. */
   private acceptedMessageIds(
@@ -530,6 +589,16 @@ export class ChannelManager {
     }
     return new Set(sent.map((m) => m.messageId));
   }
+}
+
+function groupByChannel(messages: IncomingChannelMessage[]): Map<string, IncomingChannelMessage[]> {
+  const out = new Map<string, IncomingChannelMessage[]>();
+  for (const m of messages) {
+    const list = out.get(m.channelId) ?? [];
+    list.push(m);
+    out.set(m.channelId, list);
+  }
+  return out;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

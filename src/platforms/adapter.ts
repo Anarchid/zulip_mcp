@@ -76,6 +76,12 @@ export interface ReactionEvent {
   messageId: string;
   /** Emoji name in the platform's vocabulary (Zulip: 'thumbs_up'). */
   emoji: string;
+  /** The platform's code for the emoji (Zulip: codepoints for unicode emoji,
+   *  the realm emoji id otherwise) — what a glyph-shaped suppression entry
+   *  is matched against. */
+  emojiCode?: string;
+  /** Zulip: 'unicode_emoji' | 'realm_emoji' | 'zulip_extra_emoji'. */
+  emojiType?: string;
   reactorId: string;
   reactorName: string;
   /** The reacted-to message was authored by the bot. */
@@ -94,6 +100,22 @@ export interface ChannelHistoryQuery {
   beforeMessageId?: string;
   /** Exclusive: only messages newer than this id. */
   afterMessageId?: string;
+}
+
+/**
+ * One page of channel history. `messages` is what may reach the agent —
+ * the bot's own messages and disallowed senders are already removed — while
+ * `scannedThrough` is the newest id the fetch actually covered, removed rows
+ * included: the cursor a pager advances on, so a page of nothing but the
+ * bot's own messages does not read as the end of history.
+ */
+export interface ChannelHistoryPage {
+  /** Oldest first. */
+  messages: IncomingChannelMessage[];
+  /** Newest id scanned (filtered rows included); null when the page was empty. */
+  scannedThrough: number | null;
+  /** The platform reports nothing newer than this page. */
+  reachedNewest: boolean;
 }
 
 export interface PlatformAdapter {
@@ -140,7 +162,7 @@ export interface PlatformAdapter {
    * without it channels/open cannot return backscroll and the reconnect
    * sweep has nothing to scan.
    */
-  fetchHistory?(channelId: string, query: ChannelHistoryQuery): Promise<IncomingChannelMessage[]>;
+  fetchHistory?(channelId: string, query: ChannelHistoryQuery): Promise<ChannelHistoryPage>;
 
   /**
    * Make sure the platform delivers events for this channel — Zulip only
