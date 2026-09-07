@@ -1,5 +1,14 @@
 # Design: Platform Split & MCPL Substrate Convergence
 
+> **Status (September 2026):** landed as PR #16. Two details below are
+> historical: the shared substrate ships as `@animalabs/mcpl-core` (the
+> `@connectome/mcpl-core` name predates the org move), and this server
+> declares its feature sets in the core's record shape
+> (`buildServerCapabilities` in `src/feature-sets.ts`), not the array form
+> the C.2 table anticipated. The sequencing, acceptance criteria and recipe
+> coordination sections are as executed.
+
+
 **Status:** Implemented (Aug 24 2026) — see the end-state checklist
 **Date:** 2026-06-30 (proposal); 2026-08-24 (landed)
 **Scope:** `zulip-mcp/` (this repo), `discord-mcpl/`, new `slack-mcpl/`, `mcpl-core-ts/`, and the recipes/host that consume them.

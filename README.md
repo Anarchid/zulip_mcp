@@ -34,12 +34,15 @@ Discord and Slack adapters that once lived here moved to those servers.
   (`channel_missed`).
 - Catch-up: a persisted per-channel watermark advances only when the host
   has accepted a message (itemized `channels/incoming` results, acknowledged
-  `push/event`). On the next connection a `<missed>` block per channel
-  delivers what arrived meanwhile (full backscroll for channels the host had
-  open, mention ± 7 messages for the rest), paged up to `ZULIP_CATCHUP_LIMIT`
-  and capped in size. A Zulip event-queue expiry is healed the same way —
-  open channels replayed, closed channels' mentions pushed — not merely
-  reported. Live events that arrive before the sweep has run are held, so a
+  `push/event`), and never past a message the host was offered but did not
+  accept — a refusal, a batch lost to a transport failure — which is
+  replayed from history once the host answers again. On the next connection
+  a `<missed>` block per channel delivers what arrived meanwhile (full
+  backscroll for channels the host had open, mention ± 7 messages for the
+  rest), paged up to `ZULIP_CATCHUP_LIMIT` and hard-capped in size. A Zulip
+  event-queue expiry is healed the same way — open channels replayed, closed
+  channels' mentions pushed — not merely reported. Live events that arrive
+  before the sweep has run are held and released in order after it, so a
   live delivery can never jump the watermark over the offline gap.
 - RFC-001 tags on every message (`chat:mention`, `chat:dm`, `chat:ambient`,
   `chat:from-bot`, `chat:has-image`, `chat:reaction`, …) for the host's wake
@@ -126,10 +129,20 @@ its delivery (incoming and push) and its tools at once.
 **Wake policy.** Closed-channel mentions and DMs, new-DM announcements and
 `<missed>` catch-up blocks arrive as `push/event`, not `channels/incoming`.
 A host whose gate defaults to skip needs a policy on the `mcpl:push-event`
-scope (e.g. `tags: ['chat:addressed']` → `always`) or they land in context
-without a turn. Conversely, reactions on an open channel are ordinary
-`channels/incoming` messages tagged `chat:reaction` — an unconditional
-"always wake on this channel" policy wakes on them too; key on tags.
+scope or they land in context without a turn — for connectome-host's gate:
+
+```json
+{ "name": "addressed-push",
+  "match": { "scope": ["mcpl:push-event"], "tagsAny": ["chat:addressed", "zulip:missed"] },
+  "behavior": "always" }
+```
+
+(the gate matches on `tagsAny` / `tagsAll` / `tagsNone`; the host expands
+`chat:mention` and `chat:dm` into `chat:addressed`). Conversely, reactions
+on an open channel are ordinary `channels/incoming` messages carrying only
+`chat:reaction` / `chat:reaction-remove` — a policy keyed on tags ignores
+them, but an unconditional "always wake on this channel" policy wakes on
+them too; add `"tagsNone": ["chat:reaction", "chat:reaction-remove"]` to it.
 
 ## Channels
 
@@ -160,30 +173,37 @@ restart.
 ```
 
 - `streams` — allowlist (absent = every stream the bot can see). Gates
-  discovery and delivery.
-- `dmUsers` — who may DM the bot (absent = anyone). Empty means unrestricted,
-  deliberately: unsetting a variable must not silently lose every DM.
+  discovery and delivery on every surface: live, catch-up, gap recovery,
+  backscroll on open, context injection, reactions.
+- `dmUsers` — who may DM the bot (absent = anyone), judged per sender on
+  every surface. Empty means unrestricted, deliberately: unsetting a
+  variable must not silently lose every DM.
 - `mutedStreams` — nothing from these reaches the agent on any surface:
   live delivery, mentions, backscroll on open, context injection, reactions,
   catch-up and gap recovery. The pull tools (`fetch_history`, …) still work.
 - `reactionChannels` — channels showing live reactions.
 - `suppressedReactionEmojis` — reaction markers withheld from every
   model-visible surface. Operator-owned: the agent's tools cannot carry this
-  key, and `filters_get` reports it only as a count and digest. The host's
-  baseline (`*_SUPPRESSED_REACTIONS_BASELINE`) is added on top at every
-  start and is never written into the file.
+  key, and `filters_get` reports it only as a count and digest. Entries are
+  emoji names (`biohazard`) or glyphs (☣️); a glyph matches a Zulip reaction
+  on its codepoints. The host's baseline (`*_SUPPRESSED_REACTIONS_BASELINE`,
+  glyphs as connectome-host injects them) is added on top at every start
+  and is never written into the file.
 
 Every key is an authorization list: a wrong-typed value makes the file
-invalid (last-known-good stays in force) rather than reading as
-"unrestricted". An unparseable or vanished file keeps the last-known-good
-filters in force and marks the plane stale; updates from the tools are
-refused until it is repaired. A file that cannot be created at start is a
-startup failure, not a degraded mode.
+invalid rather than reading as "unrestricted". While running, an
+unparseable or vanished file keeps the last-known-good filters in force and
+marks the plane stale; updates from the tools are refused until it is
+repaired. At start there is no last-known-good, so a file that exists but
+cannot be parsed is a startup failure — as is one that cannot be created —
+not a run on the env seed (which, unset, means everything). Repair the
+file, or remove it to re-seed from the environment.
 
 ## Tools
 
 **Reading**
-`fetch_history` (stream/topic, `before`/`after` id cursors, ids on every line),
+`fetch_history` (stream/topic or a DM conversation by channel id,
+`before`/`after` id cursors, ids on every line),
 `fetch_around` (window centred on a message, within its conversation),
 `get_channel_history` (natural dates), `get_unread_messages`,
 `list_streams`, `get_stream_topics`, `list_users`, `find_user`,
@@ -211,6 +231,14 @@ Under `ZULIP_STATE_DIR`, keyed by session:
 - `<session>.delivery.json` — watermarks, missed tallies, last-open channels
 - `<session>.filters.json` — the filters plane (unless `ZULIP_FILTERS_FILE`)
 
+Put `ZULIP_STATE_DIR` on storage that survives a redeploy. In a container
+the default `~/.zulip_mcp_state` lives in the writable layer and goes with
+the image: every rebuild wipes the watermarks (the next start anchors
+catch-up at "now") and the filters file (mutes, reaction visibility and
+allowlist edits made through the tools are gone; the file re-seeds from the
+environment). Under connectome-host, point it into the data volume, e.g.
+`"ZULIP_STATE_DIR": "${DATA_DIR}/<agent>/zulip-state"`.
+
 ## Notes for operators
 
 - **Subscription is not optional.** Zulip delivers stream events only to
@@ -225,8 +253,9 @@ Under `ZULIP_STATE_DIR`, keyed by session:
   read as before but are not migrated into delivery watermarks: the first
   3.x start anchors catch-up at "now".
 - **No per-call timeouts** on the Zulip API yet: the serve loop handles one
-  host request at a time, so a hung Zulip call stalls the requests behind it
-  until the host's own timeout.
+  host request at a time, so a hung Zulip call stalls the requests behind
+  it. The host's own timeout abandons its request but does not unstall the
+  loop; a server in that state needs a restart.
 - **zulip-js quirks** (in `platforms/zulip-events.ts`): booleans in POST bodies
   must be strings, arrays must be raw arrays; API errors come back as values
   (`result: 'error'`), which this server turns into thrown errors.
